@@ -339,4 +339,6 @@ def main():
     print(f"{'='*50}\n")
 
 if __name__ == "__main__":
+    # TEST MODE - sends test alert first
+    send_telegram("🧪 *Test Alert*\n\n✅ Python scanner is LIVE\n✅ GitHub Actions working\n✅ Telegram connected\n\nNext scan in 15 min...")
     main()
