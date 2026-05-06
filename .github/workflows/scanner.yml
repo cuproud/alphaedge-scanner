@@ -2,10 +2,8 @@ name: AlphaEdge Scanner
 
 on:
   schedule:
-    # 📈 STOCKS: Every 15 min during US market hours (9:30 AM - 4:00 PM EST)
-    # EST = UTC-5 → 14:30-21:00 UTC (winter)
-    # EDT = UTC-4 → 13:30-20:00 UTC (summer)
-    # Using 13:30-21:00 UTC to cover both, Mon-Fri
+    # 📈 STOCKS: Every 15 min during US market hours (9:30 AM - 4:00 PM EST/EDT)
+    # Covers both EST (UTC-5, winter) and EDT (UTC-4, summer)
     - cron: '30,45 13 * * 1-5'
     - cron: '*/15 14-20 * * 1-5'
     - cron: '0 21 * * 1-5'
@@ -35,13 +33,17 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       
-      - name: Restore alert cache
-        uses: actions/cache@v4
+      # ⭐ UPDATED: Cache BOTH state files with better key strategy
+      - name: Restore scanner state
+        id: cache-restore
+        uses: actions/cache/restore@v4
         with:
-          path: alert_cache.json
-          key: alert-cache-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            alert_cache.json
+            active_trades.json
+          key: scanner-state-${{ github.run_id }}
           restore-keys: |
-            alert-cache-
+            scanner-state-
       
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -53,3 +55,13 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TZ: America/New_York
         run: python scanner.py
+      
+      # ⭐ NEW: Save state AFTER the scan (always runs, even if scan fails)
+      - name: Save scanner state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            alert_cache.json
+            active_trades.json
+          key: scanner-state-${{ github.run_id }}
