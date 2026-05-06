@@ -2,10 +2,21 @@ name: AlphaEdge Scanner
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    # 📈 STOCKS: Every 15 min during US market hours (9:30 AM - 4:00 PM EST)
+    # EST = UTC-5 → 14:30-21:00 UTC (winter)
+    # EDT = UTC-4 → 13:30-20:00 UTC (summer)
+    # Using 13:30-21:00 UTC to cover both, Mon-Fri
+    - cron: '30,45 13 * * 1-5'
+    - cron: '*/15 14-20 * * 1-5'
+    - cron: '0 21 * * 1-5'
+    
+    # 🪙 CRYPTO/GOLD (24/7): Every hour outside market hours + weekends
+    - cron: '0 0-13 * * 1-5'
+    - cron: '0 22,23 * * 1-5'
+    - cron: '0 * * * 0,6'
+  
   workflow_dispatch:
 
-# Prevent overlapping runs if a scan takes >15 min
 concurrency:
   group: alphaedge-scanner
   cancel-in-progress: false
@@ -13,9 +24,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
+    timeout-minutes: 8
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -25,6 +34,14 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+      
+      - name: Restore alert cache
+        uses: actions/cache@v4
+        with:
+          path: alert_cache.json
+          key: alert-cache-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            alert-cache-
       
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -36,12 +53,3 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TZ: America/New_York
         run: python scanner.py
-      
-      - name: Commit alert cache
-        run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git pull --rebase origin ${GITHUB_REF#refs/heads/} || true
-          git add alert_cache.json || true
-          git diff --staged --quiet || git commit -m "Update alert cache [skip ci]"
-          git push || true
