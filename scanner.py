@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 # CONFIG
 # ═══════════════════════════════════════════════
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
-CHAT_ID = os.environ.get('CHAT_ID', '820394470')
+CHAT_ID = os.environ.get('CHAT_ID')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
 # EST timezone (UTC-5, no DST handling - use EDT offset if needed)
