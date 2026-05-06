@@ -1658,7 +1658,7 @@ def main():
                     msg = format_trade_event(trade, event, current)
                     if msg:
                         send_telegram(msg, silent=False)
-                        print(f"🔔 {event['type']}", end=" ")
+                        print(f"\n     🔔 {event['type']} @ ${event['price']}", end="")
                         logging.info(f"{trade['symbol']} {event['type']} @ {event['price']}")
                 
                 if closed:
