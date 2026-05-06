@@ -2,13 +2,14 @@ name: AlphaEdge Scanner
 
 on:
   schedule:
-    # Runs every 15 minutes during market hours (Mon-Fri)
     - cron: '*/15 * * * 1-5'
-  workflow_dispatch:  # Allows manual run
+  workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -26,3 +27,11 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python scanner.py
+      
+      - name: Commit alert cache
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add alert_cache.json || true
+          git diff --staged --quiet || git commit -m "Update alert cache"
+          git push || true
