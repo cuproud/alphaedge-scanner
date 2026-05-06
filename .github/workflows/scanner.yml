@@ -1,16 +1,39 @@
-name: AlphaEdge Scanner
+name: AlphaEdge Scanner v5.1
 
 on:
   schedule:
-    # 📈 STOCKS: Every 15 min during US market hours (9:30 AM - 4:00 PM EST/EDT)
-    # Covers both EST (UTC-5, winter) and EDT (UTC-4, summer)
-    - cron: '30,45 13 * * 1-5'
-    - cron: '*/15 14-20 * * 1-5'
-    - cron: '0 21 * * 1-5'
+    # ═══════════════════════════════════════════════════════════════
+    # 📈 REGULAR MARKET HOURS (9:30 AM - 4:00 PM EDT/EST)
+    # Every 15 min — full watchlist scanned (crypto + stocks)
+    # ═══════════════════════════════════════════════════════════════
+    - cron: '30,45 13 * * 1-5'       # 9:30-9:45 AM EDT
+    - cron: '*/15 14-19 * * 1-5'      # 10 AM - 3:45 PM EDT
+    - cron: '0 20 * * 1-5'            # 4:00 PM EDT close
     
-    # 🪙 CRYPTO/GOLD (24/7): Every hour outside market hours + weekends
-    - cron: '0 0-13 * * 1-5'
-    - cron: '0 22,23 * * 1-5'
+    # ═══════════════════════════════════════════════════════════════
+    # 🌙 AFTER-HOURS (4:00 PM - 8:00 PM EDT)
+    # Every 30 min — crypto + mega-cap stocks only
+    # Covers earnings reactions + extended hours moves
+    # ═══════════════════════════════════════════════════════════════
+    - cron: '15,45 20 * * 1-5'        # 4:15, 4:45 PM EDT
+    - cron: '15,45 21,22,23 * * 1-5'  # 5:15-7:45 PM EDT
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 🌅 PRE-MARKET (4:00 AM - 9:30 AM EDT)
+    # Every 30 min — crypto + mega-cap stocks only
+    # Covers overnight gaps and pre-market moves
+    # ═══════════════════════════════════════════════════════════════
+    - cron: '0,30 8-13 * * 1-5'       # 4:00 AM - 9:00 AM EDT
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 🌑 OVERNIGHT (8:00 PM - 4:00 AM EDT weekdays)
+    # Hourly — crypto only
+    # ═══════════════════════════════════════════════════════════════
+    - cron: '0 0-7 * * 1-5'           # 8 PM - 3 AM EDT
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 🪙 WEEKENDS — Hourly crypto scan
+    # ═══════════════════════════════════════════════════════════════
     - cron: '0 * * * 0,6'
   
   workflow_dispatch:
@@ -22,7 +45,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -33,7 +56,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       
-      # ⭐ UPDATED: Cache BOTH state files with better key strategy
+      # ⭐ Restore state (cache + trades + history + state + logs)
       - name: Restore scanner state
         id: cache-restore
         uses: actions/cache/restore@v4
@@ -41,6 +64,9 @@ jobs:
           path: |
             alert_cache.json
             active_trades.json
+            trade_history.json
+            scanner_state.json
+            logs/
           key: scanner-state-${{ github.run_id }}
           restore-keys: |
             scanner-state-
@@ -56,7 +82,7 @@ jobs:
           TZ: America/New_York
         run: python scanner.py
       
-      # ⭐ NEW: Save state AFTER the scan (always runs, even if scan fails)
+      # ⭐ Save state AFTER scan (always runs, even on failure)
       - name: Save scanner state
         if: always()
         uses: actions/cache/save@v4
@@ -64,4 +90,17 @@ jobs:
           path: |
             alert_cache.json
             active_trades.json
+            trade_history.json
+            scanner_state.json
+            logs/
           key: scanner-state-${{ github.run_id }}
+      
+      # 🆕 Upload logs as artifact (30-day retention)
+      - name: Upload scan logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 30
+          if-no-files-found: ignore
