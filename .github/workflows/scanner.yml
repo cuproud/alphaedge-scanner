@@ -5,9 +5,15 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
+# Prevent overlapping runs if a scan takes >15 min
+concurrency:
+  group: alphaedge-scanner
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -18,6 +24,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
       
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -27,12 +34,14 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TZ: America/New_York
         run: python scanner.py
       
       - name: Commit alert cache
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
+          git pull --rebase origin ${GITHUB_REF#refs/heads/} || true
           git add alert_cache.json || true
-          git diff --staged --quiet || git commit -m "Update alert cache"
+          git diff --staged --quiet || git commit -m "Update alert cache [skip ci]"
           git push || true
