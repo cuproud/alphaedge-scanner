@@ -1,8 +1,6 @@
 """
-ALPHAEDGE PYTHON SCANNER v2.0
-- Better signal detection
-- Anti-spam (dedupe per symbol)
-- Priority tiers
+ALPHAEDGE PYTHON SCANNER v3.0 - AI POWERED
+Custom Watchlist Edition
 """
 
 import yfinance as yf
@@ -18,26 +16,54 @@ from datetime import datetime, timedelta
 # ═══════════════════════════════════════════════
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID', '820394470')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
+# 👇 YOUR CUSTOM WATCHLIST 👇
 WATCHLIST = [
-    'AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMD', 'META', 
-    'GOOGL', 'AMZN', 'NFLX',
-    'SPY', 'QQQ', 'DIA',
-    'RELIANCE.NS', 'TCS.NS', 'INFY.NS', 'HDFCBANK.NS',
-    'BTC-USD', 'ETH-USD', 'SOL-USD',
+    # Crypto (24/7)
+    'BTC-USD', 'ETH-USD', 'XRP-USD',
+    
+    # Commodities
+    'GC=F',          # Gold Futures
+    
+    # Mega Cap Tech
+    'GOOGL', 'TSLA', 'AMD', 'NVDA', 'MSFT',
+    'META', 'AMZN', 'NFLX',
+    
+    # Semiconductors & Memory
+    'MU',            # Micron
+    'SNDK',          # SanDisk
+    'NBIS',          # Nebius Group
+    'DRAM',          # DRAM ETF
+    
+    # Quantum Computing
+    'IONQ', 'RGTI', 'QBTS',
+    
+    # AI / Nuclear / Small-cap
+    'OKLO',          # Nuclear for AI
+    'IREN',          # Iris Energy
+    'UAMY',          # US Antimony
+    'WGRX',          # Wellgistics Health
+    
+    # Fintech
+    'SOFI',          # SoFi Technologies
+    
+    # Healthcare
+    'NVO',           # Novo Nordisk
 ]
 
 TIMEFRAME = '1h'
 LOOKBACK = '3mo'
-MIN_SQS = 55          # Slightly relaxed
+MIN_SQS = 55
 MIN_SCORE = 5
+AI_TIER_THRESHOLD = 70
+COOLDOWN_HOURS = 4
 
 # ═══════════════════════════════════════════════
 # INDICATORS
 # ═══════════════════════════════════════════════
 
 def ema(s, l): return s.ewm(span=l, adjust=False).mean()
-def sma(s, l): return s.rolling(l).mean()
 
 def rsi(series, length=14):
     delta = series.diff()
@@ -97,11 +123,10 @@ def vwap(df):
     return (p * q).cumsum() / q.cumsum()
 
 # ═══════════════════════════════════════════════
-# ANTI-SPAM (stores last alert per symbol in file)
+# ANTI-SPAM CACHE
 # ═══════════════════════════════════════════════
 
 CACHE_FILE = 'alert_cache.json'
-COOLDOWN_HOURS = 4  # Don't repeat same signal within 4 hours
 
 def load_cache():
     try:
@@ -112,7 +137,7 @@ def load_cache():
 
 def save_cache(cache):
     with open(CACHE_FILE, 'w') as f:
-        json.dump(cache, f)
+        json.dump(cache, f, indent=2)
 
 def is_duplicate(symbol, signal_type, cache):
     key = f"{symbol}_{signal_type}"
@@ -126,12 +151,58 @@ def mark_sent(symbol, signal_type, cache):
     cache[key] = datetime.now().isoformat()
 
 # ═══════════════════════════════════════════════
+# GEMINI AI ANALYSIS (FREE)
+# ═══════════════════════════════════════════════
+
+def get_ai_analysis(sig):
+    if not GEMINI_API_KEY:
+        return None
+    
+    prompt = f"""You are an expert trading analyst. Analyze this signal in EXACTLY 4 short lines (max 120 chars each).
+
+SYMBOL: {sig['symbol']}
+SIGNAL: {sig['signal']} @ ${sig['price']}
+TRIGGER: {sig['trigger']}
+SCORE: {sig['score']}/10 (Grade {sig['grade']})
+SQS: {sig['sqs']}/100
+RSI: {sig['rsi']} | ADX: {sig['adx']}
+REGIME: {sig['regime']}
+SL: ${sig['sl']} | TP1: ${sig['tp1']} | TP2: ${sig['tp2']} | TP3: ${sig['tp3']}
+
+Respond EXACTLY in this format (no extra text):
+📝 Setup: [one-line quality assessment]
+⚠️ Risk: [main risk/concern]
+🎯 Tip: [one actionable execution tip]
+💡 Verdict: [STRONG BUY/BUY/NEUTRAL/CAUTION/AVOID]"""
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    try:
+        r = requests.post(url, json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.6,
+                "maxOutputTokens": 250
+            }
+        }, timeout=15)
+        
+        if r.status_code == 200:
+            data = r.json()
+            if 'candidates' in data and len(data['candidates']) > 0:
+                return data['candidates'][0]['content']['parts'][0]['text'].strip()
+        print(f"Gemini API error: {r.status_code}")
+        return None
+    except Exception as e:
+        print(f"AI error: {e}")
+        return None
+
+# ═══════════════════════════════════════════════
 # SIGNAL ENGINE
 # ═══════════════════════════════════════════════
 
 def analyze_symbol(symbol):
     try:
-        df = yf.download(symbol, period=LOOKBACK, interval=TIMEFRAME, 
+        df = yf.download(symbol, period=LOOKBACK, interval=TIMEFRAME,
                          progress=False, auto_adjust=True)
         
         if df.empty or len(df) < 200:
@@ -153,61 +224,45 @@ def analyze_symbol(symbol):
         
         last = df.iloc[-1]
         prev = df.iloc[-2]
-        prev2 = df.iloc[-3]
         price = last['Close']
         
-        # ─── Confluence Scores ───
-        bull = 0
-        bear = 0
+        # Confluence
+        bull, bear = 0, 0
         
         if price > last['ema20']: bull += 1
         else: bear += 1
-        
         if price > last['ema50']: bull += 1
         else: bear += 1
-        
         if last['ema50'] > last['ema200']: bull += 1
         else: bear += 1
-        
         if last['st'] == 1: bull += 1
         else: bear += 1
-        
         if last['macd'] > last['signal']: bull += 1
         else: bear += 1
-        
         if last['rsi'] > 50: bull += 1
         else: bear += 1
-        
         if price > last['vwap']: bull += 1
         else: bear += 1
-        
         if last['adx'] > 22:
             if last['plus_di'] > last['minus_di']: bull += 1
             else: bear += 1
-        
         if last['Volume'] > last['vol_avg'] * 1.3:
             if price > prev['Close']: bull += 1
             else: bear += 1
-        
-        # Momentum
         if last['rsi'] > prev['rsi']: bull += 1
         else: bear += 1
         
-        # ─── Trigger Detection (multiple types) ───
-        
-        # Fresh crossovers
-        fresh_bull_cross = (
+        # Trigger detection
+        fresh_bull = (
             (prev['Close'] <= prev['ema50'] and price > last['ema50']) or
             (prev['st'] == -1 and last['st'] == 1) or
             (prev['macd'] <= prev['signal'] and last['macd'] > last['signal'])
         )
-        fresh_bear_cross = (
+        fresh_bear = (
             (prev['Close'] >= prev['ema50'] and price < last['ema50']) or
             (prev['st'] == 1 and last['st'] == -1) or
             (prev['macd'] >= prev['signal'] and last['macd'] < last['signal'])
         )
-        
-        # Pullback continuation (price bounces from EMA20 in trend)
         pullback_bull = (
             last['ema50'] > last['ema200'] and
             prev['Close'] < prev['ema20'] and price > last['ema20'] and
@@ -218,8 +273,6 @@ def analyze_symbol(symbol):
             prev['Close'] > prev['ema20'] and price < last['ema20'] and
             last['rsi'] < 55
         )
-        
-        # Oversold/Overbought bounce
         oversold_bounce = (
             prev['rsi'] < 32 and last['rsi'] > prev['rsi'] and
             price > prev['Close'] and bull >= 5
@@ -228,24 +281,19 @@ def analyze_symbol(symbol):
             prev['rsi'] > 68 and last['rsi'] < prev['rsi'] and
             price < prev['Close'] and bear >= 5
         )
-        
-        # Strong momentum (already trending hard)
         strong_bull = bull >= 8 and last['adx'] > 25 and last['plus_di'] > last['minus_di']
         strong_bear = bear >= 8 and last['adx'] > 25 and last['minus_di'] > last['plus_di']
         
-        # Combine
-        bull_trigger = fresh_bull_cross or pullback_bull or oversold_bounce or strong_bull
-        bear_trigger = fresh_bear_cross or pullback_bear or overbought_drop or strong_bear
+        bull_trigger = fresh_bull or pullback_bull or oversold_bounce or strong_bull
+        bear_trigger = fresh_bear or pullback_bear or overbought_drop or strong_bear
         
-        # Detect trigger type
         trigger_type = ""
-        if fresh_bull_cross or fresh_bear_cross: trigger_type = "Fresh Cross"
+        if fresh_bull or fresh_bear: trigger_type = "Fresh Cross"
         elif pullback_bull or pullback_bear: trigger_type = "Pullback"
         elif oversold_bounce: trigger_type = "Oversold Bounce"
         elif overbought_drop: trigger_type = "Overbought Drop"
         elif strong_bull or strong_bear: trigger_type = "Strong Momentum"
         
-        # ─── SQS ───
         def calc_sqs(score, is_bull):
             conf = score / 10 * 40
             regime = 15 if last['adx'] > 25 else 10 if last['adx'] > 20 else 5
@@ -257,28 +305,23 @@ def analyze_symbol(symbol):
         def grade(s):
             return "A+" if s >= 8 else "A" if s >= 6 else "B" if s >= 4 else "C"
         
-        # Priority tier
         def tier(sqs):
             if sqs >= 85: return "🏆 ELITE"
             elif sqs >= 70: return "⭐ STRONG"
             elif sqs >= 55: return "✅ GOOD"
             else: return "⚠️ FAIR"
         
-        # ─── Decide signal ───
         if bull_trigger and bull >= MIN_SCORE:
             sqs = calc_sqs(bull, True)
             if sqs < MIN_SQS: return None
-            signal_type = 'BUY'
-            score = bull
+            signal_type, score = 'BUY', bull
         elif bear_trigger and bear >= MIN_SCORE:
             sqs = calc_sqs(bear, False)
             if sqs < MIN_SQS: return None
-            signal_type = 'SELL'
-            score = bear
+            signal_type, score = 'SELL', bear
         else:
             return None
         
-        # ─── TP/SL ───
         atr_val = last['atr']
         if signal_type == 'BUY':
             sl = price - (atr_val * 2)
@@ -296,16 +339,16 @@ def analyze_symbol(symbol):
         return {
             'symbol': symbol,
             'signal': signal_type,
-            'price': round(price, 2),
+            'price': round(price, 4),
             'score': score,
             'grade': grade(score),
             'sqs': round(sqs),
             'tier': tier(sqs),
             'trigger': trigger_type,
-            'sl': round(sl, 2),
-            'tp1': round(tp1, 2),
-            'tp2': round(tp2, 2),
-            'tp3': round(tp3, 2),
+            'sl': round(sl, 4),
+            'tp1': round(tp1, 4),
+            'tp2': round(tp2, 4),
+            'tp3': round(tp3, 4),
             'rsi': round(last['rsi'], 1),
             'adx': round(last['adx'], 1),
             'regime': 'TRENDING' if last['adx'] > 25 else 'RANGING' if last['adx'] < 20 else 'TRANSITIONAL',
@@ -320,7 +363,7 @@ def analyze_symbol(symbol):
 # TELEGRAM
 # ═══════════════════════════════════════════════
 
-def format_message(sig):
+def format_message(sig, ai_text=None):
     emoji = "🟢" if sig['signal'] == 'BUY' else "🔴"
     
     msg = f"{sig['tier']} {emoji} *{sig['signal']} {sig['symbol']}* • {sig['timeframe']}\n"
@@ -334,7 +377,13 @@ def format_message(sig):
     msg += f"🎯 TP3: `{sig['tp3']}`\n\n"
     msg += f"📈 RSI: {sig['rsi']} | ADX: {sig['adx']}\n"
     msg += f"🏷️ Regime: {sig['regime']}\n"
-    msg += f"⏰ {datetime.now().strftime('%H:%M UTC')}"
+    
+    if ai_text:
+        msg += f"\n━━━━━━━━━━━━━━━\n"
+        msg += f"🤖 *AI ANALYSIS*\n"
+        msg += f"{ai_text}\n"
+    
+    msg += f"\n⏰ {datetime.now().strftime('%H:%M UTC')}"
     return msg
 
 def send_telegram(message, silent=False):
@@ -357,34 +406,41 @@ def send_telegram(message, silent=False):
 
 def main():
     print(f"\n{'='*50}")
-    print(f"AlphaEdge v2 Scanner @ {datetime.now()}")
+    print(f"AlphaEdge v3 AI Scanner @ {datetime.now()}")
     print(f"Scanning {len(WATCHLIST)} symbols on {TIMEFRAME}")
+    print(f"AI enabled: {bool(GEMINI_API_KEY)}")
     print(f"{'='*50}\n")
     
     cache = load_cache()
     sent = 0
-    skipped_dupes = 0
+    skipped = 0
+    ai_calls = 0
     
     for symbol in WATCHLIST:
-        print(f"→ {symbol}...", end=" ")
+        print(f"→ {symbol:12s}...", end=" ")
         result = analyze_symbol(symbol)
         
         if not result:
             print("no signal")
             continue
         
-        # Check dupes
         if is_duplicate(symbol, result['signal'], cache):
-            skipped_dupes += 1
-            print(f"🔕 duplicate ({result['signal']}, cooldown active)")
+            skipped += 1
+            print(f"🔕 duplicate (cooldown)")
             continue
         
-        # Silent for FAIR tier
+        ai_text = None
+        if result['sqs'] >= AI_TIER_THRESHOLD and GEMINI_API_KEY:
+            print(f"🤖 AI...", end=" ")
+            ai_text = get_ai_analysis(result)
+            if ai_text:
+                ai_calls += 1
+        
         silent = 'FAIR' in result['tier']
         
-        print(f"🚨 {result['tier']} {result['signal']} | SQS={result['sqs']} | {result['trigger']}")
+        print(f"🚨 {result['tier']} {result['signal']} SQS={result['sqs']}")
         
-        if send_telegram(format_message(result), silent=silent):
+        if send_telegram(format_message(result, ai_text), silent=silent):
             mark_sent(symbol, result['signal'], cache)
             sent += 1
             print(f"   ✅ Sent")
@@ -394,7 +450,7 @@ def main():
     save_cache(cache)
     
     print(f"\n{'='*50}")
-    print(f"Sent: {sent} | Dupes skipped: {skipped_dupes}")
+    print(f"Sent: {sent} | Dupes: {skipped} | AI calls: {ai_calls}")
     print(f"{'='*50}")
 
 if __name__ == "__main__":
