@@ -2,7 +2,7 @@ name: AlphaEdge Scanner
 
 on:
   schedule:
-    - cron: '*/15 * * * 1-5'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -26,6 +26,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python scanner.py
       
       - name: Commit alert cache
