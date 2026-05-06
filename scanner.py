@@ -1,27 +1,32 @@
 """
-ALPHAEDGE PYTHON SCANNER v5.0 - ULTIMATE
+ALPHAEDGE PYTHON SCANNER v5.1 - SESSION-AWARE
 ═══════════════════════════════════════════════════════════════
-FEATURES:
+CHANGES IN v5.1:
+• Smart watchlist filtering by trading session
+• Split into crypto/stocks/extended-hours groups
+• After-hours signal warnings (thin liquidity alert)
+• Gold futures respects Sunday maintenance break
+• Active trades still monitored 24/7 regardless of session
+
+INHERITS FROM v5.0:
 • Smart context-aware RSI filtering
-• Multi-timeframe scanning (30m + 1h)
-• Live price fetch for accurate entries
-• Close-based SL/TP hit detection (realistic)
-• Position sizing with risk-per-trade
+• Multi-timeframe (30m + 1h)
+• Live price entries
+• Close-based SL/TP detection
+• Position sizing with risk management
 • Price ladder visualization
 • Trade age counter
-• Symbol emojis for instant recognition
+• Symbol emojis
 • Smart cooldown by SQS tier
-• Session tagging (Pre-Market/Open/Midday/Power Hour/After-Hours)
-• Weekly performance summary (Sundays 9PM EDT)
-• Trade history archive (permanent log)
+• Session tagging
+• Weekly performance summary
+• Trade history archive
 • Correlation detection
-• Daily near-miss watchlist digest (9AM EDT)
-• Market context (SPY/QQQ/VIX) daily
-• Batch alerts (digest mode for 4+ signals)
+• Daily near-miss digest
+• Market context (SPY/QQQ/VIX)
+• Batch digest mode
 • Log archiving
-• Error recovery per symbol
 • Rate limit protection
-• Timezone-normalized cache (EST/EDT auto)
 """
 
 import yfinance as yf
@@ -32,7 +37,7 @@ import os
 import json
 import time
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -55,22 +60,38 @@ def fmt_datetime():
     return now_est().strftime('%Y-%m-%d %H:%M %Z')
 
 # 💼 ACCOUNT & RISK CONFIG
-ACCOUNT_SIZE = 10000       # Your account in $
-RISK_PCT = 1.0             # % risk per trade (1% = $100 on $10k)
+ACCOUNT_SIZE = 10000
+RISK_PCT = 1.0
 
-# 👇 WATCHLIST 👇
-WATCHLIST = [
+# ═══════════════════════════════════════════════
+# WATCHLIST GROUPS (session-aware)
+# ═══════════════════════════════════════════════
+
+# 🪙 24/7 — crypto + gold (gold pauses briefly Sunday)
+CRYPTO_WATCHLIST = [
     'BTC-USD', 'ETH-USD', 'XRP-USD',
     'GC=F',
-    'GOOGL', 'TSLA', 'AMD', 'NVDA', 'MSFT',
-    'META', 'AMZN', 'NFLX',
+]
+
+# 💎 Mega-cap stocks — OK during extended hours (pre-market + after-hours)
+# These have enough liquidity that 4AM-8PM signals are tradeable
+EXTENDED_HOURS_STOCKS = [
+    'NVDA', 'TSLA', 'AMD', 'MSFT', 'META', 'AMZN', 'GOOGL', 'NFLX'
+]
+
+# 📊 All other stocks — ONLY during regular market hours (9:30 AM - 4 PM EDT)
+# Thin after-hours liquidity makes signals unreliable
+REGULAR_HOURS_ONLY = [
     'MU', 'SNDK', 'NBIS',
     'IONQ', 'RGTI', 'QBTS',
     'OKLO', 'IREN', 'UAMY', 'WGRX',
     'SOFI', 'NVO',
 ]
 
-# Symbol emojis for instant recognition
+# Combined for emoji mapping and weekly summary
+ALL_SYMBOLS = CRYPTO_WATCHLIST + EXTENDED_HOURS_STOCKS + REGULAR_HOURS_ONLY
+
+# Symbol emojis
 SYMBOL_EMOJI = {
     'BTC-USD': '₿', 'ETH-USD': 'Ξ', 'XRP-USD': '◇',
     'GC=F': '🥇',
@@ -95,34 +116,99 @@ AI_TIER_THRESHOLD = 70
 MAX_TRADE_AGE_HOURS = 72
 
 # Smart cooldown by SQS tier (hours)
-COOLDOWN_ELITE = 2     # SQS 85+
-COOLDOWN_STRONG = 4    # SQS 70-84
-COOLDOWN_GOOD = 6      # SQS 55-69
-COOLDOWN_FAIR = 10     # below 55
+COOLDOWN_ELITE = 2
+COOLDOWN_STRONG = 4
+COOLDOWN_GOOD = 6
+COOLDOWN_FAIR = 10
 
-# Batching — if more than this many signals, send digest
 DIGEST_THRESHOLD = 4
-
-# Debug logging
 DEBUG_NEAR_MISS = True
-
-# Rate limit delay
-FETCH_DELAY = 0.3  # seconds between symbol fetches
+FETCH_DELAY = 0.3
 
 # File paths
 ALERT_CACHE = 'alert_cache.json'
 TRADES_FILE = 'active_trades.json'
 HISTORY_FILE = 'trade_history.json'
-STATE_FILE = 'scanner_state.json'  # for daily digest tracking
+STATE_FILE = 'scanner_state.json'
 LOGS_DIR = Path('logs')
 LOGS_DIR.mkdir(exist_ok=True)
 
-# Setup logging
 logging.basicConfig(
     filename=LOGS_DIR / f'scan_{now_est().strftime("%Y-%m-%d")}.log',
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s'
 )
+
+# ═══════════════════════════════════════════════
+# SESSION & WATCHLIST LOGIC
+# ═══════════════════════════════════════════════
+
+def get_session():
+    """Return trading session tag based on EST time."""
+    now = now_est()
+    hour = now.hour
+    minute = now.minute
+    is_weekend = now.weekday() >= 5
+    
+    if is_weekend:
+        return "🌐 Weekend"
+    
+    time_decimal = hour + minute / 60
+    
+    if 4 <= time_decimal < 9.5:
+        return "🌅 Pre-Market"
+    elif 9.5 <= time_decimal < 10.5:
+        return "🔔 Market Open"
+    elif 10.5 <= time_decimal < 14:
+        return "📊 Midday"
+    elif 14 <= time_decimal < 16:
+        return "⚡ Power Hour"
+    elif 16 <= time_decimal < 20:
+        return "🌙 After-Hours"
+    else:
+        return "🌑 Overnight"
+
+def is_crypto(symbol):
+    """Check if symbol is crypto or gold futures (24/7-ish)."""
+    return symbol.endswith('-USD') or symbol == 'GC=F'
+
+def is_extended_hours_session():
+    """True if we're in pre-market or after-hours (stocks have reduced liquidity)."""
+    session = get_session()
+    return session in ['🌅 Pre-Market', '🌙 After-Hours']
+
+def is_regular_market_open():
+    """True if regular US market hours (9:30 AM - 4:00 PM EDT weekday)."""
+    session = get_session()
+    return session in ['🔔 Market Open', '📊 Midday', '⚡ Power Hour']
+
+def get_active_watchlist():
+    """
+    Return symbols that should be scanned RIGHT NOW based on session.
+    
+    - Weekend: crypto only
+    - Overnight (8PM - 4AM): crypto only
+    - Pre-Market (4-9:30 AM): crypto + mega-cap stocks
+    - Regular Hours (9:30 AM - 4 PM): ALL symbols
+    - After-Hours (4-8 PM): crypto + mega-cap stocks
+    """
+    session = get_session()
+    
+    if session == "🌐 Weekend":
+        return CRYPTO_WATCHLIST
+    
+    if session == "🌑 Overnight":
+        return CRYPTO_WATCHLIST
+    
+    if session in ["🌅 Pre-Market", "🌙 After-Hours"]:
+        return CRYPTO_WATCHLIST + EXTENDED_HOURS_STOCKS
+    
+    # Regular market hours — scan everything
+    if is_regular_market_open():
+        return CRYPTO_WATCHLIST + EXTENDED_HOURS_STOCKS + REGULAR_HOURS_ONLY
+    
+    # Fallback (shouldn't reach here)
+    return CRYPTO_WATCHLIST
 
 # ═══════════════════════════════════════════════
 # INDICATORS
@@ -203,7 +289,6 @@ def save_json(path, data):
         json.dump(data, f, indent=2, default=str)
 
 def load_cache_with_migration():
-    """Load alert cache and normalize all timestamps to EST."""
     cache = load_json(ALERT_CACHE, {})
     cleaned = {}
     for key, ts_str in cache.items():
@@ -213,11 +298,10 @@ def load_cache_with_migration():
                 dt = dt.replace(tzinfo=EST)
             cleaned[key] = dt.isoformat()
         except:
-            continue  # skip malformed entries
+            continue
     return cleaned
 
 def get_cooldown_hours(sqs):
-    """Return cooldown hours based on SQS tier."""
     if sqs >= 85: return COOLDOWN_ELITE
     elif sqs >= 70: return COOLDOWN_STRONG
     elif sqs >= 55: return COOLDOWN_GOOD
@@ -240,43 +324,10 @@ def mark_sent(symbol, signal_key, cache):
     cache[f"{symbol}_{signal_key}"] = now_est().isoformat()
 
 # ═══════════════════════════════════════════════
-# SESSION DETECTION
-# ═══════════════════════════════════════════════
-
-def get_session():
-    """Return trading session tag based on EST time."""
-    now = now_est()
-    hour = now.hour
-    minute = now.minute
-    is_weekend = now.weekday() >= 5
-    
-    if is_weekend:
-        return "🌐 24/7"
-    
-    time_decimal = hour + minute / 60
-    
-    if 4 <= time_decimal < 9.5:
-        return "🌅 Pre-Market"
-    elif 9.5 <= time_decimal < 10.5:
-        return "🔔 Market Open"
-    elif 10.5 <= time_decimal < 14:
-        return "📊 Midday"
-    elif 14 <= time_decimal < 16:
-        return "⚡ Power Hour"
-    elif 16 <= time_decimal < 20:
-        return "🌙 After-Hours"
-    else:
-        return "🌐 24/7"
-
-def is_crypto(symbol):
-    return symbol.endswith('-USD') or symbol == 'GC=F'
-
-# ═══════════════════════════════════════════════
 # LIVE PRICE FETCH
 # ═══════════════════════════════════════════════
 
 def get_real_time_price(symbol):
-    """Get most recent 1-min close for accurate entry."""
     try:
         df = yf.download(symbol, period='1d', interval='1m',
                         progress=False, auto_adjust=True)
@@ -289,7 +340,6 @@ def get_real_time_price(symbol):
         return None
 
 def get_live_ohlc(symbol):
-    """Get latest 5m bar (close, high, low) for TP/SL checking."""
     try:
         df = yf.download(symbol, period='2d', interval='5m',
                         progress=False, auto_adjust=True)
@@ -302,7 +352,7 @@ def get_live_ohlc(symbol):
         return None
 
 # ═══════════════════════════════════════════════
-# ANALYSIS ENGINE (v5.0 smart filters)
+# ANALYSIS ENGINE
 # ═══════════════════════════════════════════════
 
 def analyze_symbol(symbol, tf_config):
@@ -344,7 +394,6 @@ def analyze_symbol(symbol, tf_config):
         ema50 = float(last['ema50'])
         ema200 = float(last['ema200'])
         
-        # Trend context for smart filtering
         strong_uptrend = (
             ema50 > ema200 and
             bar_price > ema50 and
@@ -363,7 +412,7 @@ def analyze_symbol(symbol, tf_config):
         htf_bullish = bar_price > ema200
         htf_bearish = bar_price < ema200
         
-        # Confluence scoring
+        # Confluence
         bull, bear = 0, 0
         if bar_price > last['ema20']: bull += 1
         else: bear += 1
@@ -419,7 +468,6 @@ def analyze_symbol(symbol, tf_config):
             prev['rsi'] > 68 and rsi_val < prev['rsi'] and
             bar_price < prev['Close'] and bear >= 5
         )
-        # NEW: Trend continuation — catches healthy parabolic moves
         trend_continuation_bull = (
             strong_uptrend and
             bull >= 7 and
@@ -448,7 +496,7 @@ def analyze_symbol(symbol, tf_config):
         elif trend_continuation_bull or trend_continuation_bear: trigger_type = "Trend Continuation"
         elif strong_bull or strong_bear: trigger_type = "Strong Momentum"
         
-        # SMART HARD BLOCKS (context-aware)
+        # Smart hard blocks
         if bull_trigger:
             if rsi_val >= 80 and not strong_uptrend:
                 return None, f"RSI extreme ({rsi_val:.0f}) + weak trend"
@@ -469,7 +517,7 @@ def analyze_symbol(symbol, tf_config):
             if htf_bullish and trigger_type == "Strong Momentum":
                 return None, "counter-HTF momentum"
         
-        # SQS scoring
+        # SQS
         def calc_sqs(score, is_bull):
             conf = score / 10 * 40
             regime = 15 if 22 < adx_val < 50 else 10 if adx_val > 20 else 5
@@ -513,11 +561,11 @@ def analyze_symbol(symbol, tf_config):
                 return None, f"bear={bear} no trigger (rsi={rsi_val:.0f})"
             return None, None
         
-        # Get LIVE price for accurate entry
+        # Live price for accurate entry
         live_price = get_real_time_price(symbol)
         entry_price = live_price if live_price else bar_price
         
-        # Structure-based SL/TP using LIVE price
+        # SL/TP
         lookback_bars = 10
         recent_low = float(df['Low'].iloc[-lookback_bars-1:-1].min())
         recent_high = float(df['High'].iloc[-lookback_bars-1:-1].max())
@@ -543,7 +591,6 @@ def analyze_symbol(symbol, tf_config):
             tp2 = entry_price - risk * 2
             tp3 = entry_price - risk * 3
         
-        # Position sizing
         dollar_risk = ACCOUNT_SIZE * RISK_PCT / 100
         shares = int(dollar_risk / risk) if risk > 0 else 0
         notional = round(shares * entry_price, 2)
@@ -578,6 +625,8 @@ def analyze_symbol(symbol, tf_config):
             'session': get_session(),
             'decimals': decimals,
             'strong_trend': strong_uptrend if signal_type == 'BUY' else strong_downtrend,
+            'is_crypto': is_crypto(symbol),
+            'is_extended_hours': is_extended_hours_session() and not is_crypto(symbol),
         }, None
     
     except Exception as e:
@@ -608,6 +657,7 @@ def create_trade(sig):
         'tf': sig['timeframe'],
         'tf_label': sig['tf_label'],
         'opened_at': now_est().isoformat(),
+        'opened_session': sig['session'],
         'tp1_hit': False,
         'tp2_hit': False,
         'tp3_hit': False,
@@ -621,12 +671,11 @@ def create_trade(sig):
     }
 
 def check_trade_progress(trade):
-    """Check TP/SL using CLOSE prices (realistic fills)."""
     result = get_live_ohlc(trade['symbol'])
     if not result:
         return [], False
     
-    current, _, _ = result  # use close only
+    current, _, _ = result
     events = []
     is_long = trade['signal'] == 'BUY'
     
@@ -640,13 +689,13 @@ def check_trade_progress(trade):
             trade['closed'] = True
             trade['closed_reason'] = 'Timeout (72h)'
             trade['closed_at'] = now_est().isoformat()
-            trade['final_r'] = 0  # no gain/loss if timed out
+            trade['final_r'] = 0
             events.append({'type': 'TIMEOUT', 'price': current})
             return events, True
     except:
         pass
     
-    # SL check (use close — more realistic)
+    # SL check
     if is_long and current <= trade['sl']:
         trade['closed'] = True
         trade['closed_reason'] = 'SL Hit'
@@ -662,7 +711,7 @@ def check_trade_progress(trade):
         events.append({'type': 'SL', 'price': trade['sl']})
         return events, True
     
-    # TP hits (check close >= TP level)
+    # TP hits
     if is_long:
         if not trade['tp1_hit'] and current >= trade['tp1']:
             trade['tp1_hit'] = True
@@ -703,10 +752,8 @@ def check_trade_progress(trade):
     return events, False
 
 def archive_trade(trade):
-    """Save closed trade to permanent history."""
     history = load_json(HISTORY_FILE, [])
     history.append(trade)
-    # Keep last 500 trades
     if len(history) > 500:
         history = history[-500:]
     save_json(HISTORY_FILE, history)
@@ -719,13 +766,17 @@ def get_ai_analysis(sig):
     if not GEMINI_API_KEY:
         return None
     
+    ah_note = ""
+    if sig.get('is_extended_hours'):
+        ah_note = "\nIMPORTANT: This is an after-hours/pre-market signal — liquidity is thin."
+    
     prompt = f"""Analyze this trading signal in EXACTLY 3 short lines (max 100 chars each).
 
 SYMBOL: {sig['symbol']} ({sig['signal']} @ ${sig['price']})
 TF: {sig['timeframe']} | Trigger: {sig['trigger']}
 Score: {sig['score']}/10 ({sig['grade']}) | SQS: {sig['sqs']}/100
 RSI: {sig['rsi']} | ADX: {sig['adx']} | Regime: {sig['regime']}
-R:R = 1:3 | Stretch: {sig['stretch']}×ATR | Strong trend: {sig['strong_trend']}
+R:R = 1:3 | Stretch: {sig['stretch']}×ATR | Strong trend: {sig['strong_trend']}{ah_note}
 
 Respond EXACTLY:
 📝 [setup quality assessment]
@@ -757,7 +808,6 @@ def fmt_price(val, decimals):
     return f"{val:.{decimals}f}"
 
 def time_ago(iso_str):
-    """Return human-readable time elapsed."""
     try:
         dt = datetime.fromisoformat(iso_str)
         if dt.tzinfo is None:
@@ -777,7 +827,6 @@ def time_ago(iso_str):
         return "?"
 
 def price_ladder(trade, current_price):
-    """ASCII visualization of price levels."""
     dec = trade['decimals']
     is_long = trade['signal'] == 'BUY'
     
@@ -789,7 +838,6 @@ def price_ladder(trade, current_price):
         ('Ent', trade['entry'], '📍', None),
         ('SL ', trade['sl'],  '🛑', None),
     ]
-    # Sort: highest price at top for longs, lowest for shorts
     levels.sort(key=lambda x: -x[1] if is_long else x[1])
     
     lines = []
@@ -806,6 +854,13 @@ def format_new_signal(sig, ai_text=None):
     msg = f"{sig['tier']} {emoji} *{sig['signal']} {sym_emoji} {sig['symbol']}* `[{sig['tf_label']}]`\n"
     msg += f"{sig['session']} • {now_est().strftime('%H:%M %Z')}\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
+    
+    # ⚠️ After-hours warning for stocks
+    if sig.get('is_extended_hours'):
+        msg += f"⚠️ *After-hours signal — thin liquidity!*\n"
+        msg += f"_Wider spreads, execution may slip. Use limit orders._\n"
+        msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
+    
     msg += f"💵 *Live Entry:* `${fmt_price(sig['price'], dec)}`\n"
     msg += f"🎯 *Trigger:* {sig['trigger']}\n"
     msg += f"📊 *Quality:* {sig['score']}/10 ({sig['grade']}) • SQS *{sig['sqs']}*\n"
@@ -895,19 +950,23 @@ def format_trade_event(trade, event, current_price):
     return msg
 
 def format_digest(signals):
-    """Batched digest when many signals fire at once."""
     msg = f"🔔 *SIGNAL DIGEST — {len(signals)} alerts*\n"
     msg += f"{get_session()} • {fmt_time()}\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n\n"
     
+    ah_count = sum(1 for s in signals if s.get('is_extended_hours'))
+    if ah_count > 0:
+        msg += f"⚠️ _{ah_count} signal(s) in extended hours — thin liquidity_\n\n"
+    
     for sig in signals:
         emoji = "🟢" if sig['signal'] == 'BUY' else "🔴"
-        msg += f"{sig['tier']} {emoji} *{sig['symbol']}* `[{sig['tf_label']}]`\n"
+        ah_tag = " ⚠️" if sig.get('is_extended_hours') else ""
+        msg += f"{sig['tier']} {emoji} *{sig['symbol']}* `[{sig['tf_label']}]`{ah_tag}\n"
         msg += f"  {sig['emoji']} {sig['signal']} @ `${fmt_price(sig['price'], sig['decimals'])}` • SQS {sig['sqs']}\n"
         msg += f"  🎯 {sig['trigger']} | RSI {sig['rsi']} | Shares: {sig['shares']}\n"
         msg += f"  🛑 SL `${fmt_price(sig['sl'], sig['decimals'])}` → 🎯 TP3 `${fmt_price(sig['tp3'], sig['decimals'])}`\n\n"
     
-    msg += f"_Reply with symbol name to get full trade plan._"
+    msg += f"_Full trade plans sent separately._"
     return msg
 
 # ═══════════════════════════════════════════════
@@ -915,7 +974,6 @@ def format_digest(signals):
 # ═══════════════════════════════════════════════
 
 def get_market_context():
-    """Fetch SPY/QQQ/VIX for daily context."""
     try:
         tickers = ['SPY', 'QQQ', '^VIX']
         data = {}
@@ -934,7 +992,6 @@ def get_market_context():
         return None
 
 def format_market_context():
-    """Format daily market context message."""
     ctx = get_market_context()
     if not ctx:
         return None
@@ -943,7 +1000,6 @@ def format_market_context():
     qqq = ctx.get('QQQ', {})
     vix = ctx.get('^VIX', {})
     
-    # Determine regime
     if vix.get('price', 20) < 15:
         vol_regime = "🟢 Low Vol"
     elif vix.get('price', 20) < 22:
@@ -979,12 +1035,10 @@ def format_market_context():
 # ═══════════════════════════════════════════════
 
 def format_weekly_summary():
-    """Sunday 9PM EDT — weekly performance report."""
     history = load_json(HISTORY_FILE, [])
     if not history:
         return None
     
-    # Filter last 7 days
     cutoff = now_est() - timedelta(days=7)
     week_trades = []
     for t in history:
@@ -1013,7 +1067,6 @@ def format_weekly_summary():
     best = max(week_trades, key=lambda t: t.get('final_r', 0) or 0)
     worst = min(week_trades, key=lambda t: t.get('final_r', 0) or 0)
     
-    # Grade breakdown
     grades = {'A+': [0, 0], 'A': [0, 0], 'B': [0, 0], 'C': [0, 0]}
     for t in week_trades:
         g = t.get('grade', 'C')
@@ -1023,13 +1076,12 @@ def format_weekly_summary():
                 grades[g][1] += 1
     
     msg = f"📊 *WEEKLY SUMMARY*\n"
-    msg += f"{(cutoff).strftime('%b %d')} → {now_est().strftime('%b %d')}\n"
+    msg += f"{cutoff.strftime('%b %d')} → {now_est().strftime('%b %d')}\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
     msg += f"Total signals: *{len(week_trades)}*\n"
     msg += f"✅ Wins: *{len(wins)}* ({win_rate:.0f}%)\n"
     msg += f"❌ Losses: *{len(losses)}*\n"
-    msg += f"➖ Breakeven: *{len(breakevens)}*\n"
-    msg += f"\n"
+    msg += f"➖ Breakeven: *{len(breakevens)}*\n\n"
     msg += f"💰 *Total R: {'+'if total_r>=0 else ''}{total_r:.1f}R*\n"
     msg += f"🏆 Best: *{best['symbol']}* ({best.get('final_r', 0):+.1f}R)\n"
     msg += f"💥 Worst: *{worst['symbol']}* ({worst.get('final_r', 0):+.1f}R)\n"
@@ -1045,11 +1097,10 @@ def format_weekly_summary():
     return msg
 
 # ═══════════════════════════════════════════════
-# NEAR-MISS WATCHLIST DIGEST
+# NEAR-MISS DIGEST
 # ═══════════════════════════════════════════════
 
 def format_near_miss_digest(near_miss_list):
-    """Daily 9AM digest of setups that are forming but haven't triggered."""
     if not near_miss_list:
         return None
     
@@ -1058,7 +1109,7 @@ def format_near_miss_digest(near_miss_list):
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
     msg += f"_Symbols with strong confluence but no trigger yet_\n\n"
     
-    for item in near_miss_list[:10]:  # max 10
+    for item in near_miss_list[:10]:
         msg += f"⚡ {item['emoji']} *{item['symbol']}* `[{item['tf']}]`: {item['reason']}\n"
     
     msg += f"\n_Watch these — next pullback/breakout may trigger._"
@@ -1076,7 +1127,6 @@ CORRELATION_GROUPS = {
 }
 
 def detect_correlations(signals):
-    """Return list of correlation warnings."""
     warnings = []
     for group_name, symbols in CORRELATION_GROUPS.items():
         matching = [s for s in signals if s['symbol'] in symbols]
@@ -1109,26 +1159,23 @@ def send_telegram(message, silent=False):
         return False
 
 # ═══════════════════════════════════════════════
-# STATE (for daily/weekly triggers)
+# STATE TRIGGERS
 # ═══════════════════════════════════════════════
 
 def should_send_daily_context():
-    """Send market context once per day at/after 9AM."""
     state = load_json(STATE_FILE, {})
     today = now_est().strftime('%Y-%m-%d')
-    last = state.get('last_context_date')
-    
-    if last == today:
+    if state.get('last_context_date') == today:
         return False
     if now_est().hour < 9:
         return False
-    
+    if now_est().weekday() >= 5:  # no weekend context
+        return False
     state['last_context_date'] = today
     save_json(STATE_FILE, state)
     return True
 
 def should_send_weekly_summary():
-    """Send weekly summary on Sunday 9PM+."""
     state = load_json(STATE_FILE, {})
     now = now_est()
     if now.weekday() != 6:  # Sunday
@@ -1143,12 +1190,13 @@ def should_send_weekly_summary():
     return True
 
 def should_send_near_miss_digest():
-    """Send near-miss digest daily at 9AM."""
     state = load_json(STATE_FILE, {})
     today = now_est().strftime('%Y-%m-%d')
     if state.get('last_nearmiss') == today:
         return False
     if now_est().hour < 9 or now_est().hour > 10:
+        return False
+    if now_est().weekday() >= 5:  # no weekend digest
         return False
     state['last_nearmiss'] = today
     save_json(STATE_FILE, state)
@@ -1159,21 +1207,24 @@ def should_send_near_miss_digest():
 # ═══════════════════════════════════════════════
 
 def main():
+    session = get_session()
+    active_list = get_active_watchlist()
+    
     print(f"\n{'='*60}")
-    print(f"AlphaEdge v5.0 Scanner @ {fmt_datetime()}")
-    print(f"Session: {get_session()}")
-    print(f"Scanning {len(WATCHLIST)} symbols × {len(TIMEFRAMES)} TFs")
+    print(f"AlphaEdge v5.1 Scanner @ {fmt_datetime()}")
+    print(f"Session: {session}")
+    print(f"Active watchlist: {len(active_list)}/{len(ALL_SYMBOLS)} symbols")
     print(f"Account: ${ACCOUNT_SIZE:,} | Risk/trade: {RISK_PCT}%")
     print(f"AI: {bool(GEMINI_API_KEY)} | MIN_SQS: {MIN_SQS}")
     print(f"{'='*60}\n")
     
-    logging.info(f"Scan start | Session: {get_session()}")
+    logging.info(f"Scan start | Session: {session} | Active: {len(active_list)}")
     
     cache = load_cache_with_migration()
     trades = load_json(TRADES_FILE, {})
     
     # ═══════════════════════════════════════════════
-    # DAILY: Market context (once per day after 9AM)
+    # Daily market context (once per weekday 9AM+)
     # ═══════════════════════════════════════════════
     if should_send_daily_context():
         print("🌍 Sending daily market context...")
@@ -1182,10 +1233,12 @@ def main():
             send_telegram(ctx_msg, silent=True)
     
     # ═══════════════════════════════════════════════
-    # STEP 1: Check active trades
+    # STEP 1: Check ALL active trades (regardless of session!)
     # ═══════════════════════════════════════════════
+    # CRITICAL: active trades are checked 24/7 even outside scanning hours
+    # so you don't miss TP/SL hits on stocks during after-hours
     if trades:
-        print(f"📊 Checking {len(trades)} active trade(s)...")
+        print(f"📊 Checking {len(trades)} active trade(s) (all sessions)...")
         trades_to_remove = []
         
         for trade_key, trade in list(trades.items()):
@@ -1231,17 +1284,18 @@ def main():
         print()
     
     # ═══════════════════════════════════════════════
-    # STEP 2: Scan for new signals (multi-TF)
+    # STEP 2: Scan for new signals (session-filtered watchlist)
     # ═══════════════════════════════════════════════
-    print(f"🔍 Scanning for new signals...")
+    print(f"🔍 Scanning {len(active_list)} symbols for new signals...")
+    
     new_signals = []
     skipped_dupe = 0
     skipped_active = 0
     ai_calls = 0
     near_misses = []
-    strong_near_miss = []  # for daily digest
+    strong_near_miss = []
     
-    for symbol in WATCHLIST:
+    for symbol in active_list:
         for tf_cfg in TIMEFRAMES:
             tf = tf_cfg['tf']
             label = tf_cfg['label']
@@ -1266,7 +1320,6 @@ def main():
             if not result:
                 if DEBUG_NEAR_MISS and reason:
                     print(f"⚪ {reason}")
-                    # Track strong near-misses for daily digest
                     if 'bull=' in str(reason) or 'bear=' in str(reason):
                         strong_near_miss.append({
                             'symbol': symbol,
@@ -1285,7 +1338,6 @@ def main():
                 print(f"🔕 cooldown")
                 continue
             
-            # AI for high-quality signals
             ai_text = None
             if result['sqs'] >= AI_TIER_THRESHOLD and GEMINI_API_KEY:
                 print(f"🤖", end=" ")
@@ -1301,31 +1353,32 @@ def main():
             logging.info(f"NEW SIGNAL: {symbol} {tf} {result['signal']} SQS={result['sqs']}")
     
     # ═══════════════════════════════════════════════
-    # STEP 3: Send new signals (individual or digest)
+    # STEP 3: Send signals (individual or digest)
     # ═══════════════════════════════════════════════
     if new_signals:
-        # Check for correlations
         corr_warnings = detect_correlations(new_signals)
         
         if len(new_signals) >= DIGEST_THRESHOLD:
-            # Send digest
             digest = format_digest(new_signals)
             if corr_warnings:
                 digest += f"\n\n*⚠️ CORRELATION ALERT*\n"
                 for w in corr_warnings:
                     digest += f"{w}\n"
-                digest += f"_Consider reducing per-trade size (you have {len(new_signals)}× market exposure)._"
+                digest += f"_Consider reducing per-trade size._"
             send_telegram(digest, silent=False)
             print(f"📦 Sent digest with {len(new_signals)} signals")
+            # Also send full details
+            for sig in new_signals:
+                msg = format_new_signal(sig, sig.get('ai_text'))
+                silent = 'FAIR' in sig['tier']
+                send_telegram(msg, silent=silent)
         else:
-            # Send individually
             for sig in new_signals:
                 msg = format_new_signal(sig, sig.get('ai_text'))
                 silent = 'FAIR' in sig['tier']
                 send_telegram(msg, silent=silent)
             print(f"📨 Sent {len(new_signals)} individual alerts")
             
-            # Correlation warning as separate message
             if corr_warnings:
                 warn_msg = f"⚠️ *CORRELATION ALERT*\n"
                 warn_msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
@@ -1338,7 +1391,7 @@ def main():
     save_json(TRADES_FILE, trades)
     
     # ═══════════════════════════════════════════════
-    # STEP 4: Daily near-miss digest (9AM only)
+    # STEP 4: Daily near-miss digest (9AM weekdays)
     # ═══════════════════════════════════════════════
     if should_send_near_miss_digest() and strong_near_miss:
         print(f"👀 Sending near-miss digest ({len(strong_near_miss)} items)...")
@@ -1347,7 +1400,7 @@ def main():
             send_telegram(digest_msg, silent=True)
     
     # ═══════════════════════════════════════════════
-    # STEP 5: Weekly summary (Sunday 9PM+ only)
+    # STEP 5: Weekly summary (Sunday 9PM+)
     # ═══════════════════════════════════════════════
     if should_send_weekly_summary():
         print(f"📊 Sending weekly summary...")
@@ -1361,6 +1414,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"✅ New: {len(new_signals)} | 🔕 Cooldown: {skipped_dupe} | 🔒 Active: {skipped_active}")
     print(f"⚪ Near-miss: {len(near_misses)} | 🤖 AI: {ai_calls} | 📊 Open: {len(trades)}")
+    print(f"Session: {session} | Watchlist: {len(active_list)}/{len(ALL_SYMBOLS)}")
     print(f"{'='*60}")
     
     logging.info(f"Scan end | New:{len(new_signals)} Active:{len(trades)} AI:{ai_calls}")
