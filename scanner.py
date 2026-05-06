@@ -14,7 +14,7 @@ from datetime import datetime
 # ═══════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════
-TELEGRAM_TOKEN = os.environ.get('8591147835:AAH38Zp8pud9-2m5Ow6C2Kq1g2j9mCrPgAk')
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID', '820394470')
 
 # Your watchlist - ADD/REMOVE symbols here
