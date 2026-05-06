@@ -9,7 +9,7 @@ import numpy as np
 import requests
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # ═══════════════════════════════════════════════
 # CONFIG
@@ -17,6 +17,12 @@ from datetime import datetime, timedelta
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID', '820394470')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+
+# EST timezone (UTC-5, no DST handling - use EDT offset if needed)
+EST = timezone(timedelta(hours=-5))
+
+def now_est():
+    return datetime.now(EST)
 
 # 👇 YOUR CUSTOM WATCHLIST 👇
 WATCHLIST = [
@@ -144,11 +150,14 @@ def is_duplicate(symbol, signal_type, cache):
     if key not in cache:
         return False
     last_time = datetime.fromisoformat(cache[key])
-    return datetime.now() - last_time < timedelta(hours=COOLDOWN_HOURS)
+    # Ensure timezone-aware comparison
+    if last_time.tzinfo is None:
+        last_time = last_time.replace(tzinfo=EST)
+    return now_est() - last_time < timedelta(hours=COOLDOWN_HOURS)
 
 def mark_sent(symbol, signal_type, cache):
     key = f"{symbol}_{signal_type}"
-    cache[key] = datetime.now().isoformat()
+    cache[key] = now_est().isoformat()
 
 # ═══════════════════════════════════════════════
 # GEMINI AI ANALYSIS (FREE)
@@ -383,7 +392,7 @@ def format_message(sig, ai_text=None):
         msg += f"🤖 *AI ANALYSIS*\n"
         msg += f"{ai_text}\n"
     
-    msg += f"\n⏰ {datetime.now().strftime('%H:%M UTC')}"
+    msg += f"\n⏰ {now_est().strftime('%H:%M EST')}"
     return msg
 
 def send_telegram(message, silent=False):
@@ -406,7 +415,7 @@ def send_telegram(message, silent=False):
 
 def main():
     print(f"\n{'='*50}")
-    print(f"AlphaEdge v3 AI Scanner @ {datetime.now()}")
+    print(f"AlphaEdge v3 AI Scanner @ {now_est().strftime('%Y-%m-%d %H:%M:%S EST')}")
     print(f"Scanning {len(WATCHLIST)} symbols on {TIMEFRAME}")
     print(f"AI enabled: {bool(GEMINI_API_KEY)}")
     print(f"{'='*50}\n")
