@@ -1,32 +1,36 @@
 """
-ALPHAEDGE PYTHON SCANNER v5.1 - SESSION-AWARE
+ALPHAEDGE PYTHON SCANNER v5.2 - POLISHED
 ═══════════════════════════════════════════════════════════════
-CHANGES IN v5.1:
-• Smart watchlist filtering by trading session
-• Split into crypto/stocks/extended-hours groups
-• After-hours signal warnings (thin liquidity alert)
-• Gold futures respects Sunday maintenance break
-• Active trades still monitored 24/7 regardless of session
+v5.2 FIXES:
+• Fractional shares for crypto/gold (was showing 0 for BTC)
+• Price sanity check vs daily close (rejects bad data)
+• Dedupe correlation groups (XRP duplicate fixed)
+• Cap max SL distance (4% stocks, 8% crypto)
+• Multi-TF badge in digest (🎯🎯 when same symbol fires on 2 TFs)
+• Correlation risk dollar math (shows total $ at risk)
+• Smart full-detail filtering (only SQS 70+ gets full message)
 
-INHERITS FROM v5.0:
-• Smart context-aware RSI filtering
+v5.2 UI IMPROVEMENTS:
+• SQS visual meter
+• Dollar amounts per TP level
+• Price progress indicator (entry → current → TP1)
+• Nearby support/resistance levels
+• Signal expiry time
+• Session-specific trading tips
+• Open positions summary at scan start
+• Daily statistics in digest
+• Better trailing stop instructions
+• Plain English "why this signal" line
+
+INHERITS FROM v5.1:
+• Session-aware watchlist (crypto/stocks/mega-caps)
+• Smart RSI context-aware filtering
 • Multi-timeframe (30m + 1h)
 • Live price entries
-• Close-based SL/TP detection
-• Position sizing with risk management
-• Price ladder visualization
-• Trade age counter
-• Symbol emojis
-• Smart cooldown by SQS tier
-• Session tagging
-• Weekly performance summary
-• Trade history archive
-• Correlation detection
-• Daily near-miss digest
-• Market context (SPY/QQQ/VIX)
-• Batch digest mode
-• Log archiving
-• Rate limit protection
+• Position sizing
+• Price ladder
+• Trade tracking
+• Weekly summary, market context, near-miss digest
 """
 
 import yfinance as yf
@@ -63,24 +67,24 @@ def fmt_datetime():
 ACCOUNT_SIZE = 10000
 RISK_PCT = 1.0
 
+# 🛡️ SAFETY CAPS
+MAX_SL_PCT_STOCKS = 0.04   # 4% max stop for stocks
+MAX_SL_PCT_CRYPTO = 0.08   # 8% max stop for crypto
+PRICE_SANITY_DEVIATION = 0.20  # Reject if live price differs >20% from daily close
+
 # ═══════════════════════════════════════════════
-# WATCHLIST GROUPS (session-aware)
+# WATCHLIST GROUPS
 # ═══════════════════════════════════════════════
 
-# 🪙 24/7 — crypto + gold (gold pauses briefly Sunday)
 CRYPTO_WATCHLIST = [
     'BTC-USD', 'ETH-USD', 'XRP-USD',
     'GC=F',
 ]
 
-# 💎 Mega-cap stocks — OK during extended hours (pre-market + after-hours)
-# These have enough liquidity that 4AM-8PM signals are tradeable
 EXTENDED_HOURS_STOCKS = [
     'NVDA', 'TSLA', 'AMD', 'MSFT', 'META', 'AMZN', 'GOOGL', 'NFLX'
 ]
 
-# 📊 All other stocks — ONLY during regular market hours (9:30 AM - 4 PM EDT)
-# Thin after-hours liquidity makes signals unreliable
 REGULAR_HOURS_ONLY = [
     'MU', 'SNDK', 'NBIS',
     'IONQ', 'RGTI', 'QBTS',
@@ -88,10 +92,8 @@ REGULAR_HOURS_ONLY = [
     'SOFI', 'NVO',
 ]
 
-# Combined for emoji mapping and weekly summary
 ALL_SYMBOLS = CRYPTO_WATCHLIST + EXTENDED_HOURS_STOCKS + REGULAR_HOURS_ONLY
 
-# Symbol emojis
 SYMBOL_EMOJI = {
     'BTC-USD': '₿', 'ETH-USD': 'Ξ', 'XRP-USD': '◇',
     'GC=F': '🥇',
@@ -103,19 +105,17 @@ SYMBOL_EMOJI = {
     'SOFI': '🏦', 'NVO': '💉',
 }
 
-# Multi-timeframe scanning
 TIMEFRAMES = [
     {'tf': '30m', 'lookback': '60d', 'label': '⚡30m', 'min_bars': 100},
     {'tf': '1h',  'lookback': '3mo', 'label': '📊1h',  'min_bars': 200},
 ]
 
-# Signal quality thresholds
 MIN_SQS = 60
 MIN_SCORE = 5
 AI_TIER_THRESHOLD = 70
+FULL_DETAIL_SQS = 70   # Only send full trade plan message if SQS >= this (in digest mode)
 MAX_TRADE_AGE_HOURS = 72
 
-# Smart cooldown by SQS tier (hours)
 COOLDOWN_ELITE = 2
 COOLDOWN_STRONG = 4
 COOLDOWN_GOOD = 6
@@ -125,7 +125,6 @@ DIGEST_THRESHOLD = 4
 DEBUG_NEAR_MISS = True
 FETCH_DELAY = 0.3
 
-# File paths
 ALERT_CACHE = 'alert_cache.json'
 TRADES_FILE = 'active_trades.json'
 HISTORY_FILE = 'trade_history.json'
@@ -144,7 +143,6 @@ logging.basicConfig(
 # ═══════════════════════════════════════════════
 
 def get_session():
-    """Return trading session tag based on EST time."""
     now = now_est()
     hour = now.hour
     minute = now.minute
@@ -169,45 +167,28 @@ def get_session():
         return "🌑 Overnight"
 
 def is_crypto(symbol):
-    """Check if symbol is crypto or gold futures (24/7-ish)."""
     return symbol.endswith('-USD') or symbol == 'GC=F'
 
 def is_extended_hours_session():
-    """True if we're in pre-market or after-hours (stocks have reduced liquidity)."""
     session = get_session()
     return session in ['🌅 Pre-Market', '🌙 After-Hours']
 
 def is_regular_market_open():
-    """True if regular US market hours (9:30 AM - 4:00 PM EDT weekday)."""
     session = get_session()
     return session in ['🔔 Market Open', '📊 Midday', '⚡ Power Hour']
 
 def get_active_watchlist():
-    """
-    Return symbols that should be scanned RIGHT NOW based on session.
-    
-    - Weekend: crypto only
-    - Overnight (8PM - 4AM): crypto only
-    - Pre-Market (4-9:30 AM): crypto + mega-cap stocks
-    - Regular Hours (9:30 AM - 4 PM): ALL symbols
-    - After-Hours (4-8 PM): crypto + mega-cap stocks
-    """
     session = get_session()
     
     if session == "🌐 Weekend":
         return CRYPTO_WATCHLIST
-    
     if session == "🌑 Overnight":
         return CRYPTO_WATCHLIST
-    
     if session in ["🌅 Pre-Market", "🌙 After-Hours"]:
         return CRYPTO_WATCHLIST + EXTENDED_HOURS_STOCKS
-    
-    # Regular market hours — scan everything
     if is_regular_market_open():
         return CRYPTO_WATCHLIST + EXTENDED_HOURS_STOCKS + REGULAR_HOURS_ONLY
     
-    # Fallback (shouldn't reach here)
     return CRYPTO_WATCHLIST
 
 # ═══════════════════════════════════════════════
@@ -324,7 +305,7 @@ def mark_sent(symbol, signal_key, cache):
     cache[f"{symbol}_{signal_key}"] = now_est().isoformat()
 
 # ═══════════════════════════════════════════════
-# LIVE PRICE FETCH
+# LIVE PRICE + SANITY CHECK
 # ═══════════════════════════════════════════════
 
 def get_real_time_price(symbol):
@@ -351,8 +332,90 @@ def get_live_ohlc(symbol):
     except:
         return None
 
+def get_daily_close(symbol):
+    """Get yesterday's close for sanity checking."""
+    try:
+        df = yf.download(symbol, period='5d', interval='1d',
+                        progress=False, auto_adjust=True)
+        if df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return float(df['Close'].iloc[-1])
+    except:
+        return None
+
+def sanity_check_price(symbol, live_price):
+    """Return True if live_price is within acceptable range of daily close."""
+    daily = get_daily_close(symbol)
+    if daily is None or daily <= 0:
+        return True  # can't check, allow
+    deviation = abs(live_price - daily) / daily
+    return deviation <= PRICE_SANITY_DEVIATION
+
 # ═══════════════════════════════════════════════
-# ANALYSIS ENGINE
+# POSITION SIZING (v5.2 — fractional crypto)
+# ═══════════════════════════════════════════════
+
+def calculate_position_size(symbol, entry_price, risk_per_unit):
+    """
+    Returns (shares, notional, dollar_risk).
+    Crypto/gold get fractional precision, stocks get whole shares.
+    """
+    dollar_risk = ACCOUNT_SIZE * RISK_PCT / 100
+    
+    if risk_per_unit <= 0:
+        return 0, 0, dollar_risk
+    
+    raw_shares = dollar_risk / risk_per_unit
+    
+    if is_crypto(symbol):
+        # Crypto: 4-8 decimal precision
+        if entry_price > 1000:  # BTC, ETH
+            shares = round(raw_shares, 6)
+        else:  # XRP, altcoins
+            shares = round(raw_shares, 2)
+    elif symbol == 'GC=F':
+        shares = round(raw_shares, 2)  # gold futures allow fractional
+    else:
+        # Stocks: whole shares only
+        shares = int(raw_shares)
+    
+    notional = round(shares * entry_price, 2)
+    return shares, notional, dollar_risk
+
+# ═══════════════════════════════════════════════
+# NEARBY LEVELS (v5.2 NEW)
+# ═══════════════════════════════════════════════
+
+def find_nearby_levels(df, current_price, signal_type):
+    """Find support/resistance within reasonable range of current price."""
+    lookback = min(60, len(df) - 1)
+    
+    # Find recent swing highs (resistance) and lows (support)
+    highs = df['High'].iloc[-lookback:].values
+    lows = df['Low'].iloc[-lookback:].values
+    
+    # Get top 3 resistance (above price) and top 3 support (below price)
+    above = sorted([h for h in highs if h > current_price * 1.002], reverse=False)[:2]
+    below = sorted([l for l in lows if l < current_price * 0.998], reverse=True)[:2]
+    
+    resistance = above[0] if above else None
+    support = below[0] if below else None
+    
+    # EMAs are also key levels
+    ema50 = float(df['ema50'].iloc[-1])
+    ema200 = float(df['ema200'].iloc[-1])
+    
+    return {
+        'resistance': resistance,
+        'support': support,
+        'ema50': ema50,
+        'ema200': ema200,
+    }
+
+# ═══════════════════════════════════════════════
+# ANALYSIS ENGINE (v5.2 with all fixes)
 # ═══════════════════════════════════════════════
 
 def analyze_symbol(symbol, tf_config):
@@ -489,12 +552,27 @@ def analyze_symbol(symbol, tf_config):
         bear_trigger = fresh_bear or pullback_bear or overbought_drop or strong_bear or trend_continuation_bear
         
         trigger_type = ""
-        if fresh_bull or fresh_bear: trigger_type = "Fresh Cross"
-        elif pullback_bull or pullback_bear: trigger_type = "Pullback"
-        elif oversold_bounce: trigger_type = "Oversold Bounce"
-        elif overbought_drop: trigger_type = "Overbought Drop"
-        elif trend_continuation_bull or trend_continuation_bear: trigger_type = "Trend Continuation"
-        elif strong_bull or strong_bear: trigger_type = "Strong Momentum"
+        trigger_desc = ""
+        if fresh_bull:
+            trigger_type, trigger_desc = "Fresh Cross", "EMA50/Supertrend/MACD just flipped bullish"
+        elif fresh_bear:
+            trigger_type, trigger_desc = "Fresh Cross", "EMA50/Supertrend/MACD just flipped bearish"
+        elif pullback_bull:
+            trigger_type, trigger_desc = "Pullback", "Retested EMA20 support in uptrend, bouncing"
+        elif pullback_bear:
+            trigger_type, trigger_desc = "Pullback", "Retested EMA20 resistance in downtrend, rejecting"
+        elif oversold_bounce:
+            trigger_type, trigger_desc = "Oversold Bounce", "RSI below 32, momentum shifting up"
+        elif overbought_drop:
+            trigger_type, trigger_desc = "Overbought Drop", "RSI above 68, momentum shifting down"
+        elif trend_continuation_bull:
+            trigger_type, trigger_desc = "Trend Continuation", "Strong uptrend breaking recent highs"
+        elif trend_continuation_bear:
+            trigger_type, trigger_desc = "Trend Continuation", "Strong downtrend breaking recent lows"
+        elif strong_bull:
+            trigger_type, trigger_desc = "Strong Momentum", "All indicators aligned bullish with strong ADX"
+        elif strong_bear:
+            trigger_type, trigger_desc = "Strong Momentum", "All indicators aligned bearish with strong ADX"
         
         # Smart hard blocks
         if bull_trigger:
@@ -561,14 +639,23 @@ def analyze_symbol(symbol, tf_config):
                 return None, f"bear={bear} no trigger (rsi={rsi_val:.0f})"
             return None, None
         
-        # Live price for accurate entry
+        # Live price with SANITY CHECK
         live_price = get_real_time_price(symbol)
         entry_price = live_price if live_price else bar_price
         
-        # SL/TP
+        # Reject if price seems corrupted
+        if live_price and not sanity_check_price(symbol, live_price):
+            daily = get_daily_close(symbol)
+            return None, f"bad data (live=${live_price:.2f}, daily=${daily:.2f})"
+        
+        # SL/TP computation
         lookback_bars = 10
         recent_low = float(df['Low'].iloc[-lookback_bars-1:-1].min())
         recent_high = float(df['High'].iloc[-lookback_bars-1:-1].max())
+        
+        # MAX SL CAP
+        max_sl_pct = MAX_SL_PCT_CRYPTO if is_crypto(symbol) else MAX_SL_PCT_STOCKS
+        max_sl_dist = entry_price * max_sl_pct
         
         if signal_type == 'BUY':
             atr_sl = entry_price - (atr_val * 2)
@@ -576,6 +663,10 @@ def analyze_symbol(symbol, tf_config):
             sl = min(atr_sl, struct_sl)
             min_sl = entry_price - (atr_val * 0.5)
             sl = min(sl, min_sl)
+            # Cap: don't let SL be too far
+            capped_sl = entry_price - max_sl_dist
+            sl = max(sl, capped_sl)  # take the tighter (higher) one
+            
             risk = entry_price - sl
             tp1 = entry_price + risk
             tp2 = entry_price + risk * 2
@@ -586,16 +677,33 @@ def analyze_symbol(symbol, tf_config):
             sl = max(atr_sl, struct_sl)
             min_sl = entry_price + (atr_val * 0.5)
             sl = max(sl, min_sl)
+            # Cap: don't let SL be too far
+            capped_sl = entry_price + max_sl_dist
+            sl = min(sl, capped_sl)
+            
             risk = sl - entry_price
             tp1 = entry_price - risk
             tp2 = entry_price - risk * 2
             tp3 = entry_price - risk * 3
         
-        dollar_risk = ACCOUNT_SIZE * RISK_PCT / 100
-        shares = int(dollar_risk / risk) if risk > 0 else 0
-        notional = round(shares * entry_price, 2)
+        # Position sizing (fractional for crypto)
+        shares, notional, dollar_risk = calculate_position_size(symbol, entry_price, risk)
+        
+        # Dollar profits at each TP
+        tp1_profit = shares * risk * 1
+        tp2_profit = shares * risk * 2
+        tp3_profit = shares * risk * 3
+        
+        # Nearby levels
+        nearby = find_nearby_levels(df, entry_price, signal_type)
+        
+        # Signal expiry (2-3 bars of TF)
+        tf_minutes = 30 if tf == '30m' else 60
+        expiry_mins = tf_minutes * 2  # valid for 2 bars
+        expiry_time = now_est() + timedelta(minutes=expiry_mins)
         
         decimals = 4 if entry_price < 10 else 2
+        sl_pct = abs(sl - entry_price) / entry_price * 100
         
         return {
             'symbol': symbol,
@@ -608,10 +716,15 @@ def analyze_symbol(symbol, tf_config):
             'sqs': round(sqs),
             'tier': tier(sqs),
             'trigger': trigger_type,
+            'trigger_desc': trigger_desc,
             'sl': round(sl, decimals),
+            'sl_pct': round(sl_pct, 2),
             'tp1': round(tp1, decimals),
             'tp2': round(tp2, decimals),
             'tp3': round(tp3, decimals),
+            'tp1_profit': round(tp1_profit, 2),
+            'tp2_profit': round(tp2_profit, 2),
+            'tp3_profit': round(tp3_profit, 2),
             'risk': round(risk, decimals),
             'shares': shares,
             'notional': notional,
@@ -627,6 +740,8 @@ def analyze_symbol(symbol, tf_config):
             'strong_trend': strong_uptrend if signal_type == 'BUY' else strong_downtrend,
             'is_crypto': is_crypto(symbol),
             'is_extended_hours': is_extended_hours_session() and not is_crypto(symbol),
+            'nearby': nearby,
+            'expiry_time': expiry_time.isoformat(),
         }, None
     
     except Exception as e:
@@ -679,7 +794,6 @@ def check_trade_progress(trade):
     events = []
     is_long = trade['signal'] == 'BUY'
     
-    # Age check
     try:
         opened = datetime.fromisoformat(trade['opened_at'])
         if opened.tzinfo is None:
@@ -695,7 +809,6 @@ def check_trade_progress(trade):
     except:
         pass
     
-    # SL check
     if is_long and current <= trade['sl']:
         trade['closed'] = True
         trade['closed_reason'] = 'SL Hit'
@@ -711,7 +824,6 @@ def check_trade_progress(trade):
         events.append({'type': 'SL', 'price': trade['sl']})
         return events, True
     
-    # TP hits
     if is_long:
         if not trade['tp1_hit'] and current >= trade['tp1']:
             trade['tp1_hit'] = True
@@ -801,11 +913,19 @@ Respond EXACTLY:
         return None
 
 # ═══════════════════════════════════════════════
-# MESSAGE FORMATTING
+# MESSAGE FORMATTING v5.2
 # ═══════════════════════════════════════════════
 
 def fmt_price(val, decimals):
     return f"{val:.{decimals}f}"
+
+def fmt_shares(shares, symbol):
+    """Format shares — whole for stocks, fractional for crypto."""
+    if is_crypto(symbol) or symbol == 'GC=F':
+        if shares < 1:
+            return f"{shares:.6f}" if shares < 0.01 else f"{shares:.4f}"
+        return f"{shares:.4f}" if shares < 100 else f"{shares:.2f}"
+    return f"{int(shares)}"
 
 def time_ago(iso_str):
     try:
@@ -825,6 +945,80 @@ def time_ago(iso_str):
         return f"{days}d {hours_rem}h"
     except:
         return "?"
+
+def time_until(iso_str):
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=EST)
+        delta = dt - now_est()
+        total_mins = int(delta.total_seconds() / 60)
+        if total_mins <= 0:
+            return "expired"
+        if total_mins < 60:
+            return f"{total_mins}m"
+        hours = total_mins // 60
+        mins = total_mins % 60
+        return f"{hours}h {mins}m"
+    except:
+        return "?"
+
+def sqs_meter(sqs):
+    """Visual SQS meter using 10 emoji blocks."""
+    filled = min(10, max(0, round(sqs / 10)))
+    
+    if sqs >= 85:
+        fill_emoji = "🟢"
+    elif sqs >= 70:
+        fill_emoji = "🟢"
+    elif sqs >= 60:
+        fill_emoji = "🟡"
+    else:
+        fill_emoji = "🟠"
+    
+    empty_emoji = "⚪"
+    return fill_emoji * filled + empty_emoji * (10 - filled)
+
+def price_progress(entry, current, tp1, sl, is_long):
+    """Show where price is between SL and TP1."""
+    if is_long:
+        if current >= tp1:
+            return "🎯 AT/ABOVE TP1"
+        if current <= sl:
+            return "🛑 AT/BELOW SL"
+        # Between SL and TP1
+        total_range = tp1 - sl
+        position = current - sl
+        pct = position / total_range if total_range > 0 else 0.5
+        # 10 segment bar
+        filled = int(pct * 10)
+        bar = "🟥" * min(1, max(0, 10 - filled - 5))  # losses in red
+        bar = ""
+        for i in range(10):
+            if i < filled:
+                bar += "🟩" if i >= 5 else "🟨"  # green above entry, yellow below
+            else:
+                bar += "⚪"
+        
+        r_current = (current - entry) / (entry - sl) if entry != sl else 0
+        return f"{bar}\nSL ──── Entry ──── TP1   ({r_current:+.2f}R)"
+    else:
+        if current <= tp1:
+            return "🎯 AT/BELOW TP1"
+        if current >= sl:
+            return "🛑 AT/ABOVE SL"
+        total_range = sl - tp1
+        position = sl - current
+        pct = position / total_range if total_range > 0 else 0.5
+        filled = int(pct * 10)
+        bar = ""
+        for i in range(10):
+            if i < filled:
+                bar += "🟩" if i >= 5 else "🟨"
+            else:
+                bar += "⚪"
+        r_current = (entry - current) / (sl - entry) if sl != entry else 0
+        return f"{bar}\nSL ──── Entry ──── TP1   ({r_current:+.2f}R)"
 
 def price_ladder(trade, current_price):
     dec = trade['decimals']
@@ -846,44 +1040,102 @@ def price_ladder(trade, current_price):
         lines.append(f"{emoji} {label}: `${fmt_price(price, dec)}`{marker}")
     return "\n".join(lines)
 
+def get_session_tips(session, is_crypto_signal):
+    """Session-specific trading tips."""
+    if is_crypto_signal:
+        if session in ["🌑 Overnight", "🌐 Weekend"]:
+            return "💡 _Low volume — use tight limit orders_"
+        return None
+    
+    if session == "🌅 Pre-Market":
+        return "🌅 _Pre-market: LIMIT orders only, reduce size 30%, watch for 9:30 AM gap_"
+    if session == "🌙 After-Hours":
+        return "🌙 _After-hours: LIMIT orders only, reduce size 30%, wider spreads expected_"
+    if session == "🔔 Market Open":
+        return "🔔 _First 30 min: high volatility, wait for spread to tighten_"
+    if session == "⚡ Power Hour":
+        return "⚡ _Power hour: high volume, but risk of end-of-day reversals_"
+    return None
+
 def format_new_signal(sig, ai_text=None):
     emoji = "🟢" if sig['signal'] == 'BUY' else "🔴"
     dec = sig['decimals']
     sym_emoji = sig['emoji']
     
+    # Header
     msg = f"{sig['tier']} {emoji} *{sig['signal']} {sym_emoji} {sig['symbol']}* `[{sig['tf_label']}]`\n"
     msg += f"{sig['session']} • {now_est().strftime('%H:%M %Z')}\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
     
-    # ⚠️ After-hours warning for stocks
+    # After-hours warning
     if sig.get('is_extended_hours'):
         msg += f"⚠️ *After-hours signal — thin liquidity!*\n"
         msg += f"_Wider spreads, execution may slip. Use limit orders._\n"
         msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
     
+    # Core signal info
     msg += f"💵 *Live Entry:* `${fmt_price(sig['price'], dec)}`\n"
     msg += f"🎯 *Trigger:* {sig['trigger']}\n"
-    msg += f"📊 *Quality:* {sig['score']}/10 ({sig['grade']}) • SQS *{sig['sqs']}*\n"
+    msg += f"💬 _{sig.get('trigger_desc', '')}_\n"
     
+    # SQS with visual meter
+    msg += f"📊 *Quality:* {sig['score']}/10 ({sig['grade']}) • SQS *{sig['sqs']}*\n"
+    msg += f"`{sqs_meter(sig['sqs'])}`\n"
+    
+    # Trade plan with dollar amounts
     msg += f"\n*🎯 TRADE PLAN*\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
     msg += f"📍 Entry:  `${fmt_price(sig['price'], dec)}`\n"
-    msg += f"🛑 SL:     `${fmt_price(sig['sl'], dec)}`\n"
-    msg += f"🎯 TP1:    `${fmt_price(sig['tp1'], dec)}` (1R)\n"
-    msg += f"🎯 TP2:    `${fmt_price(sig['tp2'], dec)}` (2R)\n"
-    msg += f"🎯 TP3:    `${fmt_price(sig['tp3'], dec)}` (3R)\n"
+    msg += f"🛑 SL:     `${fmt_price(sig['sl'], dec)}` ({sig['sl_pct']}% away)\n"
+    msg += f"🎯 TP1:    `${fmt_price(sig['tp1'], dec)}` → +${sig['tp1_profit']:,.0f}\n"
+    msg += f"🎯 TP2:    `${fmt_price(sig['tp2'], dec)}` → +${sig['tp2_profit']:,.0f}\n"
+    msg += f"🎯 TP3:    `${fmt_price(sig['tp3'], dec)}` → +${sig['tp3_profit']:,.0f}\n"
     
+    # Position sizing
     msg += f"\n*💼 POSITION SIZING*\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
-    msg += f"Shares:   `{sig['shares']}` units\n"
+    msg += f"Size:     `{fmt_shares(sig['shares'], sig['symbol'])}` units\n"
     msg += f"Notional: `${sig['notional']:,.2f}`\n"
     msg += f"Risk:     `${sig['dollar_risk']:.2f}` ({RISK_PCT}% of ${ACCOUNT_SIZE:,})\n"
     
+    # Nearby key levels
+    nearby = sig.get('nearby', {})
+    if nearby:
+        msg += f"\n*🔍 KEY LEVELS NEARBY*\n"
+        msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
+        if nearby.get('resistance'):
+            r = nearby['resistance']
+            dist = abs(r - sig['price']) / sig['price'] * 100
+            msg += f"⬆️ Resistance: `${fmt_price(r, dec)}` ({dist:.1f}% away)\n"
+        if nearby.get('support'):
+            s = nearby['support']
+            dist = abs(s - sig['price']) / sig['price'] * 100
+            msg += f"⬇️ Support:    `${fmt_price(s, dec)}` ({dist:.1f}% away)\n"
+        if nearby.get('ema50'):
+            e50 = nearby['ema50']
+            dist = abs(e50 - sig['price']) / sig['price'] * 100
+            msg += f"〰️ EMA50:      `${fmt_price(e50, dec)}` ({dist:.1f}%)\n"
+        if nearby.get('ema200'):
+            e200 = nearby['ema200']
+            dist = abs(e200 - sig['price']) / sig['price'] * 100
+            msg += f"〰️ EMA200:     `${fmt_price(e200, dec)}` ({dist:.1f}%)\n"
+    
+    # Technicals
     msg += f"\n*📈 TECHNICALS*\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
     msg += f"RSI: `{sig['rsi']}` | ADX: `{sig['adx']}` | Stretch: `{sig['stretch']}×`\n"
     msg += f"Regime: {sig['regime']} | Trend: {'Strong ✓' if sig['strong_trend'] else 'Mixed'}\n"
     
+    # Signal expiry
+    msg += f"\n⏳ *Valid until:* {time_until(sig['expiry_time'])} from now\n"
+    msg += f"_After this, re-evaluate on next candle._\n"
+    
+    # Session tips
+    tips = get_session_tips(sig['session'], sig.get('is_crypto', False))
+    if tips:
+        msg += f"\n{tips}\n"
+    
+    # AI analysis
     if ai_text:
         msg += f"\n*🤖 AI ANALYSIS*\n"
         msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
@@ -896,37 +1148,64 @@ def format_trade_event(trade, event, current_price):
     dec = trade['decimals']
     sym_emoji = trade.get('emoji', '📈')
     age = time_ago(trade['opened_at'])
+    is_long = trade['signal'] == 'BUY'
     
     event_type = event['type']
     
     if event_type == 'TP1':
         header = f"✅ *TP1 HIT* {emoji} {sym_emoji} {trade['symbol']} `[{trade.get('tf_label', trade['tf'])}]`"
-        sub = "💡 _Move SL to breakeven_ 🔒"
+        sub = "💡 *Next step:*"
+        next_steps = [
+            f"  ✓ Move SL: `${fmt_price(trade['sl'], dec)}` → `${fmt_price(trade['entry'], dec)}` (BE)",
+            f"  ✓ Take partial: Sell ~33% of position",
+            f"  ✓ Let winner run to TP2/TP3"
+        ]
         r_mult = "+1R"
         dollar_gain = round(trade['shares'] * trade['risk'], 2)
     elif event_type == 'TP2':
         header = f"✅✅ *TP2 HIT* {emoji} {sym_emoji} {trade['symbol']} `[{trade.get('tf_label', trade['tf'])}]`"
-        sub = "💡 _Trail SL to TP1_ 📈"
+        sub = "💡 *Next step:*"
+        next_steps = [
+            f"  ✓ Move SL: to TP1 `${fmt_price(trade['tp1'], dec)}`",
+            f"  ✓ Take another partial: Sell ~33%",
+            f"  ✓ Let final portion run to TP3"
+        ]
         r_mult = "+2R"
         dollar_gain = round(trade['shares'] * trade['risk'] * 2, 2)
     elif event_type == 'TP3':
         header = f"🏆 *TP3 HIT — FULL TARGET* {emoji} {sym_emoji} {trade['symbol']}"
-        sub = "🎉 _Trade complete!_"
+        sub = "🎉 *Trade complete!*"
+        next_steps = [
+            f"  ✓ Close any remaining position",
+            f"  ✓ +3R full target achieved",
+            f"  ✓ Log this win in your journal"
+        ]
         r_mult = "+3R"
         dollar_gain = round(trade['shares'] * trade['risk'] * 3, 2)
     elif event_type == 'SL':
         header = f"🛑 *SL HIT* {emoji} {sym_emoji} {trade['symbol']}"
         if trade['tp1_hit']:
-            sub = "✅ _Trailed profit exit — still a winner!_"
+            sub = "✅ *Trailed profit exit — still a winner!*"
+            next_steps = [
+                "  ✓ Partial gain locked in",
+                "  ✓ No further action needed",
+                "  ✓ Review setup for lessons"
+            ]
             r_mult = "Partial gain"
             dollar_gain = round(trade['shares'] * trade['risk'] * 0.5, 2)
         else:
-            sub = "❌ _Stop loss hit — trade closed_"
+            sub = "❌ *Stop loss hit — trade closed*"
+            next_steps = [
+                "  ✓ Close position at market",
+                "  ✓ Loss limited to planned risk",
+                "  ✓ Move on — don't revenge trade"
+            ]
             r_mult = "-1R"
             dollar_gain = -round(trade['shares'] * trade['risk'], 2)
     elif event_type == 'TIMEOUT':
         header = f"⏰ *TRADE TIMEOUT* {emoji} {sym_emoji} {trade['symbol']}"
         sub = "_72h expiry — auto-closed_"
+        next_steps = ["  ✓ Signal aged out without trigger"]
         r_mult = "—"
         dollar_gain = 0
     else:
@@ -940,7 +1219,10 @@ def format_trade_event(trade, event, current_price):
     if isinstance(dollar_gain, (int, float)) and dollar_gain != 0:
         sign = "+" if dollar_gain > 0 else ""
         msg += f"💰 *P&L:* {sign}${dollar_gain:,.2f}\n"
-    msg += f"{sub}\n"
+    
+    msg += f"\n{sub}\n"
+    for step in next_steps:
+        msg += f"{step}\n"
     
     msg += f"\n*📊 PRICE LADDER*\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
@@ -950,9 +1232,16 @@ def format_trade_event(trade, event, current_price):
     return msg
 
 def format_digest(signals):
+    """v5.2 digest with multi-TF badges, dedupe, max profit display."""
     msg = f"🔔 *SIGNAL DIGEST — {len(signals)} alerts*\n"
     msg += f"{get_session()} • {fmt_time()}\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n\n"
+    
+    # Detect multi-TF symbols
+    tf_counts = {}
+    for s in signals:
+        tf_counts.setdefault(s['symbol'], set()).add(s['timeframe'])
+    multi_tf_symbols = {k for k, v in tf_counts.items() if len(v) > 1}
     
     ah_count = sum(1 for s in signals if s.get('is_extended_hours'))
     if ah_count > 0:
@@ -960,13 +1249,20 @@ def format_digest(signals):
     
     for sig in signals:
         emoji = "🟢" if sig['signal'] == 'BUY' else "🔴"
+        multi_tf_tag = " 🎯🎯" if sig['symbol'] in multi_tf_symbols else ""
         ah_tag = " ⚠️" if sig.get('is_extended_hours') else ""
-        msg += f"{sig['tier']} {emoji} *{sig['symbol']}* `[{sig['tf_label']}]`{ah_tag}\n"
+        
+        msg += f"{sig['tier']} {emoji} *{sig['symbol']}* `[{sig['tf_label']}]`{ah_tag}{multi_tf_tag}\n"
         msg += f"  {sig['emoji']} {sig['signal']} @ `${fmt_price(sig['price'], sig['decimals'])}` • SQS {sig['sqs']}\n"
-        msg += f"  🎯 {sig['trigger']} | RSI {sig['rsi']} | Shares: {sig['shares']}\n"
-        msg += f"  🛑 SL `${fmt_price(sig['sl'], sig['decimals'])}` → 🎯 TP3 `${fmt_price(sig['tp3'], sig['decimals'])}`\n\n"
+        msg += f"  🎯 {sig['trigger']} | RSI {sig['rsi']} | {fmt_shares(sig['shares'], sig['symbol'])} units\n"
+        msg += f"  🛑 `${fmt_price(sig['sl'], sig['decimals'])}` → 🎯 `${fmt_price(sig['tp3'], sig['decimals'])}` • Max +${sig['tp3_profit']:,.0f}\n\n"
     
-    msg += f"_Full trade plans sent separately._"
+    # Multi-TF highlight
+    if multi_tf_symbols:
+        msg += f"🎯🎯 *Multi-TF confirmation:* {', '.join(sorted(multi_tf_symbols))}\n"
+        msg += f"_These are highest-quality setups — fired on multiple timeframes._\n\n"
+    
+    msg += f"_Full trade plans below (SQS ≥{FULL_DETAIL_SQS} only)._"
     return msg
 
 # ═══════════════════════════════════════════════
@@ -1031,6 +1327,63 @@ def format_market_context():
     return msg
 
 # ═══════════════════════════════════════════════
+# OPEN POSITIONS SUMMARY (v5.2 NEW)
+# ═══════════════════════════════════════════════
+
+def format_open_positions_summary(trades):
+    """Summary of all active trades with P&L."""
+    if not trades:
+        return None
+    
+    active = [(k, t) for k, t in trades.items() if not t.get('closed')]
+    if not active:
+        return None
+    
+    msg = f"📊 *OPEN POSITIONS ({len(active)})*\n"
+    msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
+    
+    total_unrealized = 0
+    for trade_key, trade in active:
+        live = get_live_ohlc(trade['symbol'])
+        if not live:
+            msg += f"  {trade.get('emoji', '📈')} {trade['symbol']} [{trade.get('tf_label', trade['tf'])}] — (price unavailable)\n"
+            continue
+        
+        current = live[0]
+        is_long = trade['signal'] == 'BUY'
+        
+        if is_long:
+            pnl_per_unit = current - trade['entry']
+        else:
+            pnl_per_unit = trade['entry'] - current
+        
+        r_mult = pnl_per_unit / trade['risk'] if trade['risk'] > 0 else 0
+        dollar_pnl = pnl_per_unit * trade['shares']
+        total_unrealized += dollar_pnl
+        
+        # Status
+        if trade.get('tp3_hit'):
+            status = "🏆 +3R"
+        elif trade.get('tp2_hit'):
+            status = "🎯🎯 +2R+"
+        elif trade.get('tp1_hit'):
+            status = "🎯 +1R (trailing)"
+        elif r_mult > 0.5:
+            status = "📈 in profit"
+        elif r_mult < -0.7:
+            status = "⚠️ near SL"
+        else:
+            status = "➖ ranging"
+        
+        sign = "+" if dollar_pnl >= 0 else ""
+        msg += f"  {trade.get('emoji', '📈')} *{trade['symbol']}* `[{trade.get('tf_label', trade['tf'])}]` {status}\n"
+        msg += f"     {r_mult:+.2f}R ({sign}${dollar_pnl:.0f}) • age {time_ago(trade['opened_at'])}\n"
+    
+    sign = "+" if total_unrealized >= 0 else ""
+    msg += f"\n💰 *Total unrealized:* {sign}${total_unrealized:,.2f}\n"
+    return msg
+
+# ═══════════════════════════════════════════════
 # WEEKLY SUMMARY
 # ═══════════════════════════════════════════════
 
@@ -1075,6 +1428,8 @@ def format_weekly_summary():
             if (t.get('final_r') or 0) > 0:
                 grades[g][1] += 1
     
+    total_dollars = total_r * (ACCOUNT_SIZE * RISK_PCT / 100)
+    
     msg = f"📊 *WEEKLY SUMMARY*\n"
     msg += f"{cutoff.strftime('%b %d')} → {now_est().strftime('%b %d')}\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
@@ -1083,6 +1438,7 @@ def format_weekly_summary():
     msg += f"❌ Losses: *{len(losses)}*\n"
     msg += f"➖ Breakeven: *{len(breakevens)}*\n\n"
     msg += f"💰 *Total R: {'+'if total_r>=0 else ''}{total_r:.1f}R*\n"
+    msg += f"💵 *P&L: {'+$' if total_dollars >= 0 else '-$'}{abs(total_dollars):,.0f}*\n"
     msg += f"🏆 Best: *{best['symbol']}* ({best.get('final_r', 0):+.1f}R)\n"
     msg += f"💥 Worst: *{worst['symbol']}* ({worst.get('final_r', 0):+.1f}R)\n"
     
@@ -1116,7 +1472,7 @@ def format_near_miss_digest(near_miss_list):
     return msg
 
 # ═══════════════════════════════════════════════
-# CORRELATION DETECTION
+# CORRELATION (v5.2 — deduped with risk math)
 # ═══════════════════════════════════════════════
 
 CORRELATION_GROUPS = {
@@ -1126,14 +1482,60 @@ CORRELATION_GROUPS = {
     'Mega Tech': ['GOOGL', 'MSFT', 'META', 'AMZN'],
 }
 
-def detect_correlations(signals):
-    warnings = []
+def calculate_correlated_risk(signals):
+    """Calculate correlation exposure with actual dollar math."""
+    risk_by_group = {}
+    
     for group_name, symbols in CORRELATION_GROUPS.items():
         matching = [s for s in signals if s['symbol'] in symbols]
-        if len(matching) >= 2:
-            syms = ", ".join([m['symbol'] for m in matching])
-            warnings.append(f"🔗 *{group_name}*: {syms} all firing simultaneously")
-    return warnings
+        if len(matching) == 0:
+            continue
+        
+        # Dedupe by symbol (same symbol on multiple TFs = still 1 position IRL)
+        seen = set()
+        unique = []
+        for s in matching:
+            if s['symbol'] not in seen:
+                seen.add(s['symbol'])
+                unique.append(s)
+        
+        if len(unique) >= 2:
+            total_risk_pct = len(unique) * RISK_PCT
+            total_risk_dollars = len(unique) * (ACCOUNT_SIZE * RISK_PCT / 100)
+            risk_by_group[group_name] = {
+                'count': len(unique),
+                'symbols': sorted([s['symbol'] for s in unique]),
+                'total_risk_pct': total_risk_pct,
+                'total_risk_dollars': total_risk_dollars
+            }
+    return risk_by_group
+
+def format_correlation_alert(signals):
+    risk_data = calculate_correlated_risk(signals)
+    if not risk_data:
+        return None
+    
+    total_groups = len(risk_data)
+    total_correlated_risk = sum(d['total_risk_dollars'] for d in risk_data.values())
+    
+    msg = f"⚠️ *CORRELATION RISK ANALYSIS*\n"
+    msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
+    
+    for group, data in risk_data.items():
+        msg += f"\n🔗 *{group}* ({data['count']} positions)\n"
+        msg += f"  Symbols: {', '.join(data['symbols'])}\n"
+        msg += f"  Combined risk: *{data['total_risk_pct']:.1f}%* = `${data['total_risk_dollars']:.0f}`\n"
+    
+    msg += f"\n💡 *Portfolio exposure:*\n"
+    msg += f"  Total correlated risk: `${total_correlated_risk:.0f}`\n"
+    msg += f"  If all go bad: *-${total_correlated_risk:.0f}* ({total_correlated_risk/ACCOUNT_SIZE*100:.1f}% account)\n"
+    
+    msg += f"\n💡 *Suggestions:*\n"
+    msg += f"  • Take only 1-2 best per group, skip rest\n"
+    msg += f"  • OR reduce size {total_groups}× (e.g., 0.5% risk instead of 1%)\n"
+    msg += f"  • Tech + crypto often correlate in risk-off moves"
+    
+    return msg
 
 # ═══════════════════════════════════════════════
 # TELEGRAM
@@ -1169,7 +1571,7 @@ def should_send_daily_context():
         return False
     if now_est().hour < 9:
         return False
-    if now_est().weekday() >= 5:  # no weekend context
+    if now_est().weekday() >= 5:
         return False
     state['last_context_date'] = today
     save_json(STATE_FILE, state)
@@ -1178,7 +1580,7 @@ def should_send_daily_context():
 def should_send_weekly_summary():
     state = load_json(STATE_FILE, {})
     now = now_est()
-    if now.weekday() != 6:  # Sunday
+    if now.weekday() != 6:
         return False
     if now.hour < 21:
         return False
@@ -1196,7 +1598,7 @@ def should_send_near_miss_digest():
         return False
     if now_est().hour < 9 or now_est().hour > 10:
         return False
-    if now_est().weekday() >= 5:  # no weekend digest
+    if now_est().weekday() >= 5:
         return False
     state['last_nearmiss'] = today
     save_json(STATE_FILE, state)
@@ -1211,7 +1613,7 @@ def main():
     active_list = get_active_watchlist()
     
     print(f"\n{'='*60}")
-    print(f"AlphaEdge v5.1 Scanner @ {fmt_datetime()}")
+    print(f"AlphaEdge v5.2 Scanner @ {fmt_datetime()}")
     print(f"Session: {session}")
     print(f"Active watchlist: {len(active_list)}/{len(ALL_SYMBOLS)} symbols")
     print(f"Account: ${ACCOUNT_SIZE:,} | Risk/trade: {RISK_PCT}%")
@@ -1223,20 +1625,14 @@ def main():
     cache = load_cache_with_migration()
     trades = load_json(TRADES_FILE, {})
     
-    # ═══════════════════════════════════════════════
-    # Daily market context (once per weekday 9AM+)
-    # ═══════════════════════════════════════════════
+    # Daily market context
     if should_send_daily_context():
         print("🌍 Sending daily market context...")
         ctx_msg = format_market_context()
         if ctx_msg:
             send_telegram(ctx_msg, silent=True)
     
-    # ═══════════════════════════════════════════════
-    # STEP 1: Check ALL active trades (regardless of session!)
-    # ═══════════════════════════════════════════════
-    # CRITICAL: active trades are checked 24/7 even outside scanning hours
-    # so you don't miss TP/SL hits on stocks during after-hours
+    # STEP 1: Check active trades 24/7
     if trades:
         print(f"📊 Checking {len(trades)} active trade(s) (all sessions)...")
         trades_to_remove = []
@@ -1282,10 +1678,33 @@ def main():
             del trades[key]
         save_json(TRADES_FILE, trades)
         print()
+        
+        # Open positions summary (only if scan has signals incoming or first scan of session)
+        remaining = {k: v for k, v in trades.items() if not v.get('closed')}
+        if remaining and len(remaining) >= 2:
+            # Only send if multiple positions open (avoid spam for single position)
+            state = load_json(STATE_FILE, {})
+            last_summary = state.get('last_pos_summary')
+            # Send max once per 2 hours
+            send_summary = True
+            if last_summary:
+                try:
+                    dt = datetime.fromisoformat(last_summary)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=EST)
+                    if now_est() - dt < timedelta(hours=2):
+                        send_summary = False
+                except:
+                    pass
+            
+            if send_summary:
+                pos_summary = format_open_positions_summary(remaining)
+                if pos_summary:
+                    send_telegram(pos_summary, silent=True)
+                    state['last_pos_summary'] = now_est().isoformat()
+                    save_json(STATE_FILE, state)
     
-    # ═══════════════════════════════════════════════
-    # STEP 2: Scan for new signals (session-filtered watchlist)
-    # ═══════════════════════════════════════════════
+    # STEP 2: Scan for new signals
     print(f"🔍 Scanning {len(active_list)} symbols for new signals...")
     
     new_signals = []
@@ -1352,65 +1771,60 @@ def main():
             print(f"🚨 {result['tier']} {result['signal']} SQS={result['sqs']}")
             logging.info(f"NEW SIGNAL: {symbol} {tf} {result['signal']} SQS={result['sqs']}")
     
-    # ═══════════════════════════════════════════════
-    # STEP 3: Send signals (individual or digest)
-    # ═══════════════════════════════════════════════
+    # STEP 3: Send signals
     if new_signals:
-        corr_warnings = detect_correlations(new_signals)
+        # Sort by SQS descending (best signals first)
+        new_signals.sort(key=lambda s: s['sqs'], reverse=True)
         
         if len(new_signals) >= DIGEST_THRESHOLD:
+            # Digest mode
             digest = format_digest(new_signals)
-            if corr_warnings:
-                digest += f"\n\n*⚠️ CORRELATION ALERT*\n"
-                for w in corr_warnings:
-                    digest += f"{w}\n"
-                digest += f"_Consider reducing per-trade size._"
             send_telegram(digest, silent=False)
-            print(f"📦 Sent digest with {len(new_signals)} signals")
-            # Also send full details
-            for sig in new_signals:
-                msg = format_new_signal(sig, sig.get('ai_text'))
-                silent = 'FAIR' in sig['tier']
-                send_telegram(msg, silent=silent)
+            print(f"📦 Sent digest")
+            
+            # Only send full details for SQS >= 70
+            high_quality = [s for s in new_signals if s['sqs'] >= FULL_DETAIL_SQS]
+            if high_quality:
+                print(f"  Sending full details for {len(high_quality)} high-quality signals...")
+                for sig in high_quality:
+                    msg = format_new_signal(sig, sig.get('ai_text'))
+                    send_telegram(msg, silent=False)
+            
+            # Correlation alert
+            corr_msg = format_correlation_alert(new_signals)
+            if corr_msg:
+                send_telegram(corr_msg, silent=False)
         else:
+            # Individual mode (fewer than threshold)
             for sig in new_signals:
                 msg = format_new_signal(sig, sig.get('ai_text'))
                 silent = 'FAIR' in sig['tier']
                 send_telegram(msg, silent=silent)
             print(f"📨 Sent {len(new_signals)} individual alerts")
             
-            if corr_warnings:
-                warn_msg = f"⚠️ *CORRELATION ALERT*\n"
-                warn_msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
-                for w in corr_warnings:
-                    warn_msg += f"{w}\n"
-                warn_msg += f"\n_Consider reducing per-trade size._"
-                send_telegram(warn_msg, silent=True)
+            # Correlation alert
+            corr_msg = format_correlation_alert(new_signals)
+            if corr_msg:
+                send_telegram(corr_msg, silent=True)
     
     save_json(ALERT_CACHE, cache)
     save_json(TRADES_FILE, trades)
     
-    # ═══════════════════════════════════════════════
-    # STEP 4: Daily near-miss digest (9AM weekdays)
-    # ═══════════════════════════════════════════════
+    # STEP 4: Near-miss digest (9AM weekdays)
     if should_send_near_miss_digest() and strong_near_miss:
         print(f"👀 Sending near-miss digest ({len(strong_near_miss)} items)...")
         digest_msg = format_near_miss_digest(strong_near_miss)
         if digest_msg:
             send_telegram(digest_msg, silent=True)
     
-    # ═══════════════════════════════════════════════
     # STEP 5: Weekly summary (Sunday 9PM+)
-    # ═══════════════════════════════════════════════
     if should_send_weekly_summary():
         print(f"📊 Sending weekly summary...")
         summary_msg = format_weekly_summary()
         if summary_msg:
             send_telegram(summary_msg, silent=False)
     
-    # ═══════════════════════════════════════════════
     # Final report
-    # ═══════════════════════════════════════════════
     print(f"\n{'='*60}")
     print(f"✅ New: {len(new_signals)} | 🔕 Cooldown: {skipped_dupe} | 🔒 Active: {skipped_active}")
     print(f"⚪ Near-miss: {len(near_misses)} | 🤖 AI: {ai_calls} | 📊 Open: {len(trades)}")
