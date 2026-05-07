@@ -1,0 +1,55 @@
+name: AlphaEdge Morning Brief
+
+on:
+  schedule:
+    # 9:00 AM EST/EDT (13:00 UTC EDT, 14:00 UTC EST — covers both)
+    - cron: '0 13 * * 1-5'
+    - cron: '0 14 * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force send even if already sent today'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: alphaedge-brief
+  cancel-in-progress: false
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: scanner_state.json
+          key: scanner-state-v6-${{ github.run_id }}
+          restore-keys: scanner-state-v6-
+
+      - run: pip install -r requirements.txt
+
+      - name: Run Morning Brief
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TZ: America/New_York
+          PYTHONUNBUFFERED: "1"
+          FORCE_BRIEF: ${{ inputs.force }}
+        run: python morning_brief.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: scanner_state.json
+          key: scanner-state-v6-${{ github.run_id }}
