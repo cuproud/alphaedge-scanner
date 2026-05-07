@@ -17,6 +17,20 @@ AlphaEdge watches **24 symbols** (stocks + crypto + gold) across **multiple time
 It tracks every signal from the moment it fires until it closes (TP hit, SL hit, or 72h timeout), and automatically sends follow-up alerts when targets are reached.
 
 **It's a signal scanner, not an auto-trader.** You get the alerts — you decide what to do.
+---
+📦 Final File Structure
+your-repo/
+├── scanner.py              ← v6.0 Pine-parity scanner (existing)
+├── market_intel.py         ← Big drops + sector bleed + leadership + earnings + RS
+├── morning_brief.py        ← 9 AM daily digest (NEW)
+├── dip_scanner.py          ← Oversold uptrend finder (NEW)
+├── requirements.txt
+└── .github/workflows/
+    ├── scanner.yml         ← main scanner
+    ├── intel.yml           ← every 30 min intel
+    ├── morning_brief.yml   ← 9 AM (NEW)
+    └── dip_scanner.yml     ← 3x/day (NEW)
+
 
 ---
 
