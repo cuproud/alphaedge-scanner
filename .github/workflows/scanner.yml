@@ -1,45 +1,57 @@
-name: AlphaEdge Scanner v5.2
+name: AlphaEdge Scanner v6.0
 
 on:
   schedule:
-    # 📈 REGULAR MARKET (9:30 AM - 4:00 PM EDT) — every 10 min (public repo = unlimited)
-    - cron: '30,40,50 13 * * 1-5'
-    - cron: '*/10 14-19 * * 1-5'
-    - cron: '0 20 * * 1-5'
-    
-    # 🌙 AFTER-HOURS (4:00 PM - 8:00 PM EDT) — every 15 min
-    - cron: '15,30,45 20 * * 1-5'
-    - cron: '*/15 21-23 * * 1-5'
-    
-    # 🌅 PRE-MARKET (4:00 AM - 9:30 AM EDT) — every 15 min
-    - cron: '*/15 8-13 * * 1-5'
-    
-    # 🌑 OVERNIGHT (8:00 PM - 4:00 AM EDT) — every 30 min crypto
-    - cron: '0,30 0-7 * * 1-5'
-    
-    # 🪙 WEEKENDS — every 30 min
+    # ═══════════════════════════════════════════════
+    # All times in UTC. Covers BOTH EDT (UTC-4) and EST (UTC-5)
+    # So the active hours overlap cleanly.
+    # ═══════════════════════════════════════════════
+
+    # 📈 REGULAR MARKET (9:30 AM – 4:00 PM ET) — every 10 min
+    # Covers EDT 13:30–20:00 UTC  AND  EST 14:30–21:00 UTC
+    - cron: '*/10 13-21 * * 1-5'
+
+    # 🌙 AFTER-HOURS (4:00 PM – 8:00 PM ET) — every 15 min
+    # Covers EDT 20:00–00:00 UTC  AND  EST 21:00–01:00 UTC
+    - cron: '*/15 20-23 * * 1-5'
+    - cron: '*/15 0-1 * * 2-6'
+
+    # 🌅 PRE-MARKET (4:00 AM – 9:30 AM ET) — every 15 min
+    # Covers EDT 08:00–13:30 UTC  AND  EST 09:00–14:30 UTC
+    - cron: '*/15 8-14 * * 1-5'
+
+    # 🌑 OVERNIGHT (crypto only, 8 PM – 4 AM ET) — every 30 min
+    # Covers 01:00–09:00 UTC (spans both DST regimes)
+    - cron: '0,30 2-8 * * 2-6'
+
+    # 🪙 WEEKENDS (crypto only) — every 30 min
     - cron: '*/30 * * * 0,6'
-  
+
   workflow_dispatch:
 
 concurrency:
   group: alphaedge-scanner
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-      
+
       - name: Restore scanner state
         id: cache-restore
         uses: actions/cache/restore@v4
@@ -49,22 +61,25 @@ jobs:
             active_trades.json
             trade_history.json
             scanner_state.json
-            logs/
-          key: scanner-state-${{ github.run_id }}
+          key: scanner-state-v6-${{ github.run_id }}
           restore-keys: |
+            scanner-state-v6-
             scanner-state-
-      
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
-      
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Run AlphaEdge Scanner
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TZ: America/New_York
+          PYTHONUNBUFFERED: "1"
         run: python scanner.py
-      
+
       - name: Save scanner state
         if: always()
         uses: actions/cache/save@v4
@@ -74,14 +89,23 @@ jobs:
             active_trades.json
             trade_history.json
             scanner_state.json
-            logs/
-          key: scanner-state-${{ github.run_id }}
-      
+          key: scanner-state-v6-${{ github.run_id }}
+
       - name: Upload scan logs
-        if: always()
+        if: always() && hashFiles('logs/**') != ''
         uses: actions/upload-artifact@v4
         with:
           name: scanner-logs-${{ github.run_id }}
           path: logs/
-          retention-days: 30
+          retention-days: 7
           if-no-files-found: ignore
+
+      - name: Cleanup old caches
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh cache list --limit 50 --json key,id,createdAt \
+            | jq -r '.[] | select(.key | startswith("scanner-state-")) | .id' \
+            | tail -n +6 | xargs -I {} gh cache delete {} || true
