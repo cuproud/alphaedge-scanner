@@ -2,9 +2,10 @@ name: AlphaEdge Morning Brief
 
 on:
   schedule:
-    # 9:00 AM EST/EDT (13:00 UTC EDT, 14:00 UTC EST — covers both)
-    - cron: '0 13 * * 1-5'
-    - cron: '0 14 * * 1-5'
+    # 9:00 AM ET (covers both EDT=13:00 UTC and EST=14:00 UTC)
+    # should_send_brief() guards against double-send within same day
+    - cron: '0 13 * * 1-5'    # 9 AM EDT
+    - cron: '0 14 * * 1-5'    # 9 AM EST
 
   workflow_dispatch:
     inputs:
@@ -17,12 +18,17 @@ concurrency:
   group: alphaedge-brief
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   brief:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
