@@ -2,8 +2,10 @@ name: AlphaEdge Dip Scanner
 
 on:
   schedule:
-    # Run 3x per day: mid-morning, afternoon, pre-close
+    # 3x per day during US market hours
+    # Covers EDT (UTC-4) + EST (UTC-5)
     - cron: '30 14 * * 1-5'   # 10:30 AM EDT / 9:30 AM EST
+    - cron: '30 15 * * 1-5'   # 11:30 AM EDT / 10:30 AM EST (safety for DST)
     - cron: '30 17 * * 1-5'   # 1:30 PM EDT / 12:30 PM EST
     - cron: '30 19 * * 1-5'   # 3:30 PM EDT / 2:30 PM EST
 
@@ -13,12 +15,17 @@ concurrency:
   group: alphaedge-dipscan
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   dip:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
