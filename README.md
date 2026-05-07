@@ -2,7 +2,12 @@
 
 > **Automated multi-timeframe signal scanner for stocks & crypto.  
 > Rich Telegram alerts. AI-enhanced. Runs 24/7 on GitHub Actions. Free forever.**
-
+---
+![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-Automated-green?logo=githubactions&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telegram-Alerts-blue?logo=telegram&logoColor=white)
+![Gemini AI](https://img.shields.io/badge/Gemini_AI-Enhanced-orange?logo=google&logoColor=white)
+![Status](https://img.shields.io/badge/Status-Production-brightgreen)
 ---
 
 ## ✨ What It Does
