@@ -85,6 +85,117 @@ def save_json(path, data):
     with open(path, 'w') as f: json.dump(data, f, indent=2, default=str)
 
 # ═══════════════════════════════════════════════
+# EARNINGS CALENDAR CHECK
+# ═══════════════════════════════════════════════
+
+EARNINGS_WARNING_DAYS = 3   # Warn if earnings within N days
+
+def get_earnings_date(symbol):
+    """Returns (date, days_until) or (None, None) if no upcoming earnings."""
+    try:
+        ticker = yf.Ticker(symbol)
+        cal = ticker.calendar
+        if cal is None:
+            return None, None
+
+        # yfinance returns dict for newer versions
+        earnings_date = None
+        if isinstance(cal, dict):
+            ed = cal.get('Earnings Date')
+            if ed:
+                if isinstance(ed, list) and len(ed) > 0:
+                    earnings_date = ed[0]
+                else:
+                    earnings_date = ed
+        elif hasattr(cal, 'loc'):
+            try:
+                earnings_date = cal.loc['Earnings Date'].iloc[0] if 'Earnings Date' in cal.index else None
+            except: pass
+
+        if earnings_date is None:
+            return None, None
+
+        # Normalize to datetime
+        if isinstance(earnings_date, str):
+            earnings_date = datetime.fromisoformat(earnings_date.split('T')[0])
+        elif hasattr(earnings_date, 'to_pydatetime'):
+            earnings_date = earnings_date.to_pydatetime()
+
+        if hasattr(earnings_date, 'date'):
+            earnings_date = earnings_date.date()
+
+        today = now_est().date()
+        days_until = (earnings_date - today).days
+
+        if days_until < 0 or days_until > 60:
+            return None, None
+
+        return earnings_date, days_until
+    except Exception as e:
+        logging.debug(f"Earnings {symbol}: {e}")
+        return None, None
+
+def format_earnings_warning(symbol, earnings_date, days_until):
+    """Returns a short warning string or None."""
+    if earnings_date is None:
+        return None
+    if days_until <= 0:
+        return f"🚨 *Earnings TODAY* — extreme volatility risk"
+    if days_until == 1:
+        return f"⚠️ *Earnings TOMORROW* ({earnings_date}) — SKIP new longs"
+    if days_until <= EARNINGS_WARNING_DAYS:
+        return f"⚠️ *Earnings in {days_until} days* ({earnings_date}) — consider waiting"
+    if days_until <= 7:
+        return f"📅 Earnings in {days_until} days ({earnings_date})"
+    return None
+
+# ═══════════════════════════════════════════════
+# RELATIVE STRENGTH CALCULATOR
+# ═══════════════════════════════════════════════
+
+def calc_relative_strength(ctx, benchmark='SPY', lookback_days=5):
+    """Computes RS vs benchmark over last N days.
+    Returns: (rs_score, rs_label)
+    rs_score > 1 = outperforming
+    rs_score < 1 = underperforming
+    """
+    try:
+        df_sym = yf.download(ctx['symbol'], period='1mo', interval='1d',
+                            progress=False, auto_adjust=True)
+        df_bench = yf.download(benchmark, period='1mo', interval='1d',
+                              progress=False, auto_adjust=True)
+        if df_sym.empty or df_bench.empty:
+            return None, None
+
+        if isinstance(df_sym.columns, pd.MultiIndex):
+            df_sym.columns = df_sym.columns.get_level_values(0)
+        if isinstance(df_bench.columns, pd.MultiIndex):
+            df_bench.columns = df_bench.columns.get_level_values(0)
+
+        # Last N days performance
+        sym_perf = (df_sym['Close'].iloc[-1] / df_sym['Close'].iloc[-lookback_days] - 1) * 100
+        bench_perf = (df_bench['Close'].iloc[-1] / df_bench['Close'].iloc[-lookback_days] - 1) * 100
+
+        diff = sym_perf - bench_perf  # RS in percentage points
+
+        if diff > 5:
+            label = "🟢🟢 Strong Leader"
+        elif diff > 2:
+            label = "🟢 Outperforming"
+        elif diff > -2:
+            label = "⚖️ In-line"
+        elif diff > -5:
+            label = "🔴 Underperforming"
+        else:
+            label = "🔴🔴 Weak / Laggard"
+
+        return round(diff, 2), label
+    except Exception as e:
+        logging.debug(f"RS {ctx['symbol']}: {e}")
+        return None, None
+
+
+# ═══════════════════════════════════════════════
 # DATA FETCHERS
 # ═══════════════════════════════════════════════
 
@@ -277,6 +388,14 @@ def get_verdict(ctx, market_ctx=None):
                 verdict = "⚠️ WAIT"
                 reasons.insert(0, f"Market bleeding — VIX {vix:.0f}, SPY {spy_pct:.1f}%")
 
+    # Earnings override — skip BUY verdicts if too close
+    if "BUY" in verdict:
+        _, days_until = get_earnings_date(c['symbol'])
+        if days_until is not None and days_until <= EARNINGS_WARNING_DAYS:
+            verdict = "⚠️ WAIT — Earnings"
+            zone = f"Earnings in {days_until}d"
+            reasons.insert(0, f"Earnings risk in {days_until} days — avoid new entries")
+
     return verdict, zone, reasons
 
 # ═══════════════════════════════════════════════
@@ -422,6 +541,22 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
     elif c['rsi'] > 70: msg += " _(overbought)_\n"
     else: msg += " _(neutral)_\n"
     msg += f"EMA50: `${c['ema50']:.2f}` • EMA200: `${c['ema200']:.2f}`\n"
+
+    # Earnings warning
+    earnings_date, days_until = get_earnings_date(c['symbol'])
+    earn_warning = format_earnings_warning(c['symbol'], earnings_date, days_until)
+    if earn_warning:
+        msg += f"\n*📅 EARNINGS*\n"
+        msg += f"`─────────────────`\n"
+        msg += f"{earn_warning}\n"
+
+    # Relative Strength
+    rs_score, rs_label = calc_relative_strength(c)
+    if rs_score is not None:
+        msg += f"\n*💪 RELATIVE STRENGTH (5d vs SPY)*\n"
+        msg += f"`─────────────────`\n"
+        sign = "+" if rs_score >= 0 else ""
+        msg += f"{rs_label}: `{sign}{rs_score}%` vs SPY\n"
 
     # Price vs key MAs
     above_50 = c['current'] > c['ema50']
