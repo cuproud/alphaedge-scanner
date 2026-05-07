@@ -767,3 +767,110 @@ if __name__ == "__main__":
         format='%(asctime)s | %(levelname)s | %(message)s'
     )
     Path('logs').mkdir(exist_ok=True)
+
+# Leadership / laggard detection
+    if all_contexts:
+        sector_full = {}
+        for sector, symbols in SECTORS.items():
+            moves = [(s, all_contexts[s]['day_change_pct']) for s in symbols if s in all_contexts]
+            if len(moves) >= 2:
+                avg = sum(m[1] for m in moves) / len(moves)
+                sector_full[sector] = {'avg': avg, 'all': moves}
+
+        leaders, laggards = check_leadership(all_contexts, sector_full)
+        if leaders or laggards:
+            state = load_json(STATE_FILE, {})
+            last = state.get('last_leadership_alert')
+            send = True
+            if last:
+                try:
+                    dt = datetime.fromisoformat(last)
+                    if dt.tzinfo is None: dt = dt.replace(tzinfo=EST)
+                    if now_est() - dt < timedelta(hours=3): send = False
+                except: pass
+            if send:
+                rs_msg = format_leadership_alert(leaders, laggards)
+                if rs_msg:
+                    send_telegram(rs_msg, silent=True)
+                    state['last_leadership_alert'] = now_est().isoformat()
+                    save_json(STATE_FILE, state)
+                    print("💪 Leadership alert sent")
+
+# ═══════════════════════════════════════════════
+# LEADERSHIP / LAGGARD DETECTOR
+# ═══════════════════════════════════════════════
+
+def check_leadership(all_contexts, sector_moves):
+    """Identifies leaders (holding/rising while sector bleeds)
+    and laggards (dropping while sector holds)."""
+    leaders = []
+    laggards = []
+
+    for sector, data in sector_moves.items():
+        sector_avg = data['avg']
+        if abs(sector_avg) < 1.5:
+            continue  # only interesting if sector is making a move
+
+        for sym, ctx in all_contexts.items():
+            # Match symbol to sector
+            in_sector = False
+            for s_name, syms in SECTORS.items():
+                if s_name == sector and sym in syms:
+                    in_sector = True
+                    break
+            if not in_sector:
+                continue
+
+            divergence = ctx['day_change_pct'] - sector_avg
+
+            # Leader: sector bleeding (-), but symbol holding or green
+            if sector_avg < -2 and divergence > 2:
+                leaders.append({
+                    'symbol': sym, 'ctx': ctx,
+                    'sector': sector, 'sector_avg': sector_avg,
+                    'divergence': divergence
+                })
+
+            # Laggard: sector ripping, symbol dropping
+            elif sector_avg > 2 and divergence < -2:
+                laggards.append({
+                    'symbol': sym, 'ctx': ctx,
+                    'sector': sector, 'sector_avg': sector_avg,
+                    'divergence': divergence
+                })
+
+    return leaders, laggards
+
+def format_leadership_alert(leaders, laggards):
+    if not leaders and not laggards:
+        return None
+
+    now = now_est()
+    tz = now.tzname() or "EDT"
+    ts = now.strftime(f'%I:%M %p {tz}')
+
+    msg = f"💪 *RELATIVE STRENGTH SIGNALS*\n"
+    msg += f"🕒 {ts}\n"
+    msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
+
+    if leaders:
+        msg += f"\n🏆 *LEADERS* — holding up while sector bleeds\n"
+        msg += f"`─────────────────`\n"
+        for l in sorted(leaders, key=lambda x: -x['divergence']):
+            em = SYMBOL_EMOJI.get(l['symbol'], '📊')
+            msg += f"  {em} *{l['symbol']}* ({l['sector']})\n"
+            msg += f"     Stock: `{l['ctx']['day_change_pct']:+.2f}%` • Sector avg: `{l['sector_avg']:+.2f}%`\n"
+            msg += f"     💪 Outperforming by *{l['divergence']:+.2f}%*\n"
+        msg += f"\n💡 _Leaders during weakness = future winners. Watch for entry._\n"
+
+    if laggards:
+        msg += f"\n🔻 *LAGGARDS* — weak vs strong sector\n"
+        msg += f"`─────────────────`\n"
+        for l in sorted(laggards, key=lambda x: x['divergence']):
+            em = SYMBOL_EMOJI.get(l['symbol'], '📊')
+            msg += f"  {em} *{l['symbol']}* ({l['sector']})\n"
+            msg += f"     Stock: `{l['ctx']['day_change_pct']:+.2f}%` • Sector avg: `{l['sector_avg']:+.2f}%`\n"
+            msg += f"     📉 Underperforming by *{l['divergence']:+.2f}%*\n"
+        msg += f"\n⚠️ _Laggards in strong sectors = relative weakness. Consider shorts or skip._\n"
+
+    return msg
