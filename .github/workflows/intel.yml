@@ -1,0 +1,56 @@
+name: AlphaEdge Market Intel
+
+on:
+  schedule:
+    # Every 30 min during US market hours (13:30-21:00 UTC covers EDT/EST)
+    - cron: '*/30 13-21 * * 1-5'
+
+    # Every 2h for crypto overnight + weekends
+    - cron: '0 */2 * * *'
+
+  workflow_dispatch:
+
+concurrency:
+  group: alphaedge-intel
+  cancel-in-progress: false
+
+jobs:
+  intel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            scanner_state.json
+          key: scanner-state-v6-${{ github.run_id }}
+          restore-keys: |
+            scanner-state-v6-
+
+      - run: pip install -r requirements.txt
+
+      - name: Run Intel Scan
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TZ: America/New_York
+          PYTHONUNBUFFERED: "1"
+        run: python market_intel.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            scanner_state.json
+          key: scanner-state-v6-${{ github.run_id }}
