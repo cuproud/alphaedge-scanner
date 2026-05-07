@@ -1,0 +1,50 @@
+name: AlphaEdge Dip Scanner
+
+on:
+  schedule:
+    # Run 3x per day: mid-morning, afternoon, pre-close
+    - cron: '30 14 * * 1-5'   # 10:30 AM EDT / 9:30 AM EST
+    - cron: '30 17 * * 1-5'   # 1:30 PM EDT / 12:30 PM EST
+    - cron: '30 19 * * 1-5'   # 3:30 PM EDT / 2:30 PM EST
+
+  workflow_dispatch:
+
+concurrency:
+  group: alphaedge-dipscan
+  cancel-in-progress: false
+
+jobs:
+  dip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: scanner_state.json
+          key: scanner-state-v6-${{ github.run_id }}
+          restore-keys: scanner-state-v6-
+
+      - run: pip install -r requirements.txt
+
+      - name: Run Dip Scanner
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TZ: America/New_York
+          PYTHONUNBUFFERED: "1"
+        run: python dip_scanner.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: scanner_state.json
+          key: scanner-state-v6-${{ github.run_id }}
