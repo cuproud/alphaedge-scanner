@@ -1270,7 +1270,7 @@ def format_open_positions_summary(trades):
     for k, trade in active:
         live = get_live_ohlc(trade['symbol'])
         if not live:
-            enriched.append({'trade': trade, 'current': None, 'r_mult': 0, 'status': 'no data'})
+            enriched.append({'trade': trade, 'current': None, 'r_mult': 0, 'status': 'no data', 'bucket': 'nodata'})
             continue
         current = live[0]
         is_long = trade['signal'] == 'BUY'
@@ -1281,41 +1281,124 @@ def format_open_positions_summary(trades):
         lbl = trade.get('tf_label', trade['tf'])
         if lbl in tf_counts: tf_counts[lbl] += 1
 
-        if trade.get('tp3_hit'): status = "🏆 +3R"
-        elif trade.get('tp2_hit'): status = "🎯🎯 +2R"
-        elif trade.get('tp1_hit'): status = "🎯 +1R trail"
-        elif r_mult >= 0.5: status = "📈 winning"
-        elif r_mult <= -0.7: status = "⚠️ near SL"
-        elif abs(r_mult) < 0.15: status = "➖ flat"
-        elif r_mult < 0: status = "🔻 losing"
-        else: status = "📊 building"
+        # Bucket for grouping
+        if trade.get('tp3_hit'):
+            status, bucket = "🏆 +3R", "winner"
+        elif trade.get('tp2_hit'):
+            status, bucket = "🎯🎯 +2R", "winner"
+        elif trade.get('tp1_hit'):
+            status, bucket = "🎯 +1R trail", "winner"
+        elif r_mult >= 0.5:
+            status, bucket = "📈 winning", "winner"
+        elif r_mult <= -0.7:
+            status, bucket = "⚠️ near SL", "near_sl"
+        elif r_mult < -0.15:
+            status, bucket = "🔻 losing", "loser"
+        elif abs(r_mult) < 0.15:
+            status, bucket = "➖ flat", "flat"
+        else:
+            status, bucket = "📊 building", "building"
 
-        enriched.append({'trade': trade, 'current': current, 'r_mult': r_mult, 'status': status})
+        enriched.append({
+            'trade': trade, 'current': current, 'r_mult': r_mult,
+            'status': status, 'bucket': bucket
+        })
 
     enriched.sort(key=lambda x: -x['r_mult'])
 
+    # Aggregate stats
+    valid = [e for e in enriched if e['current'] is not None]
+    total_r = sum(e['r_mult'] for e in valid)
+    winners = [e for e in valid if e['r_mult'] > 0.1]
+    losers = [e for e in valid if e['r_mult'] < -0.1]
+    near_sl = [e for e in valid if e['bucket'] == 'near_sl']
+
+    # ═══ Header with timestamp ═══
+    now = now_est()
+    tz_abbr = now.tzname() or "EDT"
+    timestamp = now.strftime(f'%a %b %d • %I:%M %p {tz_abbr}')
+
     msg = f"📊 *OPEN POSITIONS ({len(active)})*\n"
+    msg += f"🕒 {timestamp}\n"
+    msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
+
+    # ═══ Quick stats row ═══
+    total_str = fmt_r(total_r)
+    total_emoji = "🟢" if total_r >= 0 else "🔴"
+    msg += f"{total_emoji} *Total P&L:* {total_str}\n"
     msg += f"🟢 Long: {longs} | 🔴 Short: {shorts}"
-    if tf_counts['⚡30m'] and tf_counts['📊1h']:
+    if tf_counts['⚡30m'] or tf_counts['📊1h']:
         msg += f" | 30m: {tf_counts['⚡30m']} | 1h: {tf_counts['📊1h']}"
+    msg += "\n"
+    msg += f"📈 Winners: {len(winners)} • Losers: {len(losers)}"
+    if near_sl:
+        msg += f" • ⚠️ Near SL: {len(near_sl)}"
+    msg += "\n"
+
+    # ═══ URGENT SECTION: Near-SL first ═══
+    if near_sl:
+        msg += f"\n⚠️ *NEAR STOP LOSS* ({len(near_sl)})\n"
+        msg += f"`─────────────────`\n"
+        for e in near_sl:
+            t = e['trade']
+            em = t.get('emoji', '📈')
+            dir_em = "🟢" if t['signal'] == 'BUY' else "🔴"
+            msg += f"  {em} {dir_em} *{t['symbol']}* `{t.get('tf_label', t['tf'])}` "
+            msg += f"*{fmt_r(e['r_mult'])}* • {time_ago(t['opened_at'])}\n"
+
+    # ═══ WINNERS ═══
+    winner_items = [e for e in enriched if e['bucket'] == 'winner']
+    if winner_items:
+        msg += f"\n✅ *WINNERS* ({len(winner_items)})\n"
+        msg += f"`─────────────────`\n"
+        for e in winner_items:
+            t = e['trade']
+            em = t.get('emoji', '📈')
+            dir_em = "🟢" if t['signal'] == 'BUY' else "🔴"
+            msg += f"  {em} {dir_em} *{t['symbol']}* `{t.get('tf_label', t['tf'])}` "
+            msg += f"*{fmt_r(e['r_mult'])}* • {e['status']} • {time_ago(t['opened_at'])}\n"
+
+    # ═══ BUILDING / FLAT ═══
+    building_items = [e for e in enriched if e['bucket'] in ('building', 'flat')]
+    if building_items:
+        msg += f"\n📊 *BUILDING / FLAT* ({len(building_items)})\n"
+        msg += f"`─────────────────`\n"
+        for e in building_items:
+            t = e['trade']
+            em = t.get('emoji', '📈')
+            dir_em = "🟢" if t['signal'] == 'BUY' else "🔴"
+            msg += f"  {em} {dir_em} *{t['symbol']}* `{t.get('tf_label', t['tf'])}` "
+            msg += f"{fmt_r(e['r_mult'])} • {time_ago(t['opened_at'])}\n"
+
+    # ═══ LOSERS ═══
+    loser_items = [e for e in enriched if e['bucket'] == 'loser']
+    if loser_items:
+        msg += f"\n🔻 *LOSING* ({len(loser_items)})\n"
+        msg += f"`─────────────────`\n"
+        for e in loser_items:
+            t = e['trade']
+            em = t.get('emoji', '📈')
+            dir_em = "🟢" if t['signal'] == 'BUY' else "🔴"
+            msg += f"  {em} {dir_em} *{t['symbol']}* `{t.get('tf_label', t['tf'])}` "
+            msg += f"*{fmt_r(e['r_mult'])}* • {time_ago(t['opened_at'])}\n"
+
+    # ═══ No-data ═══
+    nodata_items = [e for e in enriched if e['bucket'] == 'nodata']
+    if nodata_items:
+        msg += f"\n❔ *No live data* ({len(nodata_items)})\n"
+        for e in nodata_items:
+            msg += f"  {e['trade'].get('emoji', '📈')} {e['trade']['symbol']}\n"
+
+    # ═══ Footer summary ═══
     msg += f"\n`━━━━━━━━━━━━━━━━━━━━━`\n"
+    if winners:
+        best = max(valid, key=lambda e: e['r_mult'])
+        msg += f"🏆 Best: *{best['trade']['symbol']}* {fmt_r(best['r_mult'])}\n"
+    if losers:
+        worst = min(valid, key=lambda e: e['r_mult'])
+        msg += f"💥 Worst: *{worst['trade']['symbol']}* {fmt_r(worst['r_mult'])}\n"
 
-    for e in enriched:
-        t = e['trade']
-        if e['current'] is None:
-            msg += f"  {t.get('emoji', '📈')} *{t['symbol']}* `[{t.get('tf_label', t['tf'])}]` — no data\n"
-            continue
-        msg += f"  {t.get('emoji', '📈')} *{t['symbol']}* `[{t.get('tf_label', t['tf'])}]` {e['status']}\n"
-        msg += f"     {fmt_r(e['r_mult'])} • age {time_ago(t['opened_at'])}\n"
-
-    total_r = sum(e['r_mult'] for e in enriched if e['current'] is not None)
-    winners = [e for e in enriched if e['r_mult'] > 0.1]
-    losers = [e for e in enriched if e['r_mult'] < -0.1]
-    msg += f"\n💹 *Unrealized:* {fmt_r(total_r)} total\n"
-    if winners: msg += f"  ↗ {len(winners)} winner(s), best: {fmt_r(max(e['r_mult'] for e in winners))}\n"
-    if losers: msg += f"  ↘ {len(losers)} loser(s), worst: {fmt_r(min(e['r_mult'] for e in losers))}\n"
     return msg
-
 # ═══════════════════════════════════════════════
 # WEEKLY SUMMARY
 # ═══════════════════════════════════════════════
