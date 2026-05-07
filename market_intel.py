@@ -1,12 +1,26 @@
 """
-ALPHAEDGE MARKET INTELLIGENCE MODULE
+ALPHAEDGE MARKET INTELLIGENCE MODULE v2.0 — AUDITED
 ═══════════════════════════════════════════════════════════════
-Provides context, not just signals:
+Provides CONTEXT, not just signals:
 • Big move detection (±5%, ±10%)
 • ATH / 52W / position in range
-• AI-powered "why is this dropping?" analysis
-• Clear Buy Zone / Sell Zone / Hold verdicts
+• AI-powered "why is this moving?" analysis
+• Clear BUY ZONE / HOLD / AVOID verdicts
 • Sector bleed detection
+• Leadership / laggard detection (relative strength)
+• Earnings calendar check
+• Wilder's RMA RSI (matches scanner.py)
+
+v2.0 FIXES:
+• Proper function ordering (no forward references)
+• Leadership detection now called from run_intel_scan()
+• Logging configured at module level (works when imported)
+• Fixed off-by-one in relative_strength (proper N-day lookback)
+• Wilder's RMA RSI (consistent with scanner.py)
+• Fixed trend classification order (unreachable branches now work)
+• Message auto-split for long alerts (>4000 chars)
+• Today's volume from intraday filtered by date (not 2-day sum)
+• Better error logging throughout
 """
 
 import yfinance as yf
@@ -17,31 +31,55 @@ import os
 import json
 import time
 import logging
+import warnings
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+# ═══════════════════════════════════════════════
+# GLOBALS
+# ═══════════════════════════════════════════════
 EST = ZoneInfo("America/New_York")
 
-# Reuse scanner.py credentials + state
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
 STATE_FILE = 'scanner_state.json'
+LOGS_DIR = Path('logs')
+LOGS_DIR.mkdir(exist_ok=True)
+
+# Module-level logger (works on import AND main)
+def _setup_logger():
+    logging.basicConfig(
+        filename=LOGS_DIR / f'intel_{datetime.now(EST).strftime("%Y-%m-%d")}.log',
+        level=logging.INFO,
+        format='%(asctime)s | %(levelname)s | %(message)s'
+    )
+_setup_logger()
 
 # ═══════════════════════════════════════════════
 # THRESHOLDS
 # ═══════════════════════════════════════════════
-BIG_DROP_WARN = -5.0          # % intraday drop for warning
-BIG_DROP_CRITICAL = -10.0     # % intraday drop for critical
-BIG_GAIN_ALERT = 8.0          # % intraday gain worth alerting
-NEAR_52W_LOW_PCT = 10.0       # within 10% of 52W low
-ATH_PULLBACK_ALERT = -15.0    # more than 15% from ATH
+BIG_DROP_WARN = -5.0
+BIG_DROP_CRITICAL = -10.0
+BIG_GAIN_ALERT = 8.0
+NEAR_52W_LOW_PCT = 10.0
+ATH_PULLBACK_ALERT = -15.0
 
-COOLDOWN_HOURS = 4            # Don't re-alert same symbol within 4h
+COOLDOWN_HOURS = 4
+SECTOR_BLEED_COOLDOWN = 4
+LEADERSHIP_COOLDOWN = 3
 
-# Sector mapping (expand as needed)
+EARNINGS_WARNING_DAYS = 3
+
+FETCH_DELAY = 0.3
+
+# ═══════════════════════════════════════════════
+# SECTORS & MONITOR LIST
+# ═══════════════════════════════════════════════
 SECTORS = {
     'AI/Semis': ['NVDA', 'AMD', 'MU', 'SNDK', 'NBIS'],
     'Crypto': ['BTC-USD', 'ETH-USD', 'XRP-USD'],
@@ -56,7 +94,6 @@ SECTORS = {
     'Safe Haven': ['GC=F'],
 }
 
-# Symbols to monitor (superset of scanner watchlist)
 MONITOR_LIST = [
     'BTC-USD', 'ETH-USD', 'XRP-USD', 'GC=F',
     'NVDA', 'TSLA', 'AMD', 'MSFT', 'META', 'AMZN', 'GOOGL', 'NFLX', 'AAPL',
@@ -72,33 +109,68 @@ SYMBOL_EMOJI = {
     'IONQ': '⚛️', 'RGTI': '🧪', 'QBTS': '🔬',
     'OKLO': '☢️', 'IREN': '🪙', 'UAMY': '⚒️', 'WGRX': '💊',
     'SOFI': '🏦', 'NVO': '💉',
+    'COIN': '🪙', 'MSTR': '₿',
 }
 
-def now_est(): return datetime.now(EST)
+# Build reverse lookup (symbol → sector)
+SYMBOL_TO_SECTOR = {}
+for _sector, _syms in SECTORS.items():
+    for _sym in _syms:
+        SYMBOL_TO_SECTOR[_sym] = _sector
+
+# ═══════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════
+
+def now_est():
+    return datetime.now(EST)
 
 def load_json(path, default):
     try:
-        with open(path, 'r') as f: return json.load(f)
-    except: return default
+        with open(path, 'r') as f:
+            return json.load(f)
+    except:
+        return default
 
 def save_json(path, data):
-    with open(path, 'w') as f: json.dump(data, f, indent=2, default=str)
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2, default=str)
+
+def _clean_df(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+def rma(series, length):
+    """Wilder's RMA — matches Pine's ta.rma()."""
+    return series.ewm(alpha=1.0 / length, adjust=False).mean()
+
+def pine_rsi(src, length=14):
+    """Wilder's RSI — consistent with scanner.py."""
+    delta = src.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = rma(gain, length)
+    avg_loss = rma(loss, length)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return (100 - 100 / (1 + rs)).fillna(50)
 
 # ═══════════════════════════════════════════════
-# EARNINGS CALENDAR CHECK
+# EARNINGS CALENDAR
 # ═══════════════════════════════════════════════
-
-EARNINGS_WARNING_DAYS = 3   # Warn if earnings within N days
 
 def get_earnings_date(symbol):
-    """Returns (date, days_until) or (None, None) if no upcoming earnings."""
+    """Returns (date, days_until) or (None, None)."""
+    # Crypto / commodities never have earnings
+    if symbol.endswith('-USD') or symbol == 'GC=F':
+        return None, None
+
     try:
         ticker = yf.Ticker(symbol)
         cal = ticker.calendar
         if cal is None:
             return None, None
 
-        # yfinance returns dict for newer versions
         earnings_date = None
         if isinstance(cal, dict):
             ed = cal.get('Earnings Date')
@@ -109,13 +181,14 @@ def get_earnings_date(symbol):
                     earnings_date = ed
         elif hasattr(cal, 'loc'):
             try:
-                earnings_date = cal.loc['Earnings Date'].iloc[0] if 'Earnings Date' in cal.index else None
-            except: pass
+                if 'Earnings Date' in cal.index:
+                    earnings_date = cal.loc['Earnings Date'].iloc[0]
+            except:
+                pass
 
         if earnings_date is None:
             return None, None
 
-        # Normalize to datetime
         if isinstance(earnings_date, str):
             earnings_date = datetime.fromisoformat(earnings_date.split('T')[0])
         elif hasattr(earnings_date, 'to_pydatetime'):
@@ -136,11 +209,10 @@ def get_earnings_date(symbol):
         return None, None
 
 def format_earnings_warning(symbol, earnings_date, days_until):
-    """Returns a short warning string or None."""
     if earnings_date is None:
         return None
     if days_until <= 0:
-        return f"🚨 *Earnings TODAY* — extreme volatility risk"
+        return "🚨 *Earnings TODAY* — extreme volatility risk"
     if days_until == 1:
         return f"⚠️ *Earnings TOMORROW* ({earnings_date}) — SKIP new longs"
     if days_until <= EARNINGS_WARNING_DAYS:
@@ -150,33 +222,51 @@ def format_earnings_warning(symbol, earnings_date, days_until):
     return None
 
 # ═══════════════════════════════════════════════
-# RELATIVE STRENGTH CALCULATOR
+# MARKET CONTEXT (SPY/QQQ/VIX)
+# ═══════════════════════════════════════════════
+
+def get_market_ctx():
+    try:
+        data = {}
+        for t in ['SPY', 'QQQ', '^VIX']:
+            df = yf.download(t, period='5d', interval='1d',
+                             progress=False, auto_adjust=True)
+            if df.empty:
+                continue
+            df = _clean_df(df)
+            last = float(df['Close'].iloc[-1])
+            prev = float(df['Close'].iloc[-2])
+            data[t] = {'price': last, 'pct': (last - prev) / prev * 100}
+        return data
+    except Exception as e:
+        logging.error(f"Market ctx: {e}")
+        return None
+
+# ═══════════════════════════════════════════════
+# RELATIVE STRENGTH
 # ═══════════════════════════════════════════════
 
 def calc_relative_strength(ctx, benchmark='SPY', lookback_days=5):
-    """Computes RS vs benchmark over last N days.
-    Returns: (rs_score, rs_label)
-    rs_score > 1 = outperforming
-    rs_score < 1 = underperforming
-    """
+    """Returns (rs_diff_pct, label) where rs_diff > 0 = outperforming."""
     try:
         df_sym = yf.download(ctx['symbol'], period='1mo', interval='1d',
-                            progress=False, auto_adjust=True)
+                             progress=False, auto_adjust=True)
         df_bench = yf.download(benchmark, period='1mo', interval='1d',
-                              progress=False, auto_adjust=True)
+                               progress=False, auto_adjust=True)
         if df_sym.empty or df_bench.empty:
             return None, None
+        df_sym = _clean_df(df_sym)
+        df_bench = _clean_df(df_bench)
 
-        if isinstance(df_sym.columns, pd.MultiIndex):
-            df_sym.columns = df_sym.columns.get_level_values(0)
-        if isinstance(df_bench.columns, pd.MultiIndex):
-            df_bench.columns = df_bench.columns.get_level_values(0)
+        # Need lookback_days+1 rows (today + N back)
+        if len(df_sym) < lookback_days + 1 or len(df_bench) < lookback_days + 1:
+            return None, None
 
-        # Last N days performance
-        sym_perf = (df_sym['Close'].iloc[-1] / df_sym['Close'].iloc[-lookback_days] - 1) * 100
-        bench_perf = (df_bench['Close'].iloc[-1] / df_bench['Close'].iloc[-lookback_days] - 1) * 100
+        # FIX: use -(lookback_days+1) to get N trading days back
+        sym_perf = (df_sym['Close'].iloc[-1] / df_sym['Close'].iloc[-(lookback_days + 1)] - 1) * 100
+        bench_perf = (df_bench['Close'].iloc[-1] / df_bench['Close'].iloc[-(lookback_days + 1)] - 1) * 100
 
-        diff = sym_perf - bench_perf  # RS in percentage points
+        diff = float(sym_perf - bench_perf)
 
         if diff > 5:
             label = "🟢🟢 Strong Leader"
@@ -194,37 +284,46 @@ def calc_relative_strength(ctx, benchmark='SPY', lookback_days=5):
         logging.debug(f"RS {ctx['symbol']}: {e}")
         return None, None
 
-
 # ═══════════════════════════════════════════════
-# DATA FETCHERS
+# FULL CONTEXT (daily + intraday)
 # ═══════════════════════════════════════════════
 
 def get_full_context(symbol):
-    """Fetches all needed data in one pass — daily + intraday."""
+    """Fetches daily + intraday, computes all context metrics."""
     try:
-        # Daily for ATH / 52W / trend
         daily = yf.download(symbol, period='5y', interval='1d',
-                           progress=False, auto_adjust=True)
+                            progress=False, auto_adjust=True)
         if daily.empty or len(daily) < 50:
             return None
-        if isinstance(daily.columns, pd.MultiIndex):
-            daily.columns = daily.columns.get_level_values(0)
+        daily = _clean_df(daily)
 
-        # Intraday for today's move
         intraday = yf.download(symbol, period='2d', interval='5m',
-                              progress=False, auto_adjust=True)
+                               progress=False, auto_adjust=True)
         if intraday.empty:
             return None
-        if isinstance(intraday.columns, pd.MultiIndex):
-            intraday.columns = intraday.columns.get_level_values(0)
+        intraday = _clean_df(intraday)
 
         current = float(intraday['Close'].iloc[-1])
         prev_close = float(daily['Close'].iloc[-2])
-        today_open = float(intraday['Open'].iloc[0])
-        today_high = float(intraday['High'].max())
-        today_low = float(intraday['Low'].min())
 
-        # % moves
+        # Filter intraday to TODAY only (by EST date)
+        today_date = now_est().date()
+        try:
+            if intraday.index.tz is None:
+                intraday_tz = intraday.tz_localize('UTC').tz_convert(EST)
+            else:
+                intraday_tz = intraday.tz_convert(EST)
+            today_bars = intraday_tz[intraday_tz.index.date == today_date]
+            if today_bars.empty:
+                today_bars = intraday.iloc[-78:]  # fallback: ~6.5h of 5m bars
+        except:
+            today_bars = intraday.iloc[-78:]
+
+        today_open = float(today_bars['Open'].iloc[0])
+        today_high = float(today_bars['High'].max())
+        today_low = float(today_bars['Low'].min())
+        vol_today = float(today_bars['Volume'].sum())
+
         day_change_pct = (current - prev_close) / prev_close * 100
         intraday_pct = (current - today_open) / today_open * 100
 
@@ -235,42 +334,38 @@ def get_full_context(symbol):
         high_52w = float(daily['High'].iloc[-252:].max()) if len(daily) >= 252 else float(daily['High'].max())
 
         ath_pct = (current - ath) / ath * 100
-        pct_from_52w_low = (current - low_52w) / low_52w * 100
-        pct_from_52w_high = (current - high_52w) / high_52w * 100
-
-        # Position in 52W range (0-100)
+        pct_from_52w_low = (current - low_52w) / low_52w * 100 if low_52w > 0 else 0
+        pct_from_52w_high = (current - high_52w) / high_52w * 100 if high_52w > 0 else 0
         range_pos = ((current - low_52w) / (high_52w - low_52w) * 100) if high_52w > low_52w else 50
 
-        # Trend indicators (daily)
-        ema20 = daily['Close'].ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50 = daily['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
-        ema200 = daily['Close'].ewm(span=200, adjust=False).mean().iloc[-1] if len(daily) >= 200 else ema50
+        # Daily EMAs
+        ema20 = float(daily['Close'].ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(daily['Close'].ewm(span=50, adjust=False).mean().iloc[-1])
+        if len(daily) >= 200:
+            ema200 = float(daily['Close'].ewm(span=200, adjust=False).mean().iloc[-1])
+        else:
+            ema200 = ema50
 
-        # RSI daily
-        delta = daily['Close'].diff()
-        gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-        loss = -delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean()
-        rs = gain / loss.replace(0, np.nan)
-        rsi = (100 - 100/(1+rs)).iloc[-1]
+        # Wilder's RSI (consistent with scanner.py)
+        rsi_series = pine_rsi(daily['Close'], 14)
+        rsi = float(rsi_series.iloc[-1])
 
-        # Volume vs avg
-        vol_today = float(intraday['Volume'].sum())
         vol_avg_20d = float(daily['Volume'].iloc[-20:].mean())
         vol_ratio = vol_today / vol_avg_20d if vol_avg_20d > 0 else 1.0
 
-        # Daily trend classification
+        # ═══ FIXED: trend classification (strongest conditions first) ═══
         if current > ema20 > ema50 > ema200:
             trend = "🚀 STRONG UPTREND"
+        elif current < ema20 < ema50 < ema200:
+            trend = "💀 STRONG DOWNTREND"
         elif current > ema50 > ema200:
             trend = "📈 UPTREND"
+        elif current < ema50 < ema200:
+            trend = "📉 DOWNTREND"
         elif current > ema200 and current < ema50:
             trend = "🔄 PULLBACK IN UPTREND"
         elif current < ema200 and current > ema50:
             trend = "🔀 RECOVERING"
-        elif current < ema50 < ema200:
-            trend = "📉 DOWNTREND"
-        elif current < ema20 < ema50 < ema200:
-            trend = "💀 STRONG DOWNTREND"
         else:
             trend = "⚖️ MIXED"
 
@@ -291,13 +386,15 @@ def get_full_context(symbol):
             'pct_from_52w_low': pct_from_52w_low,
             'pct_from_52w_high': pct_from_52w_high,
             'range_pos': range_pos,
-            'ema20': ema20, 'ema50': ema50, 'ema200': ema200,
-            'rsi': float(rsi) if not pd.isna(rsi) else 50,
+            'ema20': ema20,
+            'ema50': ema50,
+            'ema200': ema200,
+            'rsi': rsi if not np.isnan(rsi) else 50,
             'vol_ratio': vol_ratio,
             'trend': trend,
         }
     except Exception as e:
-        logging.error(f"Context fetch {symbol}: {e}")
+        logging.error(f"Context {symbol}: {e}")
         return None
 
 # ═══════════════════════════════════════════════
@@ -305,7 +402,7 @@ def get_full_context(symbol):
 # ═══════════════════════════════════════════════
 
 def get_verdict(ctx, market_ctx=None):
-    """Returns a clear BUY ZONE / HOLD / AVOID verdict with reasoning."""
+    """Returns (verdict, zone, [reasons])."""
     c = ctx
     rsi = c['rsi']
     trend = c['trend']
@@ -317,32 +414,35 @@ def get_verdict(ctx, market_ctx=None):
     verdict = None
     zone = None
 
-    # Strong Uptrend + RSI oversold + pullback = good buy
+    # Strongest signal first — pullback in confirmed uptrend, RSI oversold
     if "UPTREND" in trend and rsi < 40 and drop < 0:
         verdict = "🟢 BUY ZONE"
         zone = "Accumulation"
         reasons.append("Healthy pullback in uptrend")
         reasons.append(f"Daily RSI oversold ({rsi:.0f})")
         if from_ath > -20:
-            reasons.append(f"Near ATH — strong stock pulling back")
+            reasons.append("Near ATH — strong stock pulling back")
 
-    # Strong downtrend + falling = avoid
     elif "DOWNTREND" in trend and drop < -3:
         verdict = "🔴 AVOID"
         zone = "Falling Knife"
         reasons.append("Continuation of downtrend")
-        reasons.append(f"Below EMA50 and EMA200")
+        reasons.append("Below EMA50 and EMA200")
         if rsi < 30:
             reasons.append("Oversold but no reversal signal yet")
 
-    # Near 52W low + any trend = cautious
     elif c['pct_from_52w_low'] < 5 and drop < -5:
         verdict = "⚠️ CAUTION"
         zone = "Breaking Down"
         reasons.append("Near 52W low — support at risk")
-        reasons.append("Wait for base formation before buying")
+        reasons.append("Wait for base formation")
 
-    # Healthy range trade
+    elif "PULLBACK" in trend and rsi < 50:
+        verdict = "🟢 BUY ZONE"
+        zone = "Pullback"
+        reasons.append("Above EMA200, pulling back to EMA50")
+        reasons.append(f"RSI {rsi:.0f} — room to run")
+
     elif "MIXED" in trend or "RECOVERING" in trend:
         if range_pos < 30 and rsi < 45:
             verdict = "🟡 WATCH"
@@ -354,21 +454,12 @@ def get_verdict(ctx, market_ctx=None):
             zone = "No edge"
             reasons.append("Mixed signals — wait for clarity")
 
-    # Pullback in uptrend (sweet spot)
-    elif "PULLBACK" in trend and rsi < 50:
-        verdict = "🟢 BUY ZONE"
-        zone = "Pullback"
-        reasons.append("Above EMA200, pulling back to EMA50")
-        reasons.append(f"RSI {rsi:.0f} — room to run")
-
-    # Overbought
     elif rsi > 75 and drop > 2:
         verdict = "🟠 TAKE PROFITS"
         zone = "Extended"
         reasons.append(f"RSI overbought ({rsi:.0f})")
         reasons.append("Consider trimming, not entering")
 
-    # Default
     else:
         if drop < -5:
             verdict = "⚠️ WATCH"
@@ -383,27 +474,25 @@ def get_verdict(ctx, market_ctx=None):
     if market_ctx:
         vix = market_ctx.get('^VIX', {}).get('price', 15)
         spy_pct = market_ctx.get('SPY', {}).get('pct', 0)
-        if vix > 25 and spy_pct < -1.5:
-            if "BUY" in verdict:
-                verdict = "⚠️ WAIT"
-                reasons.insert(0, f"Market bleeding — VIX {vix:.0f}, SPY {spy_pct:.1f}%")
+        if vix > 25 and spy_pct < -1.5 and "BUY" in verdict:
+            verdict = "⚠️ WAIT"
+            reasons.insert(0, f"Market bleeding — VIX {vix:.0f}, SPY {spy_pct:.1f}%")
 
-    # Earnings override — skip BUY verdicts if too close
+    # Earnings override
     if "BUY" in verdict:
         _, days_until = get_earnings_date(c['symbol'])
         if days_until is not None and days_until <= EARNINGS_WARNING_DAYS:
             verdict = "⚠️ WAIT — Earnings"
             zone = f"Earnings in {days_until}d"
-            reasons.insert(0, f"Earnings risk in {days_until} days — avoid new entries")
+            reasons.insert(0, f"Earnings in {days_until} days — avoid new entries")
 
     return verdict, zone, reasons
 
 # ═══════════════════════════════════════════════
-# AI CONTEXT ANALYZER
+# AI DROP ANALYSIS
 # ═══════════════════════════════════════════════
 
 def ai_analyze_drop(ctx, market_ctx=None):
-    """Asks Gemini WHY the drop is happening + is it a buy."""
     if not GEMINI_API_KEY:
         return None
 
@@ -440,33 +529,20 @@ Do NOT add bullet points or extra headers. 4 lines only."""
             data = r.json()
             if 'candidates' in data and len(data['candidates']) > 0:
                 return data['candidates'][0]['content']['parts'][0]['text'].strip()
+        elif r.status_code == 429:
+            logging.warning(f"Gemini rate-limited for {c['symbol']}")
+        else:
+            logging.error(f"Gemini {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        logging.error(f"AI drop analysis: {e}")
+        logging.error(f"AI drop analysis {c['symbol']}: {e}")
     return None
 
 # ═══════════════════════════════════════════════
-# MARKET CONTEXT
-# ═══════════════════════════════════════════════
-
-def get_market_ctx():
-    try:
-        data = {}
-        for t in ['SPY', 'QQQ', '^VIX']:
-            df = yf.download(t, period='5d', interval='1d', progress=False, auto_adjust=True)
-            if not df.empty:
-                if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-                last = float(df['Close'].iloc[-1])
-                prev = float(df['Close'].iloc[-2])
-                data[t] = {'price': last, 'pct': (last - prev) / prev * 100}
-        return data
-    except: return None
-
-# ═══════════════════════════════════════════════
-# BIG MOVE ALERT FORMATTER
+# ALERT FORMATTERS
 # ═══════════════════════════════════════════════
 
 def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
-    """The main alert when a stock drops/pops significantly."""
+    """Main alert when a stock drops/pops significantly."""
     c = ctx
     em = SYMBOL_EMOJI.get(c['symbol'], '📊')
     drop = c['day_change_pct']
@@ -499,17 +575,16 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
     msg += f"📊 *Range:* L `${c['today_low']:.2f}` → H `${c['today_high']:.2f}`\n"
     msg += f"📈 *Volume:* {c['vol_ratio']:.1f}× average\n"
 
-    # ═══ VERDICT (the star of the show) ═══
+    # ═══ VERDICT ═══
     msg += f"\n*🎯 VERDICT: {verdict}*\n"
     msg += f"_Zone: {zone}_\n"
     for r in reasons[:3]:
         msg += f"  • {r}\n"
 
-    # ═══ CONTEXT SECTION ═══
+    # ═══ POSITIONAL CONTEXT ═══
     msg += f"\n*📏 POSITIONAL CONTEXT*\n"
     msg += f"`─────────────────`\n"
 
-    # ATH distance with visual
     ath_pct = c['ath_pct']
     if ath_pct > -5:
         ath_tag = "🏔️ AT/NEAR ATH"
@@ -518,31 +593,44 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
     elif ath_pct > -30:
         ath_tag = "📉 Pullback from ATH"
     elif ath_pct > -50:
-        ath_tag = "💀 Deep drawdown from ATH"
+        ath_tag = "💀 Deep drawdown"
     else:
         ath_tag = "⚰️ Far from ATH"
 
     msg += f"🏔️ *ATH:* `${c['ath']:.2f}` ({c['ath_pct']:+.1f}%) {ath_tag}\n"
     msg += f"   _Set on {c['ath_date']}_\n"
 
-    # 52W range visual bar
     pos = int(c['range_pos'] / 10)
     bar = "█" * pos + "░" * (10 - pos)
     msg += f"📊 *52W Range:* `${c['low_52w']:.2f}` → `${c['high_52w']:.2f}`\n"
     msg += f"   `{bar}` {c['range_pos']:.0f}% of range\n"
     msg += f"   From low: {c['pct_from_52w_low']:+.1f}% • From high: {c['pct_from_52w_high']:+.1f}%\n"
 
-    # Trend + technicals
+    # ═══ TREND & TECHNICALS ═══
     msg += f"\n*📈 TREND & TECHNICALS*\n"
     msg += f"`─────────────────`\n"
     msg += f"Trend: {c['trend']}\n"
-    msg += f"RSI (Daily): `{c['rsi']:.0f}`"
-    if c['rsi'] < 30: msg += " _(oversold)_\n"
-    elif c['rsi'] > 70: msg += " _(overbought)_\n"
-    else: msg += " _(neutral)_\n"
+
+    rsi_tag = ""
+    if c['rsi'] < 30: rsi_tag = " _(oversold)_"
+    elif c['rsi'] > 70: rsi_tag = " _(overbought)_"
+    else: rsi_tag = " _(neutral)_"
+    msg += f"RSI (Daily): `{c['rsi']:.0f}`{rsi_tag}\n"
     msg += f"EMA50: `${c['ema50']:.2f}` • EMA200: `${c['ema200']:.2f}`\n"
 
-    # Earnings warning
+    above_50 = c['current'] > c['ema50']
+    above_200 = c['current'] > c['ema200']
+    if above_50 and above_200:
+        ma_status = "✅ Above EMA50 & EMA200 (bullish structure)"
+    elif above_200 and not above_50:
+        ma_status = "⚠️ Below EMA50, above EMA200 (pullback)"
+    elif not above_200 and above_50:
+        ma_status = "🔀 Above EMA50, below EMA200 (recovery)"
+    else:
+        ma_status = "🔴 Below EMA50 & EMA200 (bearish)"
+    msg += f"{ma_status}\n"
+
+    # ═══ EARNINGS ═══
     earnings_date, days_until = get_earnings_date(c['symbol'])
     earn_warning = format_earnings_warning(c['symbol'], earnings_date, days_until)
     if earn_warning:
@@ -550,25 +638,15 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
         msg += f"`─────────────────`\n"
         msg += f"{earn_warning}\n"
 
-    # Relative Strength
+    # ═══ RELATIVE STRENGTH ═══
     rs_score, rs_label = calc_relative_strength(c)
     if rs_score is not None:
         msg += f"\n*💪 RELATIVE STRENGTH (5d vs SPY)*\n"
         msg += f"`─────────────────`\n"
-        sign = "+" if rs_score >= 0 else ""
-        msg += f"{rs_label}: `{sign}{rs_score}%` vs SPY\n"
+        sign_rs = "+" if rs_score >= 0 else ""
+        msg += f"{rs_label}: `{sign_rs}{rs_score}%` vs SPY\n"
 
-    # Price vs key MAs
-    above_50 = c['current'] > c['ema50']
-    above_200 = c['current'] > c['ema200']
-    ma_status = ""
-    if above_50 and above_200: ma_status = "✅ Above both EMA50 & EMA200 (bullish structure)"
-    elif above_200 and not above_50: ma_status = "⚠️ Below EMA50, above EMA200 (pullback)"
-    elif not above_200 and above_50: ma_status = "🔀 Above EMA50, below EMA200 (recovery attempt)"
-    else: ma_status = "🔴 Below EMA50 & EMA200 (bearish structure)"
-    msg += f"{ma_status}\n"
-
-    # Market context
+    # ═══ MARKET CONTEXT ═══
     if market_ctx:
         spy = market_ctx.get('SPY', {}).get('pct', 0)
         vix = market_ctx.get('^VIX', {}).get('price', 15)
@@ -583,30 +661,29 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
         elif spy > 0 and drop < -5:
             msg += f"🚨 _Stock-specific weakness — market is UP_\n"
 
-    # AI analysis
+    # ═══ AI ANALYSIS ═══
     if ai_text:
         msg += f"\n*🤖 AI ANALYSIS*\n"
         msg += f"`─────────────────`\n"
         msg += f"{ai_text}\n"
 
-    # Entry guidance
+    # ═══ ENTRY GUIDANCE ═══
     msg += f"\n*💡 ENTRY GUIDANCE*\n"
     msg += f"`─────────────────`\n"
     if "BUY" in verdict:
         support1 = min(c['ema50'], c['low_52w'] * 1.03)
-        support2 = c['ema200']
         msg += f"🟢 *Buy Zone:* `${support1:.2f}` – `${c['current']:.2f}`\n"
-        msg += f"🛡️ *Support:* `${support2:.2f}` (EMA200)\n"
+        msg += f"🛡️ *Support:* `${c['ema200']:.2f}` (EMA200)\n"
         msg += f"🚪 *Invalidation:* Below `${c['low_52w']:.2f}` (52W low)\n"
     elif "AVOID" in verdict or "WAIT" in verdict:
         msg += f"🚫 *Don't enter now*\n"
-        msg += f"⏳ *Wait for:* Base formation above `${c['ema200']:.2f}`\n"
-        msg += f"👀 *Trigger:* RSI reversal + price reclaiming EMA50 `${c['ema50']:.2f}`\n"
+        msg += f"⏳ *Wait for:* Base above `${c['ema200']:.2f}`\n"
+        msg += f"👀 *Trigger:* RSI reversal + reclaim EMA50 `${c['ema50']:.2f}`\n"
     elif "CAUTION" in verdict or "WATCH" in verdict:
         msg += f"👀 *Watch key level:* `${c['ema50']:.2f}` (EMA50)\n"
         msg += f"🟡 *Scale-in zone:* `${c['ema200']:.2f}` if holds\n"
     else:
-        msg += f"⏸️ *No edge here — wait for cleaner setup*\n"
+        msg += f"⏸️ *No edge — wait for cleaner setup*\n"
 
     return msg
 
@@ -649,181 +726,41 @@ def format_sector_bleed_alert(sector_moves):
         msg += f"\n🔻 *{sector}* (avg {data['avg']:+.2f}%)\n"
         for sym, pct in sorted(data['all'], key=lambda x: x[1]):
             em = SYMBOL_EMOJI.get(sym, '📊')
-            pct_em = "🔴" if pct < -5 else "🟠" if pct < -2 else "🟡" if pct < 0 else "🟢"
+            if pct < -5: pct_em = "🔴"
+            elif pct < -2: pct_em = "🟠"
+            elif pct < 0: pct_em = "🟡"
+            else: pct_em = "🟢"
             msg += f"  {em} {sym}: {pct_em} `{pct:+.2f}%`\n"
 
     msg += f"\n💡 _Avoid longs in bleeding sectors. Wait for stabilization._"
     return msg
 
 # ═══════════════════════════════════════════════
-# COOLDOWN
-# ═══════════════════════════════════════════════
-
-def can_alert(symbol, alert_type='big_move'):
-    state = load_json(STATE_FILE, {})
-    key = f"intel_{alert_type}_{symbol}"
-    last = state.get(key)
-    if last:
-        try:
-            dt = datetime.fromisoformat(last)
-            if dt.tzinfo is None: dt = dt.replace(tzinfo=EST)
-            if now_est() - dt < timedelta(hours=COOLDOWN_HOURS):
-                return False
-        except: pass
-    state[key] = now_est().isoformat()
-    save_json(STATE_FILE, state)
-    return True
-
-# ═══════════════════════════════════════════════
-# SEND TELEGRAM
-# ═══════════════════════════════════════════════
-
-def send_telegram(msg, silent=False):
-    if not TELEGRAM_TOKEN or not CHAT_ID: return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={
-            'chat_id': CHAT_ID,
-            'text': msg,
-            'parse_mode': 'Markdown',
-            'disable_notification': silent
-        }, timeout=10)
-        return r.status_code == 200
-    except: return False
-
-# ═══════════════════════════════════════════════
-# MAIN INTEL SCAN
-# ═══════════════════════════════════════════════
-
-def run_intel_scan():
-    print(f"\n🧠 Market Intelligence Scan @ {now_est().strftime('%H:%M %Z')}")
-    market_ctx = get_market_ctx()
-    all_contexts = {}
-    alerts_fired = 0
-
-    for symbol in MONITOR_LIST:
-        try:
-            print(f"  → {symbol:10s}...", end=" ")
-            ctx = get_full_context(symbol)
-            time.sleep(0.3)
-            if not ctx:
-                print("—")
-                continue
-            all_contexts[symbol] = ctx
-
-            drop = ctx['day_change_pct']
-
-            # Trigger conditions
-            big_move = (drop <= BIG_DROP_WARN or drop >= BIG_GAIN_ALERT)
-
-            if big_move:
-                if not can_alert(symbol, 'big_move'):
-                    print(f"{drop:+.1f}% 🔕 cooldown")
-                    continue
-
-                verdict, zone, reasons = get_verdict(ctx, market_ctx)
-                ai = ai_analyze_drop(ctx, market_ctx) if abs(drop) >= 5 else None
-                msg = format_big_move_alert(ctx, verdict, zone, reasons, ai, market_ctx)
-
-                if msg:
-                    send_telegram(msg, silent=False)
-                    alerts_fired += 1
-                    print(f"{drop:+.2f}% 🚨 ALERT SENT")
-            else:
-                print(f"{drop:+.2f}%")
-
-        except Exception as e:
-            print(f"💥 {e}")
-            logging.error(f"Intel {symbol}: {e}")
-
-    # Sector bleed
-    sector_moves = check_sector_bleeds(all_contexts)
-    if sector_moves:
-        state = load_json(STATE_FILE, {})
-        last_sector = state.get('last_sector_bleed')
-        send = True
-        if last_sector:
-            try:
-                dt = datetime.fromisoformat(last_sector)
-                if dt.tzinfo is None: dt = dt.replace(tzinfo=EST)
-                if now_est() - dt < timedelta(hours=4): send = False
-            except: pass
-        if send:
-            sector_msg = format_sector_bleed_alert(sector_moves)
-            if sector_msg:
-                send_telegram(sector_msg, silent=False)
-                alerts_fired += 1
-                state['last_sector_bleed'] = now_est().isoformat()
-                save_json(STATE_FILE, state)
-                print(f"🩸 Sector bleed alert sent")
-
-    print(f"\n✅ Intel scan done — {alerts_fired} alerts fired")
-    logging.info(f"Intel scan | Alerts: {alerts_fired}")
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        filename=f'logs/intel_{now_est().strftime("%Y-%m-%d")}.log',
-        level=logging.INFO,
-        format='%(asctime)s | %(levelname)s | %(message)s'
-    )
-    Path('logs').mkdir(exist_ok=True)
-
-# Leadership / laggard detection
-    if all_contexts:
-        sector_full = {}
-        for sector, symbols in SECTORS.items():
-            moves = [(s, all_contexts[s]['day_change_pct']) for s in symbols if s in all_contexts]
-            if len(moves) >= 2:
-                avg = sum(m[1] for m in moves) / len(moves)
-                sector_full[sector] = {'avg': avg, 'all': moves}
-
-        leaders, laggards = check_leadership(all_contexts, sector_full)
-        if leaders or laggards:
-            state = load_json(STATE_FILE, {})
-            last = state.get('last_leadership_alert')
-            send = True
-            if last:
-                try:
-                    dt = datetime.fromisoformat(last)
-                    if dt.tzinfo is None: dt = dt.replace(tzinfo=EST)
-                    if now_est() - dt < timedelta(hours=3): send = False
-                except: pass
-            if send:
-                rs_msg = format_leadership_alert(leaders, laggards)
-                if rs_msg:
-                    send_telegram(rs_msg, silent=True)
-                    state['last_leadership_alert'] = now_est().isoformat()
-                    save_json(STATE_FILE, state)
-                    print("💪 Leadership alert sent")
-
-# ═══════════════════════════════════════════════
 # LEADERSHIP / LAGGARD DETECTOR
 # ═══════════════════════════════════════════════
 
-def check_leadership(all_contexts, sector_moves):
-    """Identifies leaders (holding/rising while sector bleeds)
-    and laggards (dropping while sector holds)."""
+def check_leadership(all_contexts, sector_full):
+    """Identifies leaders (holding while sector bleeds)
+    and laggards (dropping while sector rips)."""
     leaders = []
     laggards = []
 
-    for sector, data in sector_moves.items():
+    for sector, data in sector_full.items():
         sector_avg = data['avg']
         if abs(sector_avg) < 1.5:
-            continue  # only interesting if sector is making a move
+            continue  # only flag if sector is making a real move
 
-        for sym, ctx in all_contexts.items():
-            # Match symbol to sector
-            in_sector = False
-            for s_name, syms in SECTORS.items():
-                if s_name == sector and sym in syms:
-                    in_sector = True
-                    break
-            if not in_sector:
+        for sym, pct in data['all']:
+            # O(1) sector lookup via reverse map
+            if SYMBOL_TO_SECTOR.get(sym) != sector:
+                continue
+            ctx = all_contexts.get(sym)
+            if not ctx:
                 continue
 
-            divergence = ctx['day_change_pct'] - sector_avg
+            divergence = pct - sector_avg
 
-            # Leader: sector bleeding (-), but symbol holding or green
+            # Leader: sector bleeding, but this stock holding up
             if sector_avg < -2 and divergence > 2:
                 leaders.append({
                     'symbol': sym, 'ctx': ctx,
@@ -831,7 +768,7 @@ def check_leadership(all_contexts, sector_moves):
                     'divergence': divergence
                 })
 
-            # Laggard: sector ripping, symbol dropping
+            # Laggard: sector ripping, this stock dropping
             elif sector_avg > 2 and divergence < -2:
                 laggards.append({
                     'symbol': sym, 'ctx': ctx,
@@ -871,6 +808,165 @@ def format_leadership_alert(leaders, laggards):
             msg += f"  {em} *{l['symbol']}* ({l['sector']})\n"
             msg += f"     Stock: `{l['ctx']['day_change_pct']:+.2f}%` • Sector avg: `{l['sector_avg']:+.2f}%`\n"
             msg += f"     📉 Underperforming by *{l['divergence']:+.2f}%*\n"
-        msg += f"\n⚠️ _Laggards in strong sectors = relative weakness. Consider shorts or skip._\n"
+        msg += f"\n⚠️ _Laggards in strong sectors = relative weakness._\n"
 
     return msg
+
+# ═══════════════════════════════════════════════
+# COOLDOWN MANAGER
+# ═══════════════════════════════════════════════
+
+def can_alert(key, hours=COOLDOWN_HOURS):
+    """Generic cooldown check + set. Returns True if allowed."""
+    state = load_json(STATE_FILE, {})
+    last = state.get(key)
+    if last:
+        try:
+            dt = datetime.fromisoformat(last)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=EST)
+            if now_est() - dt < timedelta(hours=hours):
+                return False
+        except:
+            pass
+    state[key] = now_est().isoformat()
+    save_json(STATE_FILE, state)
+    return True
+
+# ═══════════════════════════════════════════════
+# TELEGRAM (with auto-split)
+# ═══════════════════════════════════════════════
+
+def send_telegram(message, silent=False):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logging.warning("Telegram credentials missing")
+        return False
+
+    # Auto-split if over Telegram's 4096 limit
+    if len(message) > 4000:
+        parts = []
+        current = ""
+        for line in message.split('\n'):
+            if len(current) + len(line) + 1 > 3900:
+                parts.append(current)
+                current = line + '\n'
+            else:
+                current += line + '\n'
+        if current:
+            parts.append(current)
+        success = True
+        for part in parts:
+            if not _send_single(part, silent):
+                success = False
+            time.sleep(0.3)
+        return success
+    return _send_single(message, silent)
+
+def _send_single(message, silent=False):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, json={
+            'chat_id': CHAT_ID,
+            'text': message,
+            'parse_mode': 'Markdown',
+            'disable_notification': silent
+        }, timeout=10)
+        if r.status_code != 200:
+            logging.error(f"Telegram {r.status_code}: {r.text[:200]}")
+        return r.status_code == 200
+    except Exception as e:
+        logging.error(f"Telegram send: {e}")
+        return False
+
+# ═══════════════════════════════════════════════
+# MAIN ORCHESTRATION
+# ═══════════════════════════════════════════════
+
+def run_intel_scan():
+    print(f"\n🧠 Market Intelligence Scan @ {now_est().strftime('%H:%M %Z')}")
+    logging.info("Intel scan start")
+
+    market_ctx = get_market_ctx()
+    all_contexts = {}
+    alerts_fired = 0
+
+    # ═══ STEP 1: Fetch all contexts + fire big-move alerts ═══
+    for symbol in MONITOR_LIST:
+        try:
+            print(f"  → {symbol:10s}...", end=" ", flush=True)
+            ctx = get_full_context(symbol)
+            time.sleep(FETCH_DELAY)
+            if not ctx:
+                print("—")
+                continue
+            all_contexts[symbol] = ctx
+
+            drop = ctx['day_change_pct']
+            big_move = (drop <= BIG_DROP_WARN or drop >= BIG_GAIN_ALERT)
+
+            if big_move:
+                cool_key = f"intel_bigmove_{symbol}"
+                if not can_alert(cool_key, COOLDOWN_HOURS):
+                    print(f"{drop:+.2f}% 🔕 cooldown")
+                    continue
+
+                verdict, zone, reasons = get_verdict(ctx, market_ctx)
+                ai = ai_analyze_drop(ctx, market_ctx) if abs(drop) >= 5 else None
+                msg = format_big_move_alert(ctx, verdict, zone, reasons, ai, market_ctx)
+
+                if msg:
+                    send_telegram(msg, silent=False)
+                    alerts_fired += 1
+                    print(f"{drop:+.2f}% 🚨 ALERT SENT")
+                else:
+                    print(f"{drop:+.2f}%")
+            else:
+                print(f"{drop:+.2f}%")
+
+        except Exception as e:
+            print(f"💥 {e}")
+            logging.error(f"Intel {symbol}: {e}")
+
+    if not all_contexts:
+        print("\n⚠️ No contexts fetched — skipping sector/leadership checks")
+        logging.warning("No contexts — skipping aggregate detectors")
+        return
+
+    # ═══ STEP 2: Sector bleed ═══
+    sector_moves = check_sector_bleeds(all_contexts)
+    if sector_moves:
+        if can_alert('last_sector_bleed', SECTOR_BLEED_COOLDOWN):
+            sector_msg = format_sector_bleed_alert(sector_moves)
+            if sector_msg:
+                send_telegram(sector_msg, silent=False)
+                alerts_fired += 1
+                print(f"🩸 Sector bleed alert sent")
+        else:
+            print("🩸 Sector bleed — 🔕 cooldown")
+
+    # ═══ STEP 3: Leadership / laggard detection ═══
+    sector_full = {}
+    for sector, symbols in SECTORS.items():
+        moves = [(s, all_contexts[s]['day_change_pct'])
+                 for s in symbols if s in all_contexts]
+        if len(moves) >= 2:
+            avg = sum(m[1] for m in moves) / len(moves)
+            sector_full[sector] = {'avg': avg, 'all': moves}
+
+    leaders, laggards = check_leadership(all_contexts, sector_full)
+    if leaders or laggards:
+        if can_alert('last_leadership_alert', LEADERSHIP_COOLDOWN):
+            rs_msg = format_leadership_alert(leaders, laggards)
+            if rs_msg:
+                send_telegram(rs_msg, silent=True)
+                alerts_fired += 1
+                print(f"💪 Leadership alert sent")
+        else:
+            print("💪 Leadership — 🔕 cooldown")
+
+    print(f"\n✅ Intel scan done — {alerts_fired} alert(s) fired")
+    logging.info(f"Intel scan | Alerts: {alerts_fired}")
+
+
+if __name__ == "__main__":
+    run_intel_scan()
