@@ -1,241 +1,282 @@
-Here's my context:
-📋 AlphaEdge Scanner — Context for Next Chat
-Copy-paste this entire block at the start of your next chat. Then paste your current scanner.py immediately after.
+📋 AlphaEdge System — Complete Context Prompt for New Chat
+# 🎯 AlphaEdge Trading Intelligence System — Project Context (v6.1)
 
-# AlphaEdge Trading Scanner — Project Context (v5.3)
+I have a production Python trading intelligence system deployed on GitHub Actions that sends Telegram alerts. Full context below.
 
-I have a production Python trading scanner deployed on GitHub Actions that sends Telegram alerts. Full context below.
+---
 
 ## 🎯 WHAT IT DOES
 
-Scans 24 symbols across multi-timeframes for high-quality trading signals, sends rich Telegram alerts with AI analysis, tracks active signals from entry through TP/SL hits, and generates weekly performance summaries.
+A **4-module market intelligence suite** — NOT just a signal scanner:
 
-**Important:** This is a SIGNAL TRACKER / SCANNER, not an auto-trader. I do NOT execute trades from these alerts — I use them alongside my Pine Script indicator on charts. The scanner just tells me what's firing and tracks outcomes.
+1. **Signal Scanner** (Pine Script parity) — detects trading setups across 24 symbols, 30m & 1h
+2. **Market Intel** — big drops, sector bleeds, leadership/laggard detection, ATH/52W context
+3. **Dip Scanner** — finds oversold uptrending stocks across ~50 quality names
+4. **Morning Brief** — 9 AM daily digest with AI outlook
+
+**Important:** This is a SIGNAL TRACKER / INTELLIGENCE system, NOT an auto-trader. I do NOT execute trades from alerts — I use them alongside my Pine Script indicator on TradingView charts. The system tells me what's firing, provides context, and tracks outcomes.
+
+---
 
 ## 🏗️ ARCHITECTURE
 
 **Stack:**
 - Python 3.11
 - yfinance (market data, free)
-- Google Gemini 2.0 Flash API (free tier AI enrichment)
+- Google Gemini 2.0 Flash API (free tier: 1,500 req/day)
 - GitHub Actions (free unlimited minutes — repo is PUBLIC)
 - Telegram Bot API (alerts)
 - zoneinfo for EST/EDT auto-handling
 
 **Files:**
-- `scanner.py` — v5.3 main scanner (will be pasted next)
-- `.github/workflows/scanner.yml` — DST-aware cron schedule
-- `requirements.txt` — yfinance, pandas, numpy, requests
-- State files (cached between GitHub Actions runs):
-  - `alert_cache.json` — signal cooldowns by tier
-  - `active_trades.json` — open positions being tracked
-  - `trade_history.json` — archived closed trades (capped at 500)
-  - `scanner_state.json` — daily/weekly digest timestamps, position summary throttle
-  - `logs/` — daily scan logs
+your-repo/ ├── scanner.py ← v6.1 Pine-parity signal scanner ├── market_intel.py ← v2.0 context/intelligence engine ├── dip_scanner.py ← v2.0 oversold uptrend finder ├── morning_brief.py ← v2.0 daily digest ├── requirements.txt ← yfinance, pandas, numpy, requests └── .github/workflows/ ├── scanner.yml ← main scanner (every 10-15 min) ├── intel.yml ← context scan (every 30 min) ├── dip_scanner.yml ← 3-4x/day └── morning_brief.yml ← 9 AM weekdays
+
+**State files (cached between GitHub Actions runs):**
+- `alert_cache.json` — signal cooldowns by tier
+- `active_trades.json` — open positions being tracked
+- `trade_history.json` — archived closed trades (capped at 500)
+- `scanner_state.json` — daily/weekly/intel state + timestamps
+- `logs/` — daily scan logs per module
 
 **GitHub Secrets:**
 - `TELEGRAM_TOKEN`, `CHAT_ID`, `GEMINI_API_KEY`
 
+---
+
 ## 📊 WATCHLIST (24 symbols, session-aware)
 
-**CRYPTO_WATCHLIST (24/7):**
-BTC-USD, ETH-USD, XRP-USD, GC=F (gold futures)
+**CRYPTO (24/7):** BTC-USD, ETH-USD, XRP-USD, GC=F (gold futures)
 
-**EXTENDED_HOURS_STOCKS (pre-market + after-hours OK):**
-NVDA, TSLA, AMD, MSFT, META, AMZN, GOOGL, NFLX
+**EXTENDED_HOURS_STOCKS** (pre-market + after-hours OK): NVDA, TSLA, AMD, MSFT, META, AMZN, GOOGL, NFLX
 
-**REGULAR_HOURS_ONLY (9:30 AM - 4:00 PM local only):**
-MU, SNDK, NBIS, IONQ, RGTI, QBTS, OKLO, IREN, UAMY, WGRX, SOFI, NVO
+**REGULAR_HOURS_ONLY** (9:30 AM - 4:00 PM local): MU, SNDK, NBIS, IONQ, RGTI, QBTS, OKLO, IREN, UAMY, WGRX, SOFI, NVO
 
-## ⚙️ KEY CONFIG (v5.3)
+**DIP_UNIVERSE** (dip scanner only, ~50 symbols): AAPL, MSFT, GOOGL, AMZN, META, NVDA, TSLA, AMD, AVGO, TSM, ASML, MU, SMCI, MRVL, ARM, SNDK, NFLX, CRM, ADBE, ORCL, CRWD, PLTR, SNOW, NOW, DDOG, NBIS, APP, DUOL, HOOD, OKLO, CEG, VST, SMR, NNE, LLY, NVO, REGN, JPM, V, MA, SOFI, AXP, IONQ, RGTI, QBTS, QUBT, MSTR, IREN, MARA, RIOT, COIN, SHOP, UBER, SPOT, ANET, COST, CAVA
 
+---
+
+## ⚙️ KEY CONFIG (v6.1)
+
+### scanner.py — Pine Parity Settings
 ```python
-ACCOUNT_SIZE = 10000            # reference only
-RISK_PCT = 1.0                  # reference only
-SHOW_DOLLAR_AMOUNTS = False     # v5.3: R-multiples only in alerts, NO $ amounts
+# Pine: AE Core
+AE_LENGTH = 200
 
-MIN_SQS = 60                    # signal quality threshold (0-100)
-MIN_SCORE = 5                   # confluence threshold (0-10)
-AI_TIER_THRESHOLD = 70          # Gemini fires only on SQS ≥ 70
-FULL_DETAIL_SQS = 70            # digest mode: only SQS≥70 get full message
-AFTER_HOURS_SQS_PENALTY = 5     # -5 SQS for stocks during extended hours
+# Pine: Signal Filters
+MIN_CONF_SCORE = 4
+GRADE_FILTER = "A+ and A"       # A+ (≥8), A (≥6), B (≥4), C (<4)
+MIN_BARS_BETWEEN = 3
+USE_COUNTER_TREND_BLOCK = True
+USE_MTF_GATE = True
+MTF_GATE_BULL = 9                # Block SELL if MTF sum ≥ 9/12
+MTF_GATE_BEAR = 3                # Block BUY if MTF sum ≤ 3/12
+USE_CHOP_FILTER = True
+ADX_BYPASS_MIN = 5
 
-MAX_TRADE_AGE_HOURS = 72        # auto-close stale trades
-MAX_SL_PCT_STOCKS = 0.04        # 4% max stop
-MAX_SL_PCT_CRYPTO = 0.08        # 8% max stop
-MIN_SL_PCT_STOCKS = 0.005       # 0.5% minimum (prevents noise stops)
-MIN_SL_PCT_CRYPTO = 0.01        # 1% minimum (prevents noise stops like BTC 0.63%)
-PRICE_SANITY_DEVIATION = 0.20   # reject if live price differs >20% from daily close
+# Pine: SQS (Signal Quality Score 0-100)
+USE_SQS = True
+SQS_MIN_FOR_ALERT = 75           # Pine default
+AI_TIER_THRESHOLD = 75
 
-# Cooldown by SQS tier (hours)
-COOLDOWN_ELITE = 2    # SQS 85+
-COOLDOWN_STRONG = 4   # SQS 70-84
-COOLDOWN_GOOD = 6     # SQS 55-69
-COOLDOWN_FAIR = 10    # below 55
+# Safety caps
+MAX_SL_PCT_STOCKS = 0.04         # 4% max stop
+MAX_SL_PCT_CRYPTO = 0.08         # 8% max stop
+MIN_SL_PCT_STOCKS = 0.005
+MIN_SL_PCT_CRYPTO = 0.01
+PRICE_SANITY_DEVIATION = 0.20    # reject if live diffs >20% from daily close
 
-DIGEST_THRESHOLD = 4    # 4+ signals → digest mode instead of individual
+# Alert management
+DIGEST_THRESHOLD = 4             # 4+ signals → digest mode
+MAX_TRADE_AGE_HOURS = 72
+COOLDOWN_ELITE = 2               # SQS 85+
+COOLDOWN_STRONG = 4              # SQS 70-84
+COOLDOWN_GOOD = 6                # SQS 55-69
+COOLDOWN_FAIR = 10
 
 # Multi-timeframe
 TIMEFRAMES = [
-    {'tf': '30m', 'lookback': '60d', 'label': '⚡30m', 'min_bars': 100},
-    {'tf': '1h',  'lookback': '3mo', 'label': '📊1h',  'min_bars': 200},
+    {'tf': '30m', 'lookback': '60d', 'label': '⚡30m', 'min_bars': 250},
+    {'tf': '1h',  'lookback': '3mo', 'label': '📊1h',  'min_bars': 250},
 ]
+MTF_FRAMES = ['15m', '1h', '4h', '1d']  # For MTF gate sum (0-12)
+market_intel.py — Intelligence Thresholds
+BIG_DROP_WARN = -5.0             # ±5% triggers big-move alert
+BIG_DROP_CRITICAL = -10.0        # ±10% = CRITICAL
+BIG_GAIN_ALERT = 8.0
+COOLDOWN_HOURS = 4               # per-symbol cooldown
+EARNINGS_WARNING_DAYS = 3        # warn if earnings ≤3d
+dip_scanner.py — Dip Qualification
+DIP_RSI_MIN = 28
+DIP_RSI_MAX = 45
+DIP_MIN_DROP_1D = -2.0
+DIP_MIN_DROP_5D = -5.0
+DIP_MAX_FROM_ATH = -25.0
+DIP_MIN_VOL_RATIO = 0.8
+PER_SYMBOL_COOLDOWN_HOURS = 6
 🕐 TIMEZONE
 Uses zoneinfo.ZoneInfo("America/New_York") for auto EST/EDT handling. All timestamps displayed in EDT/EST. Workflow crons run in UTC but cover both DST regimes.
 
-🎯 SIGNAL LOGIC
-Confluence Scoring (0-10): 10 indicators checked — EMA20, EMA50, EMA200, Supertrend, MACD, RSI>50, VWAP, ADX±DI, Volume, RSI direction.
+🎯 SIGNAL LOGIC (scanner.py — Pine Script parity)
+Indicators (all use Wilder's RMA — matches Pine's ta.rma, ta.rsi, ta.atr, ta.dmi):
+
+RSI, ATR, ADX (+DI/-DI) with proper Wilder smoothing
+Range Filter (Pine's rngfilt_va with volume-direction logic)
+Supertrend (HL2 + ratcheting bands)
+MACD, EMA20/50/200, VWAP, BB/KC Squeeze
+10-point confluence scoring (bull AND bear tracked independently): AE • Supertrend • MACD • RSI • EMA50>200 • VWAP • ADX+DI • HTF • Squeeze • SMC
 
 Triggers:
 
-Fresh Cross (EMA50/Supertrend/MACD just flipped)
-Pullback (retest of EMA20 in established trend)
-Oversold Bounce / Overbought Drop (RSI <32 / >68)
-Trend Continuation (strong trend breaking recent highs/lows)
-Strong Momentum (7+ confluence with ADX 22-55)
-Smart Hard Blocks (context-aware — don't kill healthy trends):
+AE Flip (range filter direction change)
+Band Breakout (close crosses hband/lowband)
+Hard Gates:
 
-RSI ≥ 80 blocked UNLESS strong uptrend confirmed
-RSI ≤ 20 similar for bear
-Parabolic (stretch >5× ATR) blocked unless strong trend
-ADX ≥ 65 = trend exhaustion, always blocked
-Counter-HTF momentum blocked
-v5.3 NEW: Crypto Fresh-Cross requires trend confirmation (kills chop signals like weak BTC flips)
-v5.3 NEW: Stocks in pre-market/after-hours get -5 SQS penalty (quality filter, not block)
+ADX gate (>20) with high-score bypass (≥5)
+Counter-trend block (score <6 AND HTF+ST opposite)
+MTF Gate (blocks longs when 4-TF sum ≤3, shorts when ≥9)
+Grade filter (A+ ≥8, A ≥6, B ≥4)
+Chop filter (blocks signals too close to last signal, ATR-relative)
 SQS (Signal Quality Score 0-100):
 
-Confluence: 40%
-Regime fit (ADX): 15%
+Confluence: 40% (score/10 × 40)
+MTF alignment: 25% (directional match with MTF sum)
+Regime fit: 15% (trending/ranging/transitional)
 Volume: 10%
-RSI fit (40-60 ideal): 10%
-Trend alignment: 15%
-Parabolic penalty: -10% if stretch >4
-Tiers: 🏆 ELITE (85+) / ⭐ STRONG (70-84) / ✅ GOOD (55-69) / ⚠️ FAIR (<55)
-
-📅 CRON SCHEDULE (DST-aware)
-Regular market (9:30-4 local) — every 10 min, full watchlist
-After-hours (4-8 PM local) — every 15 min, crypto + mega-caps
-Pre-market (4-9:30 AM local) — every 15 min, crypto + mega-caps
-Overnight (8 PM-4 AM local) — every 30 min, crypto only
-Weekends — every 30 min, crypto only
-Covers both EDT and EST windows so no DST-related gaps.
+Volatility fit: 10%
+Tiers: 🏆 ELITE (90+) / ⭐ STRONG (75-89) / ✅ GOOD (60-74) / ⚠️ FAIR (<60)
 
 🤖 GEMINI AI INTEGRATION
 Model: gemini-2.0-flash (free tier: 1,500 req/day)
-Fires ONLY on signals with SQS ≥ 70
-Returns 3 structured lines:
-📝 Setup quality assessment
-⚠️ Main risk factor
-💡 Verdict (STRONG BUY/BUY/NEUTRAL/CAUTION/AVOID) — brief reason
-Graceful failure: if API fails, signal still sent without AI
-Usage: ~90 calls/day (6% of free tier limit)
+Used by:
+scanner.py — fires on SQS ≥75 (3-line verdict per signal)
+market_intel.py — "why is this moving?" on big drops (4-line analysis)
+morning_brief.py — daily outlook (4-line strategy brief)
+Graceful failure: If API fails or rate-limits, alerts still send without AI block
+Typical usage: ~30-60 calls/day (well under free tier limit)
 📱 TELEGRAM ALERT TYPES
-New Signal — Full trade plan with entry, SL (with tight/wide warnings), 3 TPs (shown as +1R/+2R/+3R), key levels (≥0.3% away only), technicals, absolute expiry time, session tips, AI analysis
-Trade Events — TP1/TP2/TP3 hit (✅), SL hit (🛑), Timeout (⏰) — all in R-multiples
-Price Ladder — Visual SL→Entry→TPs with hit markers
-Market Context (daily 9 AM EDT weekdays) — SPY/QQQ/VIX with bias
-Near-Miss Digest (daily 9 AM) — symbols with 7+ confluence but no trigger
-Weekly Summary (Sunday 9 PM+) — win rate, total R, grade performance (NO dollar amounts)
-Correlation Notice — when multiple signals/positions in same sector (informational, not blocking)
-Open Positions Summary — max every 2 hours if 2+ positions open; sorted by R (best → worst); shows longs/shorts/TF breakdown
-🎨 ALERT UI FEATURES (v5.3)
+From scanner.py:
+🚀 New Signal — full trade plan with entry, SL, 3 TPs, R-multiples, key levels, technicals, expiry, AI analysis
+✅ TP1/TP2/TP3 Hit — with next-step guidance
+🛑 SL Hit — distinguishes trailed profit vs true loss
+⏰ Timeout — auto-close after 72h
+📊 Open Positions Summary — grouped (winners/building/flat/losing/near-SL) every 2h if 2+ open
+🔔 Signal Digest — when 4+ signals fire simultaneously
+🔗 Correlation Notice — multiple signals/positions in same sector
+🌍 Daily Market Context — 9 AM EDT weekdays (SPY/QQQ/VIX bias)
+📈 Weekly Summary — Sunday 9 PM (win rate, R totals, grade performance)
+From market_intel.py:
+🩸 Big Drop Alert — ≥5% drop with AI "why" analysis + ATH/52W context + RS + earnings
+🚀 Big Gain Alert — ≥8% gain
+🚨 CRITICAL DROP — ≥10% drop
+🏚️ Sector Bleed — when sector avg ≤-2%
+💪 Leadership Signal — stocks holding while sector bleeds
+🔻 Laggard Signal — stocks weak in strong sectors
+From dip_scanner.py:
+💎 Dip Opportunities — top-10 oversold uptrend setups (score 0-14)
+From morning_brief.py:
+🌅 Morning Brief — 9 AM daily digest (market snapshot, AI outlook, earnings, sectors, movers, buy candidates, avoid list)
+🎨 ALERT UI FEATURES
 Symbol emojis (₿ BTC, 💎 NVDA, 🥇 gold, etc.)
 SQS visual meter (🟢🟢🟢🟢🟡🟡⚪⚪⚪⚪)
-Borderline warning if SQS 60-69
-Tight stop warning (<1% away) / wide stop warning (>5%)
+MTF bar (█████░░░░░░░ 5/12)
+Borderline warning if SQS 60-74
+Tight stop warning (<1%) / wide stop warning (>5%)
 Nearby key levels (resistance, support, EMA50, EMA200) — ONLY if ≥0.3% distance
 Absolute expiry time + relative: "Valid until: 19:09 EDT (59m)"
 Session-specific trading tips (pre-market, after-hours warnings)
-Multi-TF confirmation badge (🎯🎯 when symbol fires on both TFs)
 Trade age counter
 After-hours warning ⚠️ for thin liquidity
 Trailing stop instructions on TP hits
 All P&L in R-multiples (no dollars)
+Auto-split for messages >4000 chars
 🛡️ SAFETY FEATURES
 Price sanity check (rejects if live differs >20% from daily close)
 Max SL caps (4% stocks, 8% crypto)
-Min SL distance (0.5% stocks, 1% crypto) — prevents noise stops
-Min SL distance (0.5× ATR minimum)
-Structure-based SL (recent swing low/high - 0.2× ATR)
-Rate limit delay (0.3s between symbol fetches)
+Min SL distance (0.5% stocks, 1% crypto)
+Min SL distance (0.5× ATR)
+Structure-based SL (recent swing low/high ± 0.2× ATR)
+Rate limit delays (0.3s between symbol fetches)
 Error recovery per-symbol (one failure doesn't kill scan)
-Active trade check runs 24/7 regardless of session
-Cooldown prevents duplicate alerts
-🔗 CORRELATION GROUPS (informational only, not blocking)
-CORRELATION_GROUPS = {
+Cooldowns prevent duplicate alerts
+Pandas 2.x safe (numpy-based loops for Supertrend/range filter)
+Earnings exclusion (blocks BUY verdicts within 3d of earnings)
+Weekend/overnight guards (skip scans when data stale)
+📅 CRON SCHEDULE (all DST-aware)
+Workflow	Schedule	Purpose
+scanner.yml	Every 10 min (market), 15 min (extended), 30 min (overnight/weekend)	Main signal scans
+intel.yml	Every 30 min	Big moves, sector bleed, leadership
+dip_scanner.yml	3-4× per trading day	Oversold uptrend finder
+morning_brief.yml	9 AM ET weekdays	Daily digest
+🔗 CORRELATION GROUPS / SECTORS
+SECTORS = {
     'AI/Semis': ['NVDA', 'AMD', 'MU', 'SNDK', 'NBIS'],
     'Crypto': ['BTC-USD', 'ETH-USD', 'XRP-USD'],
+    'Crypto-Adj': ['IREN', 'COIN', 'MSTR'],
     'Quantum': ['IONQ', 'RGTI', 'QBTS'],
-    'Mega Tech': ['GOOGL', 'MSFT', 'META', 'AMZN'],
+    'Nuclear/Energy': ['OKLO', 'UAMY'],
+    'Mega Tech': ['GOOGL', 'MSFT', 'META', 'AMZN', 'AAPL'],
+    'EV/Auto': ['TSLA'],
+    'Fintech': ['SOFI'],
+    'Biotech': ['NVO', 'WGRX'],
+    'Streaming': ['NFLX'],
+    'Safe Haven': ['GC=F'],
 }
-Alerts when 2+ signals/positions in same group (includes existing open trades for true exposure view). Kept intentionally loose — just a notice, doesn't block signals.
-
-📈 v5.3 CHANGES (AUDIT RESULTS)
-Bugs Fixed:
-
-Removed ALL dollar/P&L calculations (R-multiples only throughout)
-Fixed -0.00R ($-0) formatting → clean R display via fmt_r()
-Fixed tight-stop noise (e.g., BTC 0.63% SL) → MIN_SL_PCT enforced
-Removed dead price_progress() code
-Fixed stale expiry display → absolute time "HH:MM TZ (relative)"
-Fixed correlation to include open trades for true exposure
-Fixed noise levels shown at 0.2% → filter ≥0.3% only
-Logic Improvements (quality, NOT tightening):
-
-Crypto Fresh-Cross needs trend confirmation (kills weak chop signals)
-After-hours stock SQS penalty (-5) as quality tweak
-Removed Per User Request:
-
-All $ profit/P&L displays
-Position size units/notional
-Dollar risk displays
-Max concurrent position cap (this is a tracker, not executor)
-Dollar math in correlation
-Intentionally Unchanged:
-
-Correlation groups (left loose)
-All signal trigger types
-All filters (no additional tightening)
-Cooldowns
-Watchlist composition
-🎯 VERSION HISTORY
-v3.0 — Initial scanner with basic confluence
-v4.0 — Added strict filters (blocked parabolic chases)
-v4.1 — Balanced filters, near-miss diagnostics
-v4.2 — Smart RSI (context-aware, allows healthy uptrends)
-v5.0 — Multi-timeframe, position sizing, trade history, weekly summary
-v5.1 — Session-aware watchlist
-v5.2 — All bug fixes + UI polish (multi-TF badge, price ladder, key levels, expiry)
-v5.3 (current) — Audited & polished: R-only (no $), min SL distance, smart crypto filters, cleaner UI
+📈 VERSION HISTORY
+Version	Key Changes
+v3.0	Initial scanner
+v4.0-4.2	Smart filtering, context-aware RSI
+v5.0-5.3	Multi-TF, position sizing, trade history
+v6.0	Pine Script parity (Wilder's RMA, Range Filter)
+v6.1	Audited & bug-fixed (pandas 2.x safe, chop filter wired, auto-split)
++ Intel v2.0	Market intelligence module (big moves, sector bleed, leadership)
++ Dip v2.0	Oversold uptrend scanner
++ Brief v2.0	9 AM daily digest with AI outlook
 📜 COMPANION PINE SCRIPT
-I also have an AlphaEdge Pine Script v6.3.2 indicator that runs on TradingView charts with identical signal logic. The Python scanner essentially automates that indicator's signal detection across multiple symbols with Telegram delivery.
+I also have AlphaEdge Pine Script v6.3.2 (indicator) on TradingView that runs on charts with identical signal logic. The Python scanner.py essentially mirrors that indicator's logic across multiple symbols with Telegram delivery.
 
 Pine Script features: 16 themes, Signal Quality Score (SQS), Smart Re-Entry, Trade History log, Drawdown tracker, Session Volume Profile (NY/London/Asia), Liquidity Sweeps, Market Structure (BOS/CHoCH), Order Blocks, FVGs, Anchored VWAP, CVD, Multi-TF POC lines, Confluence Heatmap, Market Regime Badge.
 
-📝 REQUEST FORMAT
-When I paste this + my question, please:
+💬 WHAT I MIGHT ASK FOR NEXT
+Common requests:
 
-Answer in context of this v5.3 scanner
-Don't suggest changes that break existing features
-Provide complete updated code blocks when making changes (no ... placeholders)
-Note any dependencies/config that need updating
-Call out potential side effects on existing features
-Keep R-multiples only — NO dollar amounts in alerts
-Don't add a position cap — this is a signal tracker, not an executor
-Don't tighten correlation logic — keep it as informational only
-💡 WHAT I MIGHT ASK FOR NEXT
-Add new trigger types (breakout-only, volume spike, mean reversion)
-Add new timeframe (15m or 4h)
-Tune specific filters based on recent signal performance
-Add backtest mode on historical data
-Expand watchlist with new symbols
-Add new correlation groups
-Modify AI prompt
-Add trade journal auto-export (Google Sheets/CSV)
-Debug specific signal behavior
-Change alert formatting
-Add Discord alerts in parallel
-Add EOD email digest
-NEXT: I will paste the current scanner.py v5.3 code for continuation.
-My question is:
-Here's my current scanner.py:
+Add new feature to any module (with audit for bugs)
+Fix bugs in specific file (paste file, I'll audit)
+Add a new module (e.g., news integration, weekly review, price-level alerts)
+Tune thresholds / filters
+Refactor / clean up code
+Debug a specific alert I received
+Compare Telegram alert vs my Pine chart (paste chart screenshot)
+Update README / workflow files
+When I paste a file, please:
+
+Audit first — list all bugs found with severity
+Then rewrite — clean version split into parts if long
+Pine Script parity is critical — for scanner.py, it must match TradingView's ta.* functions exactly (Wilder's RMA for RSI/ATR/ADX)
+Keep imports clean — shared helpers live in market_intel.py, reused by dip_scanner and morning_brief
+🎯 DESIGN PRINCIPLES
+Context over signals — every alert must explain WHY, not just WHAT
+Pine parity is non-negotiable — scanner must match my TradingView chart
+R-multiples only — no dollar amounts in alerts
+Session awareness — different behavior for RTH vs extended vs overnight
+Cooldowns everywhere — prevent spam
+Graceful failure — if AI/API fails, alert still fires
+Mobile-readable — concise layout, grouped info, emojis for scanning
+Auto-split — Telegram's 4096 char limit handled automatically
+---
+
+Then after pasting that, follow with something like:
+
+I want to [add a news integration / fix X / build Y]. Here's my current [file_name.py]:
+
+[paste file]
+
+---
+
+## 💡 Shorter Version (If You Just Want a Tiny Reminder)
+
+If you don't want the whole thing above, here's a **1-paragraph compact version** for quick-resume chats:
+
+```markdown
+## AlphaEdge Context (v6.1 — short form)
+
+Production Python trading intelligence system on GitHub Actions → Telegram. 4 modules: scanner.py (Pine Script v6.3.2 parity signal detection, 24 symbols, 30m/1h, Wilder's RMA RSI/ATR/ADX, Range Filter, 10-pt confluence, SQS 0-100), market_intel.py (big drops ≥5%, sector bleeds, leadership, ATH/52W, earnings, RS), dip_scanner.py (50 quality names, oversold uptrend, RSI 28-45), morning_brief.py (9 AM daily AI digest). Free tier stack: yfinance + Gemini 2.0 Flash + GitHub Actions + Telegram. R-multiples only, no dollars. Session-aware, DST-aware, auto-split messages, pandas 2.x safe. I track signals alongside my TradingView Pine Script chart — NOT auto-trading. When I paste a file, audit bugs first then rewrite cleanly.
