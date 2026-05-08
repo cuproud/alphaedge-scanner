@@ -1,32 +1,25 @@
-name: AlphaEdge Scanner v6.0
-
+name: AlphaEdge Scanner v7.0
 on:
   schedule:
     # ═══════════════════════════════════════════════
     # All times in UTC. Covers BOTH EDT (UTC-4) and EST (UTC-5)
     # So the active hours overlap cleanly.
     # ═══════════════════════════════════════════════
-
     # 📈 REGULAR MARKET (9:30 AM – 4:00 PM ET) — every 10 min
     # Covers EDT 13:30–20:00 UTC  AND  EST 14:30–21:00 UTC
     - cron: '*/10 13-21 * * 1-5'
-
     # 🌙 AFTER-HOURS (4:00 PM – 8:00 PM ET) — every 15 min
     # Covers EDT 20:00–00:00 UTC  AND  EST 21:00–01:00 UTC
     - cron: '*/15 20-23 * * 1-5'
     - cron: '*/15 0-1 * * 2-6'
-
     # 🌅 PRE-MARKET (4:00 AM – 9:30 AM ET) — every 15 min
     # Covers EDT 08:00–13:30 UTC  AND  EST 09:00–14:30 UTC
     - cron: '*/15 8-14 * * 1-5'
-
     # 🌑 OVERNIGHT (crypto only, 8 PM – 4 AM ET) — every 30 min
     # Covers 01:00–09:00 UTC (spans both DST regimes)
     - cron: '0,30 2-8 * * 2-6'
-
     # 🪙 WEEKENDS (crypto only) — every 30 min
     - cron: '*/30 * * * 0,6'
-
   workflow_dispatch:
 
 concurrency:
@@ -40,8 +33,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-
+    timeout-minutes: 20  # bumped from 12 — v7.0 pre-fetches HTF+MTF for all symbols
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -61,10 +53,11 @@ jobs:
             active_trades.json
             trade_history.json
             scanner_state.json
-          key: scanner-state-v6-${{ github.run_id }}
+            sqs_history.json
+            dynamic_threshold.json
+          key: scanner-state-v7-${{ github.run_id }}
           restore-keys: |
-            scanner-state-v6-
-            scanner-state-
+            scanner-state-v7-
 
       - name: Install dependencies
         run: |
@@ -89,7 +82,9 @@ jobs:
             active_trades.json
             trade_history.json
             scanner_state.json
-          key: scanner-state-v6-${{ github.run_id }}
+            sqs_history.json
+            dynamic_threshold.json
+          key: scanner-state-v7-${{ github.run_id }}
 
       - name: Upload scan logs
         if: always() && hashFiles('logs/**') != ''
