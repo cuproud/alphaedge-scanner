@@ -1,90 +1,97 @@
-# AlphaEdge Universe Configuration
-# Edit this file to add/remove symbols across ALL scanners
+# ═══════════════════════════════════════════════════════
+# ALPHAEDGE UNIVERSE CONFIGURATION
+# ═══════════════════════════════════════════════════════
+# Edit this file to add/remove symbols across ALL scanners.
+# No code changes needed. Just update here and restart.
+# ═══════════════════════════════════════════════════════
 
-watchlists:
-  crypto:
-    - symbol: BTC-USD
-      emoji: ₿
-      sector: Crypto
-    - symbol: ETH-USD
-      emoji: Ξ
-      sector: Crypto
-    - symbol: XRP-USD
-      emoji: ◇
-      sector: Crypto
-    - symbol: GC=F
-      emoji: 🥇
-      sector: Commodities
+# ─── Crypto & Commodities (24/7 tradable) ───
+crypto:
+  - { symbol: BTC-USD, emoji: ₿,  sector: Crypto }
+  - { symbol: ETH-USD, emoji: Ξ,  sector: Crypto }
+  - { symbol: XRP-USD, emoji: ◇,  sector: Crypto }
+  - { symbol: GC=F,    emoji: 🥇, sector: Safe Haven }
 
-  extended_hours:
-    - symbol: NVDA
-      emoji: 💎
-      sector: AI/Semis
-    - symbol: TSLA
-      emoji: 🚘
-      sector: EV/Auto
-    - symbol: AMD
-      emoji: ⚡
-      sector: AI/Semis
-    - symbol: MSFT
-      emoji: 🪟
-      sector: Mega Tech
-    - symbol: META
-      emoji: 👓
-      sector: Mega Tech
-    - symbol: AMZN
-      emoji: 📦
-      sector: Mega Tech
-    - symbol: GOOGL
-      emoji: 🔍
-      sector: Mega Tech
-    - symbol: NFLX
-      emoji: 🎬
-      sector: Mega Tech
+# ─── Extended-Hours Stocks (pre-market + after-hours) ───
+extended_hours:
+  - { symbol: NVDA,  emoji: 💎, sector: AI/Semis }
+  - { symbol: TSLA,  emoji: 🚘, sector: EV/Auto }
+  - { symbol: AMD,   emoji: ⚡, sector: AI/Semis }
+  - { symbol: MSFT,  emoji: 🪟, sector: Mega Tech }
+  - { symbol: META,  emoji: 👓, sector: Mega Tech }
+  - { symbol: AMZN,  emoji: 📦, sector: Mega Tech }
+  - { symbol: GOOGL, emoji: 🔍, sector: Mega Tech }
+  - { symbol: NFLX,  emoji: 🎬, sector: Streaming }
+  - { symbol: AAPL,  emoji: 🍎, sector: Mega Tech }
 
-  regular_hours:
-    - symbol: MU
-      emoji: 💾
-      sector: AI/Semis
-    - symbol: SNDK
-      emoji: 💽
-      sector: AI/Semis
-    - symbol: NBIS
-      emoji: 🌐
-      sector: AI/Semis
-    - symbol: IONQ
-      emoji: ⚛️
-      sector: Quantum
-    - symbol: RGTI
-      emoji: 🧪
-      sector: Quantum
-    - symbol: QBTS
-      emoji: 🔬
-      sector: Quantum
-    - symbol: OKLO
-      emoji: ☢️
-      sector: Nuclear/Energy
-    - symbol: IREN
-      emoji: 🪙
-      sector: Crypto Mining
-    - symbol: UAMY
-      emoji: ⚒️
-      sector: Materials
-    - symbol: WGRX
-      emoji: 💊
-      sector: Biotech
-    - symbol: SOFI
-      emoji: 🏦
-      sector: Fintech
-    - symbol: NVO
-      emoji: 💉
-      sector: Pharma
+# ─── Regular-Hours Only ───
+regular_hours:
+  - { symbol: MU,   emoji: 💾, sector: AI/Semis }
+  - { symbol: SNDK, emoji: 💽, sector: AI/Semis }
+  - { symbol: NBIS, emoji: 🌐, sector: AI/Semis }
+  - { symbol: IONQ, emoji: ⚛️, sector: Quantum }
+  - { symbol: RGTI, emoji: 🧪, sector: Quantum }
+  - { symbol: QBTS, emoji: 🔬, sector: Quantum }
+  - { symbol: OKLO, emoji: ☢️, sector: Nuclear/Energy }
+  - { symbol: IREN, emoji: 🪙, sector: Crypto Mining }
+  - { symbol: UAMY, emoji: ⚒️, sector: Materials }
+  - { symbol: WGRX, emoji: 💊, sector: Biotech }
+  - { symbol: SOFI, emoji: 🏦, sector: Fintech }
+  - { symbol: NVO,  emoji: 💉, sector: Pharma }
 
-# Optional: scanner-specific overrides
-dip_scanner_extras:
-  - symbol: AAPL
-    emoji: 🍎
-    sector: Mega Tech
-  - symbol: COIN
-    emoji: 🪙
-    sector: Crypto
+# ─── Extra symbols for Dip Scanner only ───
+# (these are scanned for dips but NOT in main signal scanner
+#  to avoid alert overload)
+dip_extras:
+  - { symbol: AVGO, emoji: 🔷, sector: AI/Semis }
+  - { symbol: TSM,  emoji: 🏭, sector: AI/Semis }
+  - { symbol: ASML, emoji: 🔬, sector: AI/Semis }
+  - { symbol: SMCI, emoji: 💻, sector: AI/Semis }
+  - { symbol: MRVL, emoji: 🛸, sector: AI/Semis }
+  - { symbol: ARM,  emoji: 🦾, sector: AI/Semis }
+  - { symbol: CRM,  emoji: ☁️, sector: SaaS }
+  - { symbol: ADBE, emoji: 🎨, sector: SaaS }
+  - { symbol: ORCL, emoji: 🗄️, sector: SaaS }
+  - { symbol: CRWD, emoji: 🛡️, sector: Cybersec }
+  - { symbol: PLTR, emoji: 🔮, sector: AI/Data }
+  - { symbol: SNOW, emoji: ❄️, sector: SaaS }
+  - { symbol: NOW,  emoji: ⏱️, sector: SaaS }
+  - { symbol: DDOG, emoji: 🐕, sector: SaaS }
+  - { symbol: APP,  emoji: 📱, sector: AdTech }
+  - { symbol: DUOL, emoji: 🦉, sector: EdTech }
+  - { symbol: HOOD, emoji: 🏹, sector: Fintech }
+  - { symbol: CEG,  emoji: ⚡, sector: Nuclear/Energy }
+  - { symbol: VST,  emoji: 🔌, sector: Nuclear/Energy }
+  - { symbol: SMR,  emoji: ⚛️, sector: Nuclear/Energy }
+  - { symbol: NNE,  emoji: ☢️, sector: Nuclear/Energy }
+  - { symbol: LLY,  emoji: 💊, sector: Pharma }
+  - { symbol: REGN, emoji: 🧬, sector: Biotech }
+  - { symbol: JPM,  emoji: 🏦, sector: Financial }
+  - { symbol: V,    emoji: 💳, sector: Financial }
+  - { symbol: MA,   emoji: 💳, sector: Financial }
+  - { symbol: AXP,  emoji: 🪙, sector: Financial }
+  - { symbol: QUBT, emoji: 🔬, sector: Quantum }
+  - { symbol: MSTR, emoji: ₿,  sector: Crypto-Adj }
+  - { symbol: MARA, emoji: ⛏️, sector: Crypto Mining }
+  - { symbol: RIOT, emoji: ⛏️, sector: Crypto Mining }
+  - { symbol: COIN, emoji: 🪙, sector: Crypto-Adj }
+  - { symbol: SHOP, emoji: 🛍️, sector: E-Commerce }
+  - { symbol: UBER, emoji: 🚗, sector: Gig Economy }
+  - { symbol: SPOT, emoji: 🎵, sector: Streaming }
+  - { symbol: ANET, emoji: 🌐, sector: Networking }
+  - { symbol: COST, emoji: 🏪, sector: Retail }
+  - { symbol: CAVA, emoji: 🫒, sector: Restaurants }
+
+# ─── Scanner settings (optional overrides) ───
+settings:
+  scanner:
+    sqs_min_for_alert: 75
+    grade_filter: "A+ and A"
+  dip_scanner:
+    rsi_min: 28
+    rsi_max: 45
+    max_from_ath_pct: -25.0
+  intel:
+    big_drop_warn: -5.0
+    big_drop_critical: -10.0
+    big_gain_alert: 8.0
