@@ -495,8 +495,8 @@ def md_escape(text):
     if text is None:
         return ""
     s = str(text)
-    for ch in ('\', '_', '*', '`', '[', ']'):
-        s = s.replace(ch, '\' + ch)
+    for ch in ('\\', '_', '*', '`', '[', ']'):
+        s = s.replace(ch, '\\' + ch)
     return s
 
 def safe_sym(sym):
