@@ -1,5 +1,5 @@
 """
-ALPHAEDGE MARKET INTELLIGENCE MODULE v2.0 — AUDITED
+ALPHAEDGE MARKET INTELLIGENCE MODULE v2.1
 ═══════════════════════════════════════════════════════════════
 Provides CONTEXT, not just signals:
 • Big move detection (±5%, ±10%)
@@ -11,16 +11,13 @@ Provides CONTEXT, not just signals:
 • Earnings calendar check
 • Wilder's RMA RSI (matches scanner.py)
 
-v2.0 FIXES:
-• Proper function ordering (no forward references)
-• Leadership detection now called from run_intel_scan()
-• Logging configured at module level (works when imported)
-• Fixed off-by-one in relative_strength (proper N-day lookback)
-• Wilder's RMA RSI (consistent with scanner.py)
-• Fixed trend classification order (unreachable branches now work)
-• Message auto-split for long alerts (>4000 chars)
-• Today's volume from intraday filtered by date (not 2-day sum)
-• Better error logging throughout
+v2.1 CHANGES vs v2.0:
+• Reads MONITOR_LIST, SECTORS, SYMBOL_EMOJI from symbols.yaml
+  (single source of truth — stays in sync with scanner.py)
+• Fallback to hardcoded lists if symbols.yaml not found
+• Fixed can't-parse apostrophe SyntaxError in _send_single
+• Removed orphaned COIN/MSTR from SYMBOL_EMOJI (were missing from MONITOR_LIST)
+• symbols.yaml loader is optional-import safe (no hard crash if pyyaml missing)
 """
 
 import yfinance as yf
@@ -48,10 +45,10 @@ CHAT_ID = os.environ.get('CHAT_ID')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
 STATE_FILE = 'scanner_state.json'
+SYMBOLS_YAML = 'symbols.yaml'
 LOGS_DIR = Path('logs')
 LOGS_DIR.mkdir(exist_ok=True)
 
-# Module-level logger (works on import AND main)
 def _setup_logger():
     logging.basicConfig(
         filename=LOGS_DIR / f'intel_{datetime.now(EST).strftime("%Y-%m-%d")}.log',
@@ -77,46 +74,92 @@ EARNINGS_WARNING_DAYS = 3
 
 FETCH_DELAY = 0.3
 
-# ═══════════════════════════════════════════════
-# SECTORS & MONITOR LIST
-# ═══════════════════════════════════════════════
-SECTORS = {
-    'AI/Semis': ['NVDA', 'AMD', 'MU', 'SNDK', 'NBIS'],
-    'Crypto': ['BTC-USD', 'ETH-USD', 'XRP-USD'],
-    'Crypto-Adj': ['IREN', 'COIN', 'MSTR'],
-    'Quantum': ['IONQ', 'RGTI', 'QBTS'],
-    'Nuclear/Energy': ['OKLO', 'UAMY'],
-    'Mega Tech': ['GOOGL', 'MSFT', 'META', 'AMZN', 'AAPL'],
-    'EV/Auto': ['TSLA'],
-    'Fintech': ['SOFI'],
-    'Biotech': ['NVO', 'WGRX'],
-    'Streaming': ['NFLX'],
-    'Safe Haven': ['GC=F'],
-}
 
-MONITOR_LIST = [
-    'BTC-USD', 'ETH-USD', 'XRP-USD', 'GC=F',
-    'NVDA', 'TSLA', 'AMD', 'MSFT', 'META', 'AMZN', 'GOOGL', 'NFLX', 'AAPL',
-    'MU', 'SNDK', 'NBIS', 'IONQ', 'RGTI', 'QBTS',
-    'OKLO', 'IREN', 'UAMY', 'WGRX', 'SOFI', 'NVO',
-]
+# ═══════════════════════════════════════════════
+# SYMBOLS — loaded from symbols.yaml with hardcoded fallback
+# ═══════════════════════════════════════════════
 
-SYMBOL_EMOJI = {
-    'BTC-USD': '₿', 'ETH-USD': 'Ξ', 'XRP-USD': '◇', 'GC=F': '🥇',
-    'NVDA': '💎', 'TSLA': '🚘', 'META': '👓', 'AMZN': '📦',
-    'GOOGL': '🔍', 'MSFT': '🪟', 'NFLX': '🎬', 'AMD': '⚡', 'AAPL': '🍎',
-    'MU': '💾', 'SNDK': '💽', 'NBIS': '🌐',
-    'IONQ': '⚛️', 'RGTI': '🧪', 'QBTS': '🔬',
-    'OKLO': '☢️', 'IREN': '🪙', 'UAMY': '⚒️', 'WGRX': '💊',
-    'SOFI': '🏦', 'NVO': '💉',
-    'COIN': '🪙', 'MSTR': '₿',
-}
+def _load_from_yaml():
+    """
+    Reads MONITOR_LIST, SECTORS, SYMBOL_EMOJI from symbols.yaml.
+    Returns (monitor_list, sectors, emoji_map) or None if unavailable.
+    """
+    yaml_path = Path(SYMBOLS_YAML)
+    if not yaml_path.exists():
+        return None
+    try:
+        import yaml
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            raw = yaml.safe_load(f) or {}
+
+        emoji_map = {}
+        sector_map = {}   # symbol → sector
+        all_syms = []
+
+        for bucket in ('crypto', 'extended_hours', 'regular_hours'):
+            for item in (raw.get(bucket) or []):
+                sym = item['symbol']
+                all_syms.append(sym)
+                emoji_map[sym] = item.get('emoji', '📊')
+                sector_map[sym] = item.get('sector', 'Other')
+
+        # Build SECTORS dict: {sector: [symbols]}
+        sectors = {}
+        for sym, sec in sector_map.items():
+            sectors.setdefault(sec, []).append(sym)
+
+        return all_syms, sectors, emoji_map
+    except Exception as e:
+        logging.warning(f"symbols.yaml load failed: {e} — using hardcoded fallback")
+        return None
+
+
+# Try yaml first, fall back to hardcoded
+_yaml_result = _load_from_yaml()
+
+if _yaml_result:
+    MONITOR_LIST, SECTORS, SYMBOL_EMOJI = _yaml_result
+    logging.info(f"market_intel: loaded {len(MONITOR_LIST)} symbols from symbols.yaml")
+else:
+    # ── Hardcoded fallback (used if symbols.yaml missing) ──
+    SECTORS = {
+        'AI/Semis':       ['NVDA', 'AMD', 'MU', 'SNDK', 'NBIS'],
+        'Crypto':         ['BTC-USD', 'ETH-USD', 'XRP-USD'],
+        'Crypto-Adj':     ['IREN', 'SOFI'],
+        'Quantum':        ['IONQ', 'RGTI', 'QBTS'],
+        'Nuclear/Energy': ['OKLO', 'UAMY'],
+        'Mega Tech':      ['GOOGL', 'MSFT', 'META', 'AMZN', 'AAPL'],
+        'EV/Auto':        ['TSLA'],
+        'Fintech':        ['SOFI'],
+        'Biotech':        ['NVO', 'WGRX'],
+        'Streaming':      ['NFLX'],
+        'Safe Haven':     ['GC=F'],
+    }
+
+    MONITOR_LIST = [
+        'BTC-USD', 'ETH-USD', 'XRP-USD', 'GC=F',
+        'NVDA', 'TSLA', 'AMD', 'MSFT', 'META', 'AMZN', 'GOOGL', 'NFLX', 'AAPL',
+        'MU', 'SNDK', 'NBIS', 'IONQ', 'RGTI', 'QBTS',
+        'OKLO', 'IREN', 'UAMY', 'WGRX', 'SOFI', 'NVO',
+    ]
+
+    SYMBOL_EMOJI = {
+        'BTC-USD': '₿', 'ETH-USD': 'Ξ', 'XRP-USD': '◇', 'GC=F': '🥇',
+        'NVDA': '💎', 'TSLA': '🚘', 'META': '👓', 'AMZN': '📦',
+        'GOOGL': '🔍', 'MSFT': '🪟', 'NFLX': '🎬', 'AMD': '⚡', 'AAPL': '🍎',
+        'MU': '💾', 'SNDK': '💽', 'NBIS': '🌐',
+        'IONQ': '⚛️', 'RGTI': '🧪', 'QBTS': '🔬',
+        'OKLO': '☢️', 'IREN': '🪙', 'UAMY': '⚒️', 'WGRX': '💊',
+        'SOFI': '🏦', 'NVO': '💉',
+    }
+    logging.info("market_intel: symbols.yaml not found — using hardcoded fallback")
 
 # Build reverse lookup (symbol → sector)
 SYMBOL_TO_SECTOR = {}
 for _sector, _syms in SECTORS.items():
     for _sym in _syms:
         SYMBOL_TO_SECTOR[_sym] = _sector
+
 
 # ═══════════════════════════════════════════════
 # HELPERS
@@ -129,7 +172,7 @@ def load_json(path, default):
     try:
         with open(path, 'r') as f:
             return json.load(f)
-    except:
+    except Exception:
         return default
 
 def save_json(path, data):
@@ -155,16 +198,15 @@ def pine_rsi(src, length=14):
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return (100 - 100 / (1 + rs)).fillna(50)
 
+
 # ═══════════════════════════════════════════════
 # EARNINGS CALENDAR
 # ═══════════════════════════════════════════════
 
 def get_earnings_date(symbol):
     """Returns (date, days_until) or (None, None)."""
-    # Crypto / commodities never have earnings
     if symbol.endswith('-USD') or symbol == 'GC=F':
         return None, None
-
     try:
         ticker = yf.Ticker(symbol)
         cal = ticker.calendar
@@ -175,15 +217,12 @@ def get_earnings_date(symbol):
         if isinstance(cal, dict):
             ed = cal.get('Earnings Date')
             if ed:
-                if isinstance(ed, list) and len(ed) > 0:
-                    earnings_date = ed[0]
-                else:
-                    earnings_date = ed
+                earnings_date = ed[0] if isinstance(ed, list) and len(ed) > 0 else ed
         elif hasattr(cal, 'loc'):
             try:
                 if 'Earnings Date' in cal.index:
                     earnings_date = cal.loc['Earnings Date'].iloc[0]
-            except:
+            except Exception:
                 pass
 
         if earnings_date is None:
@@ -193,16 +232,13 @@ def get_earnings_date(symbol):
             earnings_date = datetime.fromisoformat(earnings_date.split('T')[0])
         elif hasattr(earnings_date, 'to_pydatetime'):
             earnings_date = earnings_date.to_pydatetime()
-
         if hasattr(earnings_date, 'date'):
             earnings_date = earnings_date.date()
 
         today = now_est().date()
         days_until = (earnings_date - today).days
-
         if days_until < 0 or days_until > 60:
             return None, None
-
         return earnings_date, days_until
     except Exception as e:
         logging.debug(f"Earnings {symbol}: {e}")
@@ -220,6 +256,7 @@ def format_earnings_warning(symbol, earnings_date, days_until):
     if days_until <= 7:
         return f"📅 Earnings in {days_until} days ({earnings_date})"
     return None
+
 
 # ═══════════════════════════════════════════════
 # MARKET CONTEXT (SPY/QQQ/VIX)
@@ -242,6 +279,7 @@ def get_market_ctx():
         logging.error(f"Market ctx: {e}")
         return None
 
+
 # ═══════════════════════════════════════════════
 # RELATIVE STRENGTH
 # ═══════════════════════════════════════════════
@@ -258,31 +296,24 @@ def calc_relative_strength(ctx, benchmark='SPY', lookback_days=5):
         df_sym = _clean_df(df_sym)
         df_bench = _clean_df(df_bench)
 
-        # Need lookback_days+1 rows (today + N back)
         if len(df_sym) < lookback_days + 1 or len(df_bench) < lookback_days + 1:
             return None, None
 
-        # FIX: use -(lookback_days+1) to get N trading days back
         sym_perf = (df_sym['Close'].iloc[-1] / df_sym['Close'].iloc[-(lookback_days + 1)] - 1) * 100
         bench_perf = (df_bench['Close'].iloc[-1] / df_bench['Close'].iloc[-(lookback_days + 1)] - 1) * 100
-
         diff = float(sym_perf - bench_perf)
 
-        if diff > 5:
-            label = "🟢🟢 Strong Leader"
-        elif diff > 2:
-            label = "🟢 Outperforming"
-        elif diff > -2:
-            label = "⚖️ In-line"
-        elif diff > -5:
-            label = "🔴 Underperforming"
-        else:
-            label = "🔴🔴 Weak / Laggard"
+        if diff > 5:       label = "🟢🟢 Strong Leader"
+        elif diff > 2:     label = "🟢 Outperforming"
+        elif diff > -2:    label = "⚖️ In-line"
+        elif diff > -5:    label = "🔴 Underperforming"
+        else:              label = "🔴🔴 Weak / Laggard"
 
         return round(diff, 2), label
     except Exception as e:
         logging.debug(f"RS {ctx['symbol']}: {e}")
         return None, None
+
 
 # ═══════════════════════════════════════════════
 # FULL CONTEXT (daily + intraday)
@@ -306,7 +337,6 @@ def get_full_context(symbol):
         current = float(intraday['Close'].iloc[-1])
         prev_close = float(daily['Close'].iloc[-2])
 
-        # Filter intraday to TODAY only (by EST date)
         today_date = now_est().date()
         try:
             if intraday.index.tz is None:
@@ -315,8 +345,8 @@ def get_full_context(symbol):
                 intraday_tz = intraday.tz_convert(EST)
             today_bars = intraday_tz[intraday_tz.index.date == today_date]
             if today_bars.empty:
-                today_bars = intraday.iloc[-78:]  # fallback: ~6.5h of 5m bars
-        except:
+                today_bars = intraday.iloc[-78:]
+        except Exception:
             today_bars = intraday.iloc[-78:]
 
         today_open = float(today_bars['Open'].iloc[0])
@@ -327,7 +357,6 @@ def get_full_context(symbol):
         day_change_pct = (current - prev_close) / prev_close * 100
         intraday_pct = (current - today_open) / today_open * 100
 
-        # ATH + 52W
         ath = float(daily['High'].max())
         ath_date = daily['High'].idxmax()
         low_52w = float(daily['Low'].iloc[-252:].min()) if len(daily) >= 252 else float(daily['Low'].min())
@@ -338,22 +367,16 @@ def get_full_context(symbol):
         pct_from_52w_high = (current - high_52w) / high_52w * 100 if high_52w > 0 else 0
         range_pos = ((current - low_52w) / (high_52w - low_52w) * 100) if high_52w > low_52w else 50
 
-        # Daily EMAs
         ema20 = float(daily['Close'].ewm(span=20, adjust=False).mean().iloc[-1])
         ema50 = float(daily['Close'].ewm(span=50, adjust=False).mean().iloc[-1])
-        if len(daily) >= 200:
-            ema200 = float(daily['Close'].ewm(span=200, adjust=False).mean().iloc[-1])
-        else:
-            ema200 = ema50
+        ema200 = float(daily['Close'].ewm(span=200, adjust=False).mean().iloc[-1]) if len(daily) >= 200 else ema50
 
-        # Wilder's RSI (consistent with scanner.py)
         rsi_series = pine_rsi(daily['Close'], 14)
         rsi = float(rsi_series.iloc[-1])
 
         vol_avg_20d = float(daily['Volume'].iloc[-20:].mean())
         vol_ratio = vol_today / vol_avg_20d if vol_avg_20d > 0 else 1.0
 
-        # ═══ FIXED: trend classification (strongest conditions first) ═══
         if current > ema20 > ema50 > ema200:
             trend = "🚀 STRONG UPTREND"
         elif current < ema20 < ema50 < ema200:
@@ -397,6 +420,7 @@ def get_full_context(symbol):
         logging.error(f"Context {symbol}: {e}")
         return None
 
+
 # ═══════════════════════════════════════════════
 # VERDICT ENGINE
 # ═══════════════════════════════════════════════
@@ -414,7 +438,6 @@ def get_verdict(ctx, market_ctx=None):
     verdict = None
     zone = None
 
-    # Strongest signal first — pullback in confirmed uptrend, RSI oversold
     if "UPTREND" in trend and rsi < 40 and drop < 0:
         verdict = "🟢 BUY ZONE"
         zone = "Accumulation"
@@ -470,7 +493,6 @@ def get_verdict(ctx, market_ctx=None):
             zone = "No clear setup"
             reasons.append("Wait for better entry")
 
-    # Market context override
     if market_ctx:
         vix = market_ctx.get('^VIX', {}).get('price', 15)
         spy_pct = market_ctx.get('SPY', {}).get('pct', 0)
@@ -478,7 +500,6 @@ def get_verdict(ctx, market_ctx=None):
             verdict = "⚠️ WAIT"
             reasons.insert(0, f"Market bleeding — VIX {vix:.0f}, SPY {spy_pct:.1f}%")
 
-    # Earnings override
     if "BUY" in verdict:
         _, days_until = get_earnings_date(c['symbol'])
         if days_until is not None and days_until <= EARNINGS_WARNING_DAYS:
@@ -487,6 +508,7 @@ def get_verdict(ctx, market_ctx=None):
             reasons.insert(0, f"Earnings in {days_until} days — avoid new entries")
 
     return verdict, zone, reasons
+
 
 # ═══════════════════════════════════════════════
 # AI DROP ANALYSIS
@@ -527,7 +549,7 @@ Do NOT add bullet points or extra headers. 4 lines only."""
         }, timeout=20)
         if r.status_code == 200:
             data = r.json()
-            if 'candidates' in data and len(data['candidates']) > 0:
+            if data.get('candidates'):
                 return data['candidates'][0]['content']['parts'][0]['text'].strip()
         elif r.status_code == 429:
             logging.warning(f"Gemini rate-limited for {c['symbol']}")
@@ -537,26 +559,22 @@ Do NOT add bullet points or extra headers. 4 lines only."""
         logging.error(f"AI drop analysis {c['symbol']}: {e}")
     return None
 
+
 # ═══════════════════════════════════════════════
 # ALERT FORMATTERS
 # ═══════════════════════════════════════════════
 
 def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
-    """Main alert when a stock drops/pops significantly."""
     c = ctx
     em = SYMBOL_EMOJI.get(c['symbol'], '📊')
     drop = c['day_change_pct']
 
-    # Severity
     if drop <= BIG_DROP_CRITICAL:
-        header_emoji = "🚨🩸"
-        severity = "CRITICAL DROP"
+        header_emoji, severity = "🚨🩸", "CRITICAL DROP"
     elif drop <= BIG_DROP_WARN:
-        header_emoji = "⚠️📉"
-        severity = "BIG DROP"
+        header_emoji, severity = "⚠️📉", "BIG DROP"
     elif drop >= BIG_GAIN_ALERT:
-        header_emoji = "🚀📈"
-        severity = "BIG GAIN"
+        header_emoji, severity = "🚀📈", "BIG GAIN"
     else:
         return None
 
@@ -568,34 +586,25 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
     msg += f"🕒 {ts}\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
 
-    # Price + move
     sign = "+" if drop >= 0 else ""
     drop_em = "🔴" if drop < 0 else "🟢"
     msg += f"💵 *Price:* `${c['current']:.2f}` ({drop_em} {sign}{drop:.2f}% today)\n"
     msg += f"📊 *Range:* L `${c['today_low']:.2f}` → H `${c['today_high']:.2f}`\n"
     msg += f"📈 *Volume:* {c['vol_ratio']:.1f}× average\n"
 
-    # ═══ VERDICT ═══
     msg += f"\n*🎯 VERDICT: {verdict}*\n"
     msg += f"_Zone: {zone}_\n"
     for r in reasons[:3]:
         msg += f"  • {r}\n"
 
-    # ═══ POSITIONAL CONTEXT ═══
-    msg += f"\n*📏 POSITIONAL CONTEXT*\n"
-    msg += f"`─────────────────`\n"
+    msg += f"\n*📏 POSITIONAL CONTEXT*\n`─────────────────`\n"
 
     ath_pct = c['ath_pct']
-    if ath_pct > -5:
-        ath_tag = "🏔️ AT/NEAR ATH"
-    elif ath_pct > -15:
-        ath_tag = "📍 Near ATH"
-    elif ath_pct > -30:
-        ath_tag = "📉 Pullback from ATH"
-    elif ath_pct > -50:
-        ath_tag = "💀 Deep drawdown"
-    else:
-        ath_tag = "⚰️ Far from ATH"
+    if ath_pct > -5:        ath_tag = "🏔️ AT/NEAR ATH"
+    elif ath_pct > -15:     ath_tag = "📍 Near ATH"
+    elif ath_pct > -30:     ath_tag = "📉 Pullback from ATH"
+    elif ath_pct > -50:     ath_tag = "💀 Deep drawdown"
+    else:                   ath_tag = "⚰️ Far from ATH"
 
     msg += f"🏔️ *ATH:* `${c['ath']:.2f}` ({c['ath_pct']:+.1f}%) {ath_tag}\n"
     msg += f"   _Set on {c['ath_date']}_\n"
@@ -606,15 +615,12 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
     msg += f"   `{bar}` {c['range_pos']:.0f}% of range\n"
     msg += f"   From low: {c['pct_from_52w_low']:+.1f}% • From high: {c['pct_from_52w_high']:+.1f}%\n"
 
-    # ═══ TREND & TECHNICALS ═══
-    msg += f"\n*📈 TREND & TECHNICALS*\n"
-    msg += f"`─────────────────`\n"
+    msg += f"\n*📈 TREND & TECHNICALS*\n`─────────────────`\n"
     msg += f"Trend: {c['trend']}\n"
 
-    rsi_tag = ""
-    if c['rsi'] < 30: rsi_tag = " _(oversold)_"
-    elif c['rsi'] > 70: rsi_tag = " _(overbought)_"
-    else: rsi_tag = " _(neutral)_"
+    if c['rsi'] < 30:       rsi_tag = " _(oversold)_"
+    elif c['rsi'] > 70:     rsi_tag = " _(overbought)_"
+    else:                   rsi_tag = " _(neutral)_"
     msg += f"RSI (Daily): `{c['rsi']:.0f}`{rsi_tag}\n"
     msg += f"EMA50: `${c['ema50']:.2f}` • EMA200: `${c['ema200']:.2f}`\n"
 
@@ -630,28 +636,21 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
         ma_status = "🔴 Below EMA50 & EMA200 (bearish)"
     msg += f"{ma_status}\n"
 
-    # ═══ EARNINGS ═══
     earnings_date, days_until = get_earnings_date(c['symbol'])
     earn_warning = format_earnings_warning(c['symbol'], earnings_date, days_until)
     if earn_warning:
-        msg += f"\n*📅 EARNINGS*\n"
-        msg += f"`─────────────────`\n"
-        msg += f"{earn_warning}\n"
+        msg += f"\n*📅 EARNINGS*\n`─────────────────`\n{earn_warning}\n"
 
-    # ═══ RELATIVE STRENGTH ═══
     rs_score, rs_label = calc_relative_strength(c)
     if rs_score is not None:
-        msg += f"\n*💪 RELATIVE STRENGTH (5d vs SPY)*\n"
-        msg += f"`─────────────────`\n"
         sign_rs = "+" if rs_score >= 0 else ""
+        msg += f"\n*💪 RELATIVE STRENGTH (5d vs SPY)*\n`─────────────────`\n"
         msg += f"{rs_label}: `{sign_rs}{rs_score}%` vs SPY\n"
 
-    # ═══ MARKET CONTEXT ═══
     if market_ctx:
         spy = market_ctx.get('SPY', {}).get('pct', 0)
         vix = market_ctx.get('^VIX', {}).get('price', 15)
-        msg += f"\n*🌍 MARKET*\n"
-        msg += f"`─────────────────`\n"
+        msg += f"\n*🌍 MARKET*\n`─────────────────`\n"
         spy_em = "🔴" if spy < 0 else "🟢"
         msg += f"SPY: {spy_em} `{spy:+.2f}%` • VIX: `{vix:.1f}`\n"
         if vix > 22:
@@ -661,15 +660,10 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
         elif spy > 0 and drop < -5:
             msg += f"🚨 _Stock-specific weakness — market is UP_\n"
 
-    # ═══ AI ANALYSIS ═══
     if ai_text:
-        msg += f"\n*🤖 AI ANALYSIS*\n"
-        msg += f"`─────────────────`\n"
-        msg += f"{ai_text}\n"
+        msg += f"\n*🤖 AI ANALYSIS*\n`─────────────────`\n{ai_text}\n"
 
-    # ═══ ENTRY GUIDANCE ═══
-    msg += f"\n*💡 ENTRY GUIDANCE*\n"
-    msg += f"`─────────────────`\n"
+    msg += f"\n*💡 ENTRY GUIDANCE*\n`─────────────────`\n"
     if "BUY" in verdict:
         support1 = min(c['ema50'], c['low_52w'] * 1.03)
         msg += f"🟢 *Buy Zone:* `${support1:.2f}` – `${c['current']:.2f}`\n"
@@ -687,27 +681,21 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
 
     return msg
 
+
 # ═══════════════════════════════════════════════
 # SECTOR BLEED DETECTOR
 # ═══════════════════════════════════════════════
 
 def check_sector_bleeds(all_contexts):
-    """Detects when an entire sector is bleeding together."""
     sector_moves = {}
     for sector, symbols in SECTORS.items():
-        moves = []
-        for sym in symbols:
-            if sym in all_contexts and all_contexts[sym]:
-                moves.append((sym, all_contexts[sym]['day_change_pct']))
+        moves = [(s, all_contexts[s]['day_change_pct'])
+                 for s in symbols if s in all_contexts and all_contexts[s]]
         if len(moves) >= 2:
             avg = sum(m[1] for m in moves) / len(moves)
             bleeding = [m for m in moves if m[1] < -2]
             if avg < -2 and len(bleeding) >= max(2, len(moves) // 2):
-                sector_moves[sector] = {
-                    'avg': avg,
-                    'bleeding': bleeding,
-                    'all': moves,
-                }
+                sector_moves[sector] = {'avg': avg, 'bleeding': bleeding, 'all': moves}
     return sector_moves
 
 def format_sector_bleed_alert(sector_moves):
@@ -718,57 +706,47 @@ def format_sector_bleed_alert(sector_moves):
     tz = now.tzname() or "EDT"
     ts = now.strftime(f'%I:%M %p {tz}')
 
-    msg = f"🩸 *SECTOR BLEED DETECTED*\n"
-    msg += f"🕒 {ts}\n"
-    msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
-
+    msg = f"🩸 *SECTOR BLEED DETECTED*\n🕒 {ts}\n`━━━━━━━━━━━━━━━━━━━━━`\n"
     for sector, data in sorted(sector_moves.items(), key=lambda x: x[1]['avg']):
         msg += f"\n🔻 *{sector}* (avg {data['avg']:+.2f}%)\n"
         for sym, pct in sorted(data['all'], key=lambda x: x[1]):
             em = SYMBOL_EMOJI.get(sym, '📊')
-            if pct < -5: pct_em = "🔴"
-            elif pct < -2: pct_em = "🟠"
-            elif pct < 0: pct_em = "🟡"
-            else: pct_em = "🟢"
+            if pct < -5:    pct_em = "🔴"
+            elif pct < -2:  pct_em = "🟠"
+            elif pct < 0:   pct_em = "🟡"
+            else:           pct_em = "🟢"
             msg += f"  {em} {sym}: {pct_em} `{pct:+.2f}%`\n"
-
     msg += f"\n💡 _Avoid longs in bleeding sectors. Wait for stabilization._"
     return msg
+
 
 # ═══════════════════════════════════════════════
 # LEADERSHIP / LAGGARD DETECTOR
 # ═══════════════════════════════════════════════
 
 def check_leadership(all_contexts, sector_full):
-    """Identifies leaders (holding while sector bleeds)
-    and laggards (dropping while sector rips)."""
     leaders = []
     laggards = []
 
     for sector, data in sector_full.items():
         sector_avg = data['avg']
         if abs(sector_avg) < 1.5:
-            continue  # only flag if sector is making a real move
+            continue
 
         for sym, pct in data['all']:
-            # O(1) sector lookup via reverse map
             if SYMBOL_TO_SECTOR.get(sym) != sector:
                 continue
             ctx = all_contexts.get(sym)
             if not ctx:
                 continue
-
             divergence = pct - sector_avg
 
-            # Leader: sector bleeding, but this stock holding up
             if sector_avg < -2 and divergence > 2:
                 leaders.append({
                     'symbol': sym, 'ctx': ctx,
                     'sector': sector, 'sector_avg': sector_avg,
                     'divergence': divergence
                 })
-
-            # Laggard: sector ripping, this stock dropping
             elif sector_avg > 2 and divergence < -2:
                 laggards.append({
                     'symbol': sym, 'ctx': ctx,
@@ -786,13 +764,10 @@ def format_leadership_alert(leaders, laggards):
     tz = now.tzname() or "EDT"
     ts = now.strftime(f'%I:%M %p {tz}')
 
-    msg = f"💪 *RELATIVE STRENGTH SIGNALS*\n"
-    msg += f"🕒 {ts}\n"
-    msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
+    msg = f"💪 *RELATIVE STRENGTH SIGNALS*\n🕒 {ts}\n`━━━━━━━━━━━━━━━━━━━━━`\n"
 
     if leaders:
-        msg += f"\n🏆 *LEADERS* — holding up while sector bleeds\n"
-        msg += f"`─────────────────`\n"
+        msg += f"\n🏆 *LEADERS* — holding up while sector bleeds\n`─────────────────`\n"
         for l in sorted(leaders, key=lambda x: -x['divergence']):
             em = SYMBOL_EMOJI.get(l['symbol'], '📊')
             msg += f"  {em} *{l['symbol']}* ({l['sector']})\n"
@@ -801,8 +776,7 @@ def format_leadership_alert(leaders, laggards):
         msg += f"\n💡 _Leaders during weakness = future winners. Watch for entry._\n"
 
     if laggards:
-        msg += f"\n🔻 *LAGGARDS* — weak vs strong sector\n"
-        msg += f"`─────────────────`\n"
+        msg += f"\n🔻 *LAGGARDS* — weak vs strong sector\n`─────────────────`\n"
         for l in sorted(laggards, key=lambda x: x['divergence']):
             em = SYMBOL_EMOJI.get(l['symbol'], '📊')
             msg += f"  {em} *{l['symbol']}* ({l['sector']})\n"
@@ -812,12 +786,12 @@ def format_leadership_alert(leaders, laggards):
 
     return msg
 
+
 # ═══════════════════════════════════════════════
 # COOLDOWN MANAGER
 # ═══════════════════════════════════════════════
 
 def can_alert(key, hours=COOLDOWN_HOURS):
-    """Generic cooldown check + set. Returns True if allowed."""
     state = load_json(STATE_FILE, {})
     last = state.get(key)
     if last:
@@ -827,11 +801,12 @@ def can_alert(key, hours=COOLDOWN_HOURS):
                 dt = dt.replace(tzinfo=EST)
             if now_est() - dt < timedelta(hours=hours):
                 return False
-        except:
+        except Exception:
             pass
     state[key] = now_est().isoformat()
     save_json(STATE_FILE, state)
     return True
+
 
 # ═══════════════════════════════════════════════
 # TELEGRAM (with auto-split)
@@ -842,7 +817,6 @@ def send_telegram(message, silent=False):
         logging.warning("Telegram credentials missing")
         return False
 
-    # Auto-split if over Telegram's 4096 limit
     if len(message) > 4000:
         parts = []
         current = ""
@@ -873,10 +847,19 @@ def _send_single(message, silent=False):
         }, timeout=10)
         if r.status_code != 200:
             logging.error(f"Telegram {r.status_code}: {r.text[:200]}")
+            # Retry without Markdown if parse error
+            if "can't parse" in r.text.lower() or 'parse' in r.text.lower():
+                logging.warning("Retrying without parse_mode")
+                r = requests.post(url, json={
+                    'chat_id': CHAT_ID, 'text': message,
+                    'disable_notification': silent,
+                }, timeout=10)
+                return r.status_code == 200
         return r.status_code == 200
     except Exception as e:
         logging.error(f"Telegram send: {e}")
         return False
+
 
 # ═══════════════════════════════════════════════
 # MAIN ORCHESTRATION
@@ -890,7 +873,7 @@ def run_intel_scan():
     all_contexts = {}
     alerts_fired = 0
 
-    # ═══ STEP 1: Fetch all contexts + fire big-move alerts ═══
+    # ─── STEP 1: Fetch all contexts + fire big-move alerts ───
     for symbol in MONITOR_LIST:
         try:
             print(f"  → {symbol:10s}...", end=" ", flush=True)
@@ -932,7 +915,7 @@ def run_intel_scan():
         logging.warning("No contexts — skipping aggregate detectors")
         return
 
-    # ═══ STEP 2: Sector bleed ═══
+    # ─── STEP 2: Sector bleed ───
     sector_moves = check_sector_bleeds(all_contexts)
     if sector_moves:
         if can_alert('last_sector_bleed', SECTOR_BLEED_COOLDOWN):
@@ -940,11 +923,11 @@ def run_intel_scan():
             if sector_msg:
                 send_telegram(sector_msg, silent=False)
                 alerts_fired += 1
-                print(f"🩸 Sector bleed alert sent")
+                print("🩸 Sector bleed alert sent")
         else:
             print("🩸 Sector bleed — 🔕 cooldown")
 
-    # ═══ STEP 3: Leadership / laggard detection ═══
+    # ─── STEP 3: Leadership / laggard ───
     sector_full = {}
     for sector, symbols in SECTORS.items():
         moves = [(s, all_contexts[s]['day_change_pct'])
@@ -960,7 +943,7 @@ def run_intel_scan():
             if rs_msg:
                 send_telegram(rs_msg, silent=True)
                 alerts_fired += 1
-                print(f"💪 Leadership alert sent")
+                print("💪 Leadership alert sent")
         else:
             print("💪 Leadership — 🔕 cooldown")
 
