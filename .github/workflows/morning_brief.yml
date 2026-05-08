@@ -1,16 +1,22 @@
-name: AlphaEdge Morning Brief
-
+name: AlphaEdge Morning & Evening Brief
 on:
   schedule:
-    # 9:00 AM ET (covers both EDT=13:00 UTC and EST=14:00 UTC)
-    # should_send_brief() guards against double-send within same day
-    - cron: '0 13 * * 1-5'    # 9 AM EDT
-    - cron: '0 14 * * 1-5'    # 9 AM EST
-
+    # ─── MORNING BRIEF — 9:00 AM ET ───
+    # should_send_morning() guards against double-send within same day
+    - cron: '0 13 * * 1-5'    # 9 AM EDT (UTC-4)
+    - cron: '0 14 * * 1-5'    # 9 AM EST (UTC-5)
+    # ─── EVENING BRIEF — 4:30 PM ET ───
+    # should_send_evening() guards against double-send within same day
+    - cron: '30 20 * * 1-5'   # 4:30 PM EDT (UTC-4)
+    - cron: '30 21 * * 1-5'   # 4:30 PM EST (UTC-5)
   workflow_dispatch:
     inputs:
-      force:
-        description: 'Force send even if already sent today'
+      force_morning:
+        description: 'Force morning brief even if already sent today'
+        required: false
+        default: 'false'
+      force_evening:
+        description: 'Force evening brief even if already sent today'
         required: false
         default: 'false'
 
@@ -25,7 +31,7 @@ permissions:
 jobs:
   brief:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15  # bumped — evening brief fetches AH prices on top of all symbols
     steps:
       - uses: actions/checkout@v4
 
@@ -37,25 +43,33 @@ jobs:
       - name: Restore state
         uses: actions/cache/restore@v4
         with:
-          path: scanner_state.json
-          key: scanner-state-v6-${{ github.run_id }}
-          restore-keys: scanner-state-v6-
+          path: |
+            scanner_state.json
+            active_trades.json
+            trade_history.json
+          key: scanner-state-v7-${{ github.run_id }}
+          restore-keys: |
+            scanner-state-v7-
 
       - run: pip install -r requirements.txt
 
-      - name: Run Morning Brief
+      - name: Run Brief
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TZ: America/New_York
           PYTHONUNBUFFERED: "1"
-          FORCE_BRIEF: ${{ inputs.force }}
+          FORCE_MORNING: ${{ inputs.force_morning }}
+          FORCE_EVENING: ${{ inputs.force_evening }}
         run: python morning_brief.py
 
       - name: Save state
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: scanner_state.json
-          key: scanner-state-v6-${{ github.run_id }}
+          path: |
+            scanner_state.json
+            active_trades.json
+            trade_history.json
+          key: scanner-state-v7-${{ github.run_id }}
