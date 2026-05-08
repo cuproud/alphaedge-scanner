@@ -1,0 +1,90 @@
+# AlphaEdge Universe Configuration
+# Edit this file to add/remove symbols across ALL scanners
+
+watchlists:
+  crypto:
+    - symbol: BTC-USD
+      emoji: ₿
+      sector: Crypto
+    - symbol: ETH-USD
+      emoji: Ξ
+      sector: Crypto
+    - symbol: XRP-USD
+      emoji: ◇
+      sector: Crypto
+    - symbol: GC=F
+      emoji: 🥇
+      sector: Commodities
+
+  extended_hours:
+    - symbol: NVDA
+      emoji: 💎
+      sector: AI/Semis
+    - symbol: TSLA
+      emoji: 🚘
+      sector: EV/Auto
+    - symbol: AMD
+      emoji: ⚡
+      sector: AI/Semis
+    - symbol: MSFT
+      emoji: 🪟
+      sector: Mega Tech
+    - symbol: META
+      emoji: 👓
+      sector: Mega Tech
+    - symbol: AMZN
+      emoji: 📦
+      sector: Mega Tech
+    - symbol: GOOGL
+      emoji: 🔍
+      sector: Mega Tech
+    - symbol: NFLX
+      emoji: 🎬
+      sector: Mega Tech
+
+  regular_hours:
+    - symbol: MU
+      emoji: 💾
+      sector: AI/Semis
+    - symbol: SNDK
+      emoji: 💽
+      sector: AI/Semis
+    - symbol: NBIS
+      emoji: 🌐
+      sector: AI/Semis
+    - symbol: IONQ
+      emoji: ⚛️
+      sector: Quantum
+    - symbol: RGTI
+      emoji: 🧪
+      sector: Quantum
+    - symbol: QBTS
+      emoji: 🔬
+      sector: Quantum
+    - symbol: OKLO
+      emoji: ☢️
+      sector: Nuclear/Energy
+    - symbol: IREN
+      emoji: 🪙
+      sector: Crypto Mining
+    - symbol: UAMY
+      emoji: ⚒️
+      sector: Materials
+    - symbol: WGRX
+      emoji: 💊
+      sector: Biotech
+    - symbol: SOFI
+      emoji: 🏦
+      sector: Fintech
+    - symbol: NVO
+      emoji: 💉
+      sector: Pharma
+
+# Optional: scanner-specific overrides
+dip_scanner_extras:
+  - symbol: AAPL
+    emoji: 🍎
+    sector: Mega Tech
+  - symbol: COIN
+    emoji: 🪙
+    sector: Crypto
