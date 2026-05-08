@@ -1413,7 +1413,8 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
         }
 
         # ─── v7.0 FEATURE: POC ───
-        poc_data = compute_poc(df, bins=30, lookback_bars=200)
+        lookback = 260 if tf == '30m' else 130
+        poc_data = compute_poc(df, bins=30, lookback_bars=lookback)
 
         # ─── Meta ───
         tf_minutes = 30 if tf == '30m' else 60
