@@ -2123,7 +2123,7 @@ def _tg_send(message, silent=False):
         if r.status_code != 200:
             logging.error(f"Telegram {r.status_code}: {r.text[:200]}")
             # Retry without Markdown if parse error
-            if 'can't parse' in r.text.lower() or 'parse' in r.text.lower():
+            if "can't parse" in r.text.lower() or 'parse' in r.text.lower():
                 logging.warning("Retrying without parse_mode")
                 r = requests.post(url, json={
                     'chat_id': CHAT_ID, 'text': message,
