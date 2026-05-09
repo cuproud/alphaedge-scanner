@@ -2081,6 +2081,43 @@ def format_weekly_summary():
     return msg
 
 
+def analyze_single_symbol(symbol: str):
+    symbol = symbol.upper().strip()
+
+    # basic validation (IMPORTANT)
+    if not symbol or len(symbol) > 10:
+        return "❌ Invalid symbol format"
+
+    try:
+        tf_cfg = TIMEFRAMES[0]  # use 30m or your default TF
+
+        ctx = {
+            'htf_bull': get_htf_bias(symbol),
+            'mtf_sum': get_mtf_sum(symbol)
+        }
+
+        result, reason = analyze_symbol(
+            symbol,
+            tf_cfg,
+            ctx['htf_bull'],
+            ctx['mtf_sum'],
+            None
+        )
+
+        if not result:
+            return f"⚠️ No valid setup found for {symbol}"
+
+        ai_text = None
+        if result['sqs'] >= AI_TIER_THRESHOLD and GEMINI_API_KEY:
+            ai_text = get_ai_analysis(result)
+
+        result['ai_text'] = ai_text
+
+        return format_new_signal(result, ai_text)
+
+    except Exception as e:
+        return f"❌ Error analyzing {symbol}: {str(e)[:50]}"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # §18  TELEGRAM TRANSPORT
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2110,7 +2147,9 @@ def send_telegram(message, silent=False):
             time.sleep(0.3)
         return success
     return _tg_send(message, silent)
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# New addition > telegram analysis >  CORRELATION DETECTOR
+# ═══════════════════════════════════════════════════════════════════════════════
 def _tg_send(message, silent=False):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
