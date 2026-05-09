@@ -1,12 +1,29 @@
 import sys
+import requests
+import os
 
-def run(symbol):
-    print(f"Analyzing: {symbol}")
+symbol = sys.argv[1]
 
-    # TODO: call your real scanner logic here
-    # from scanner import scan
-    # scan(symbol)
+print(f"Analyzing: {symbol}")
 
-if __name__ == "__main__":
-    symbol = sys.argv[1]
-    run(symbol)
+# ---- SAMPLE RESULT (replace later with real scanner output)
+signal = f"📊 AlphaEdge Alert\nSymbol: {symbol}\nStatus: SCANNED"
+
+# ---- TELEGRAM SEND ----
+telegram_token = os.environ.get("TELEGRAM_TOKEN")
+chat_id = os.environ.get("CHAT_ID")
+
+if telegram_token and chat_id:
+
+    url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+
+    payload = {
+        "chat_id": chat_id,
+        "text": signal
+    }
+
+    response = requests.post(url, json=payload)
+
+    print("Telegram status:", response.status_code)
+else:
+    print("Missing Telegram credentials")
