@@ -283,6 +283,7 @@ def main():
 
     print(f"  → AI analysis...")
     ai_text = ai_analyze_drop(ctx, market_ctx)
+    print(f"  → AI result: {ai_text[:80] if ai_text else 'None — skipped'}")
 
     print(f"  → Building message...")
     msg = format_analysis(
