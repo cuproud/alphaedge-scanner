@@ -285,7 +285,7 @@ def main():
     ai_text = ai_analyze_drop(ctx, market_ctx)
     print(f"  → AI result: {'GOT RESPONSE' if ai_text else 'NO RESPONSE'}")
     if ai_text:
-    print(f"     First 100 chars: {ai_text[:100]}")
+        print(f"     First 100 chars: {ai_text[:100]}")
 
     print(f"  → Building message...")
     msg = format_analysis(
