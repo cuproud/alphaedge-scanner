@@ -691,7 +691,12 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
         support1 = min(c['ema50'], c['low_52w'] * 1.03)
         msg += f"🟢 *Buy Zone:* `${support1:.2f}` – `${c['current']:.2f}`\n"
         msg += f"🛡️ *Support:* `${c['ema200']:.2f}` (EMA200)\n"
-        msg += f"🚪 *Invalidation:* Below `${c['low_52w']:.2f}` (52W low)\n"
+        msg += f"🚪 *Invalidation:* Below `${c['ema200']:.2f}`\n"
+    elif "TAKE PROFITS" in verdict or "EXTENDED" in verdict:
+        msg += f"🟠 *If holding:* Consider trimming 25-33% here\n"
+        msg += f"🔄 *Re-entry zone:* Pullback to EMA50 `${c['ema50']:.2f}`\n"
+        msg += f"🛡️ *Trail stop:* `${c['ema50'] * 0.97:.2f}` (3% below EMA50)\n"
+        msg += f"🚫 *Don't add* to position at these levels\n"
     elif "AVOID" in verdict or "WAIT" in verdict:
         msg += f"🚫 *Don't enter now*\n"
         msg += f"⏳ *Wait for:* Base above `${c['ema200']:.2f}`\n"
@@ -699,8 +704,13 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
     elif "CAUTION" in verdict or "WATCH" in verdict:
         msg += f"👀 *Watch key level:* `${c['ema50']:.2f}` (EMA50)\n"
         msg += f"🟡 *Scale-in zone:* `${c['ema200']:.2f}` if holds\n"
+    elif "PARABOLIC" in verdict:
+        msg += f"🚫 *DO NOT chase* at current levels\n"
+        msg += f"⏳ *Wait for:* 3-5 day consolidation\n"
+        msg += f"🔄 *Re-entry:* First pullback to EMA50 `${c['ema50']:.2f}`\n"
     else:
-        msg += f"⏸️ *No edge — wait for cleaner setup*\n"
+        msg += f"⏸️ *No clear edge* — wait for directional setup\n"
+        msg += f"👀 *Watch:* EMA50 `${c['ema50']:.2f}` for direction\n"
 
     return msg
 
