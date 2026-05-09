@@ -549,11 +549,19 @@ Do NOT add bullet points or extra headers. 4 lines only."""
         }, timeout=20)
         if r.status_code == 200:
             data = r.json()
+            print(f"  → Gemini keys: {list(data.keys())}")
             if data.get('candidates'):
-                return data['candidates'][0]['content']['parts'][0]['text'].strip()
+                text = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                print(f"  → Gemini got {len(text)} chars")
+                return text
+            else:
+                print(f"  → Gemini no candidates: {data}")
+                return None
         elif r.status_code == 429:
+            print(f"  → Gemini RATE LIMITED")
             logging.warning(f"Gemini rate-limited for {c['symbol']}")
         else:
+            print(f"  → Gemini ERROR {r.status_code}: {r.text[:300]}")
             logging.error(f"Gemini {r.status_code}: {r.text[:200]}")
     except Exception as e:
         logging.error(f"AI drop analysis {c['symbol']}: {e}")
