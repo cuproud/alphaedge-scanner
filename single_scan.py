@@ -224,10 +224,10 @@ def format_analysis(symbol, ctx, verdict, zone, reasons, ai_text,
     # Entry guidance
     msg += f"\n*💡 ENTRY GUIDANCE*\n`─────────────────`\n"
     if "BUY" in verdict:
-        support = min(c['ema50'], c['low_52w'] * 1.03)
+        support = max(c['ema200'], c['current'] * 0.95)
         msg += f"🟢 *Buy Zone:* `${price_fmt.format(support)}` – `${price_fmt.format(c['current'])}`\n"
         msg += f"🛡️ *Support:* `${price_fmt.format(c['ema200'])}` (EMA200)\n"
-        msg += f"🚪 *Invalidation:* Below `${price_fmt.format(c['low_52w'])}`\n"
+        msg += f"🚪 *Invalidation:* Below `${price_fmt.format(c['ema200'] * 0.97)}`\n"
     elif "AVOID" in verdict or "WAIT" in verdict:
         msg += f"🚫 *Don't enter now*\n"
         msg += f"👀 *Watch:* Reclaim EMA50 `${price_fmt.format(c['ema50'])}`\n"
