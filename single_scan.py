@@ -1,53 +1,12 @@
-name: AlphaEdge Single Symbol Scan
-on:
-  repository_dispatch:
-    types: [analyze_symbol]
-  workflow_dispatch:
-    inputs:
-      symbol:
-        description: 'Symbol to analyze (e.g. TSLA, BTC-USD, NVDA)'
-        required: true
-        default: 'TSLA'
+import sys
 
-concurrency:
-  group: alphaedge-single-${{ github.event.client_payload.symbol || inputs.symbol }}
-  cancel-in-progress: true
+def run(symbol):
+    print(f"Analyzing: {symbol}")
 
-permissions:
-  contents: read
+    # TODO: call your real scanner logic here
+    # from scanner import scan
+    # scan(symbol)
 
-jobs:
-  analyze:
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Restore state
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            scanner_state.json
-            active_trades.json
-          key: scanner-state-v7-${{ github.run_id }}
-          restore-keys: |
-            scanner-state-v7-
-
-      - run: pip install -r requirements.txt
-
-      - name: Run single scan
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TZ: America/New_York
-          PYTHONUNBUFFERED: "1"
-        run: |
-          SYMBOL="${{ github.event.client_payload.symbol || inputs.symbol }}"
-          echo "Analyzing: $SYMBOL"
-          python single_scan.py "$SYMBOL"
+if __name__ == "__main__":
+    symbol = sys.argv[1]
+    run(symbol)
