@@ -558,8 +558,23 @@ Do NOT add bullet points or extra headers. 4 lines only."""
                 print(f"  → Gemini no candidates: {data}")
                 return None
         elif r.status_code == 429:
-            print(f"  → Gemini RATE LIMITED")
+            print(f"  → Gemini RATE LIMITED — retrying in 15s")
             logging.warning(f"Gemini rate-limited for {c['symbol']}")
+            time.sleep(15)
+            try:
+                r2 = requests.post(url, json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.5, "maxOutputTokens": 400}
+                }, timeout=20)
+                if r2.status_code == 200:
+                    data2 = r2.json()
+                    if data2.get('candidates'):
+                        text = data2['candidates'][0]['content']['parts'][0]['text'].strip()
+                        print(f"  → Gemini retry succeeded ({len(text)} chars)")
+                        return text
+                print(f"  → Gemini retry failed: {r2.status_code}")
+            except Exception as e2:
+                print(f"  → Gemini retry error: {e2}")
         else:
             print(f"  → Gemini ERROR {r.status_code}: {r.text[:300]}")
             logging.error(f"Gemini {r.status_code}: {r.text[:200]}")
