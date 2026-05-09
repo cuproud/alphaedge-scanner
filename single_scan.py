@@ -73,6 +73,34 @@ def get_verdict(ctx, market_ctx=None):
     verdict = None
     zone = None
 
+    # ── 0. PARABOLIC SPIKE — huge single-day move ──
+    if abs(drop) >= 15:
+        if drop > 0:
+            verdict = "⚠️ PARABOLIC"
+            zone = f"News/Catalyst Spike +{drop:.0f}%"
+            reasons.append(f"+{drop:.1f}% single-day move — likely news driven")
+            reasons.append("Parabolic moves mean-revert — high risk to chase")
+            reasons.append(f"Volume {c['vol_ratio']:.1f}× avg confirms institutional activity")
+            next_steps = [
+                f"DO NOT chase at current price",
+                f"Wait for 3-5 day consolidation",
+                f"Re-entry zone: first pullback to `${c['ema50']:.2f}` (EMA50)",
+                f"If already holding: consider taking partial profits",
+            ]
+        else:
+            verdict = "🚨 CRASH"
+            zone = f"Severe Drop {drop:.0f}%"
+            reasons.append(f"{drop:.1f}% single-day drop — likely news driven")
+            reasons.append("Wait for dust to settle before any entry")
+            reasons.append("Could bounce or continue — too early to know")
+            next_steps = [
+                f"Do NOT catch this falling knife today",
+                f"Wait minimum 3 days for stabilisation",
+                f"Watch: does it hold EMA200 `${c['ema200']:.2f}`?",
+                f"Re-evaluate after volume normalises",
+            ]
+        return verdict, zone, reasons, next_steps
+           
     # ── 1. MOMENTUM — AT/NEAR ATH in strong uptrend ──
     if ("UPTREND" in trend and from_ath > -5 and
             above_50 and above_200 and rsi < 80):
