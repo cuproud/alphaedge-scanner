@@ -1,17 +1,37 @@
 name: AlphaEdge Single Symbol Scan
 on:
   repository_dispatch:
-    types: [analyze_symbol]
+    types: [analyze_symbol, bot_command]
   workflow_dispatch:
     inputs:
       symbol:
         description: 'Symbol to analyze (e.g. TSLA, BTC-USD, NVDA)'
-        required: true
-        default: 'TSLA'
+        required: false
+        default: ''
+      command:
+        description: 'Command (scan, top, brief, help, alert, list_alerts)'
+        required: false
+        default: ''
+      mode:
+        description: 'Mode: full or short'
+        required: false
+        default: 'full'
+      timeframe:
+        description: 'Timeframe: 1d, 1wk, 1mo'
+        required: false
+        default: '1d'
+      price:
+        description: 'Price (for alert command)'
+        required: false
+        default: ''
+      direction:
+        description: 'Direction: above/below/auto'
+        required: false
+        default: 'auto'
 
 concurrency:
-  group: alphaedge-single-${{ github.event.client_payload.symbol || inputs.symbol }}
-  cancel-in-progress: true
+  group: alphaedge-${{ github.event.client_payload.symbol || github.event.client_payload.command || inputs.symbol || inputs.command }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -19,7 +39,7 @@ permissions:
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -34,13 +54,14 @@ jobs:
           path: |
             scanner_state.json
             active_trades.json
+            price_alerts.json
           key: scanner-state-v7-${{ github.run_id }}
           restore-keys: |
             scanner-state-v7-
 
       - run: pip install -r requirements.txt
 
-      - name: Run single scan
+      - name: Run scan
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
@@ -48,6 +69,25 @@ jobs:
           TZ: America/New_York
           PYTHONUNBUFFERED: "1"
         run: |
-          SYMBOL="${{ github.event.client_payload.symbol || inputs.symbol }}"
-          echo "Analyzing: $SYMBOL"
-          python single_scan.py "$SYMBOL"
+          python single_scan.py "$(python3 -c "
+          import json
+          print(json.dumps({
+              'event_type':  '${{ github.event.action || 'analyze_symbol' }}',
+              'command':     '${{ github.event.client_payload.command || inputs.command }}',
+              'symbol':      '${{ github.event.client_payload.symbol || inputs.symbol }}',
+              'mode':        '${{ github.event.client_payload.mode || inputs.mode || 'full' }}',
+              'timeframe':   '${{ github.event.client_payload.timeframe || inputs.timeframe || '1d' }}',
+              'price':       '${{ github.event.client_payload.price || inputs.price }}' or None,
+              'direction':   '${{ github.event.client_payload.direction || inputs.direction || 'auto' }}',
+          }))
+          ")"
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            scanner_state.json
+            active_trades.json
+            price_alerts.json
+          key: scanner-state-v7-${{ github.run_id }}
