@@ -1,24 +1,24 @@
 name: AlphaEdge Market Intel
-
 on:
   schedule:
     # Every 30 min during US market hours (13:30-21:00 UTC covers EDT/EST)
     - cron: '*/30 13-21 * * 1-5'
-
     # Every 2h for crypto overnight + weekends
     - cron: '0 */2 * * *'
-
   workflow_dispatch:
 
 concurrency:
   group: alphaedge-intel
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   intel:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - uses: actions/checkout@v4
 
@@ -32,9 +32,10 @@ jobs:
         with:
           path: |
             scanner_state.json
-          key: scanner-state-v6-${{ github.run_id }}
+            price_alerts.json
+          key: scanner-state-v7-${{ github.run_id }}
           restore-keys: |
-            scanner-state-v6-
+            scanner-state-v7-
 
       - run: pip install -r requirements.txt
 
@@ -53,4 +54,5 @@ jobs:
         with:
           path: |
             scanner_state.json
-          key: scanner-state-v6-${{ github.run_id }}
+            price_alerts.json
+          key: scanner-state-v7-${{ github.run_id }}
