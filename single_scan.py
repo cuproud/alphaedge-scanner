@@ -417,7 +417,7 @@ def detect_rsi_divergence(df):
 
 def get_mtf_verdicts(symbol):
     """
-    Returns dict of {label: {trend, rsi, adx, sar_bull, adx_signal}}
+    Returns dict of {label: {trend, rsi, adx, sar_bull, adx_signal, rsi_tag}}
     for Daily / Weekly / Monthly.
     """
     results = {}
@@ -439,11 +439,23 @@ def get_mtf_verdicts(symbol):
             e200 = float(ema(df['Close'], min(200, len(df))).iloc[-1])
             rsi_val = float(pine_rsi(df['Close'], 14).iloc[-1])
 
+            # RSI extreme tag
+            if rsi_val >= 90:
+                rsi_tag = "🚨 EXTREME"
+            elif rsi_val >= 80:
+                rsi_tag = "⚠️ Overbought"
+            elif rsi_val <= 20:
+                rsi_tag = "🚨 EXTREME"
+            elif rsi_val <= 30:
+                rsi_tag = "⚠️ Oversold"
+            else:
+                rsi_tag = ""
+
             # ADX
             adx_series, plus_di, minus_di = calc_adx(df, 14)
-            adx_val  = float(adx_series.iloc[-1]) if adx_series is not None else 0
-            plus_val = float(plus_di.iloc[-1])    if plus_di   is not None else 0
-            minus_val= float(minus_di.iloc[-1])   if minus_di  is not None else 0
+            adx_val   = float(adx_series.iloc[-1]) if adx_series is not None else 0
+            plus_val  = float(plus_di.iloc[-1])    if plus_di   is not None else 0
+            minus_val = float(minus_di.iloc[-1])   if minus_di  is not None else 0
 
             # Parabolic SAR
             sar_bull_series, sar_series = calc_parabolic_sar(df)
@@ -460,18 +472,19 @@ def get_mtf_verdicts(symbol):
                 adx_sar = "➖ Mixed"
 
             # Trend label
-            if c > e50 > e200:      trend = "🚀 Strong Bull"
-            elif c > e200:          trend = "📈 Bull"
-            elif c < e50 < e200:    trend = "💀 Strong Bear"
-            elif c < e200:          trend = "📉 Bear"
-            else:                   trend = "⚖️ Mixed"
+            if c > e50 > e200:   trend = "🚀 Strong Bull"
+            elif c > e200:       trend = "📈 Bull"
+            elif c < e50 < e200: trend = "💀 Strong Bear"
+            elif c < e200:       trend = "📉 Bear"
+            else:                trend = "⚖️ Mixed"
 
             results[label] = {
-                'trend':   trend,
-                'rsi':     round(rsi_val, 1),
-                'adx':     round(adx_val, 1),
+                'trend':    trend,
+                'rsi':      round(rsi_val, 1),
+                'rsi_tag':  rsi_tag,
+                'adx':      round(adx_val, 1),
                 'sar_bull': sar_bull,
-                'adx_sar': adx_sar,
+                'adx_sar':  adx_sar,
             }
             time.sleep(0.2)
         except Exception as e:
@@ -516,14 +529,27 @@ def get_sector_context(symbol):
 
 def quick_poc(df_daily):
     try:
-        recent = df_daily.iloc[-60:]
-        low    = float(recent['Low'].min())
-        high   = float(recent['High'].max())
+        price_now = float(df_daily['Close'].iloc[-1])
+
+        # Only use bars where price overlaps with current trading range (±30%)
+        # This prevents old low-price history dominating the POC on parabolic movers
+        lo_bound = price_now * 0.70
+        hi_bound = price_now * 1.30
+        mask     = (df_daily['High'] >= lo_bound) & (df_daily['Low'] <= hi_bound)
+        recent   = df_daily[mask].iloc[-60:]  # max 60 qualifying bars
+
+        if len(recent) < 5:
+            return None  # not enough bars in range — skip POC rather than show garbage
+
+        low  = float(recent['Low'].min())
+        high = float(recent['High'].max())
         if high <= low:
             return None
-        bins          = 30
-        bin_edges     = np.linspace(low, high, bins + 1)
-        vol_at_price  = np.zeros(bins)
+
+        bins         = 30
+        bin_edges    = np.linspace(low, high, bins + 1)
+        vol_at_price = np.zeros(bins)
+
         for i in range(len(recent)):
             bar_low  = float(recent['Low'].iloc[i])
             bar_high = float(recent['High'].iloc[i])
@@ -532,23 +558,23 @@ def quick_poc(df_daily):
                 continue
             bar_range = max(bar_high - bar_low, 1e-9)
             for b in range(bins):
-                overlap = max(0, min(bar_high, bin_edges[b+1]) - max(bar_low, bin_edges[b]))
+                overlap = max(0, min(bar_high, bin_edges[b + 1]) - max(bar_low, bin_edges[b]))
                 if overlap > 0:
                     vol_at_price[b] += bar_vol * (overlap / bar_range)
+
         if vol_at_price.sum() == 0:
             return None
+
         poc_idx = int(np.argmax(vol_at_price))
-        return round((bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2, 4)
+        poc     = round((bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2, 4)
+
+        # Sanity check — POC must be within 40% of current price or it's meaningless
+        if abs(poc - price_now) / price_now > 0.40:
+            return None
+
+        return poc
     except Exception:
         return None
-
-def recent_structure(df_daily):
-    try:
-        recent = df_daily.iloc[-20:]
-        return round(float(recent['Low'].min()), 2), round(float(recent['High'].max()), 2)
-    except Exception:
-        return None, None
-
 
 # ═══════════════════════════════════════════════
 # VERDICT ENGINE
@@ -564,18 +590,26 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
     above_50  = c['current'] > c['ema50']
     above_200 = c['current'] > c['ema200']
 
+    # EMA50 stretch — computed once, used in multiple cases
+    stretch_pct = (c['current'] - c['ema50']) / c['ema50'] * 100 if c['ema50'] > 0 else 0
+
     reasons    = []
     next_steps = []
     verdict    = None
     zone       = None
 
-    # MTF alignment bonus
-    mtf_all_bull = False
+    # MTF alignment bonus + RSI extreme detection
+    mtf_all_bull    = False
+    mtf_rsi_extreme = False  # any TF with RSI >= 85 or <= 15
     if mtf_verdicts and len(mtf_verdicts) >= 2:
         bull_count = sum(1 for v in mtf_verdicts.values() if 'Bull' in v.get('trend', ''))
-        mtf_all_bull = bull_count == len(mtf_verdicts)
+        mtf_all_bull    = bull_count == len(mtf_verdicts)
+        mtf_rsi_extreme = any(
+            v.get('rsi', 50) >= 85 or v.get('rsi', 50) <= 15
+            for v in mtf_verdicts.values()
+        )
 
-    # 0. PARABOLIC
+    # ── 0. PARABOLIC single-day spike ──
     if abs(drop) >= 15:
         if drop > 0:
             verdict, zone = "⚠️ PARABOLIC", f"News/Catalyst Spike +{drop:.0f}%"
@@ -593,8 +627,26 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
                           f"Watch: does it hold EMA200 `${c['ema200']:.2f}`?"]
         return verdict, zone, reasons, next_steps
 
-    # 1. MOMENTUM
-    if "UPTREND" in trend and from_ath > -5 and above_50 and above_200 and rsi < 80:
+    # ── 0b. PARABOLIC extension — extreme EMA stretch regardless of single-day move ──
+    # Catches multi-day parabolic runs (like AXTI +72% above EMA50)
+    if stretch_pct >= 50 and rsi >= 70:
+        verdict, zone = "🚨 PARABOLIC EXTENSION", f"{stretch_pct:.0f}% Above EMA50"
+        reasons = [
+            f"Price is {stretch_pct:.0f}% above EMA50 — extreme extension",
+            f"RSI {rsi:.0f} — severely overbought",
+        ]
+        if mtf_rsi_extreme:
+            reasons.append("Weekly/Monthly RSI also at extremes — broad overextension")
+        next_steps = [
+            "DO NOT enter at current levels — mean reversion is the highest-probability trade",
+            f"Wait for RSI to cool below 60 AND price near EMA50 `${c['ema50']:.2f}`",
+            f"If holding: trail stop tightly, protect gains",
+        ]
+        return verdict, zone, reasons, next_steps
+
+    # ── 1. MOMENTUM — at/near ATH in strong uptrend, not overextended ──
+    if ("UPTREND" in trend and from_ath > -5 and above_50 and above_200
+            and rsi < 78 and stretch_pct < 30):
         verdict, zone = "🚀 MOMENTUM", "AT ATH — Continuation"
         reasons = [f"At/near ATH ({from_ath:+.1f}%)", "EMA stack fully bullish",
                    f"RSI {rsi:.0f} — not overbought"]
@@ -604,8 +656,36 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
                       f"Pullback entry: dip to EMA50 `${c['ema50']:.2f}`",
                       f"Stop: below EMA50 `${c['ema50']:.2f}`"]
 
-    # 2. STRONG UPTREND PULLBACK
-    elif "UPTREND" in trend and rsi < 52 and above_200:
+    # ── 2. EXTENDED — overbought at or near highs ──
+    # Catches RSI 70-79 OR stretch 30-49% — wider net than before
+    elif (rsi >= 70 or stretch_pct >= 30) and above_50 and above_200:
+        if mtf_rsi_extreme:
+            verdict, zone = "🚨 EXTREMELY EXTENDED", "Multi-TF Overbought"
+            reasons = [
+                f"RSI {rsi:.0f} on daily — overbought",
+                "Weekly/Monthly RSI also at extremes — unsustainable",
+                f"Price {stretch_pct:.0f}% above EMA50 — severe extension",
+            ]
+            next_steps = [
+                "DO NOT enter — highest-probability move is a pullback",
+                f"Wait for RSI to reset to 50-60 AND price near EMA50 `${c['ema50']:.2f}`",
+                "If holding: consider taking 33-50% profits",
+            ]
+        else:
+            verdict, zone = "🟠 EXTENDED", "Overbought — Wait for Pullback"
+            reasons = [
+                f"RSI {rsi:.0f} — overbought",
+                f"Price {stretch_pct:.0f}% above EMA50 — extended",
+                "Risk/reward not ideal for new entry",
+            ]
+            next_steps = [
+                f"Better entry: pullback to EMA50 `${c['ema50']:.2f}`",
+                "Wait for RSI to cool below 60",
+                "If holding: trail stop, do not add",
+            ]
+
+    # ── 3. STRONG UPTREND PULLBACK → BUY ZONE ──
+    elif "UPTREND" in trend and rsi < 55 and above_200 and stretch_pct < 20:
         verdict, zone = "🟢 BUY ZONE", "Pullback in Uptrend"
         reasons = ["Healthy pullback in confirmed uptrend", f"RSI {rsi:.0f} — room to run"]
         if from_ath > -20:
@@ -614,8 +694,8 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
                       f"Target: ATH `${c['ath']:.2f}`",
                       f"Stop: below EMA200 `${c['ema200']:.2f}`"]
 
-    # 3. EMA50 PULLBACK
-    elif "PULLBACK" in trend and rsi < 55:
+    # ── 4. EMA50 PULLBACK ──
+    elif "PULLBACK" in trend and rsi < 58 and stretch_pct < 15:
         verdict, zone = "🟢 BUY ZONE", "EMA50 Pullback"
         reasons = ["Above EMA200 — uptrend intact",
                    f"Pulling toward EMA50 `${c['ema50']:.2f}`",
@@ -624,15 +704,7 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
                       f"Stop: below EMA200 `${c['ema200']:.2f}`",
                       f"Target: `${c['high_52w']:.2f}`"]
 
-    # 4. EXTENDED
-    elif from_ath > -8 and rsi > 75:
-        verdict, zone = "🟠 EXTENDED", "Overbought Near ATH"
-        reasons = [f"RSI {rsi:.0f} — overbought", "Risk/reward not ideal"]
-        next_steps = ["Wait for RSI to cool to 50-60",
-                      f"Better entry: EMA50 `${c['ema50']:.2f}`",
-                      "If holding: trail stop, don't add"]
-
-    # 5. DOWNTREND
+    # ── 5. DOWNTREND ──
     elif "DOWNTREND" in trend and not above_200:
         verdict, zone = "🔴 AVOID", "Falling Knife"
         reasons = ["Below EMA50 & EMA200 — confirmed downtrend"]
@@ -641,22 +713,22 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
         next_steps = [f"Wait for: close above EMA50 `${c['ema50']:.2f}`",
                       "Confirm EMA50 > EMA200 cross before entry"]
 
-    # 6. NEAR 52W LOW
+    # ── 6. NEAR 52W LOW ──
     elif c['pct_from_52w_low'] < 8 and drop < -3:
         verdict, zone = "⚠️ CAUTION", "Breaking Down"
         reasons = ["Near 52W low — key support at risk"]
         next_steps = [f"Watch: holds `${c['low_52w']:.2f}` (52W low)",
                       "Enter only after 2-3 days stabilisation"]
 
-    # 7. TAKE PROFITS
-    elif rsi > 75 and drop > 2:
+    # ── 7. TAKE PROFITS — overbought non-ATH ──
+    elif rsi > 73 and drop > 2:
         verdict, zone = "🟠 TAKE PROFITS", "Extended"
         reasons = [f"RSI overbought ({rsi:.0f})", "Consider trimming"]
         next_steps = ["Trim 25-33% of position here",
                       f"Re-entry: pullback to EMA50 `${c['ema50']:.2f}`",
                       f"Trail stop: `${c['ema50'] * 0.97:.2f}`"]
 
-    # 8. RECOVERING
+    # ── 8. RECOVERING ──
     elif "RECOVERING" in trend:
         if rsi > 55 and drop > 0:
             verdict, zone = "🟡 WATCH", "Recovery Attempt"
@@ -667,7 +739,7 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             reasons = ["Below EMA200 — no structural confirmation"]
             next_steps = [f"Wait for: reclaim EMA200 `${c['ema200']:.2f}`"]
 
-    # 9. MIXED
+    # ── 9. MIXED ──
     elif "MIXED" in trend:
         if range_pos < 35 and rsi < 45:
             verdict, zone = "🟡 WATCH", "Potential Base"
@@ -679,19 +751,29 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             next_steps = [f"Bull: above EMA50 `${c['ema50']:.2f}` + RSI > 55",
                           f"Bear: below EMA200 `${c['ema200']:.2f}`"]
 
-    # 10. DEFAULT
+    # ── 10. DEFAULT ──
     else:
-        if above_50 and above_200 and rsi > 55:
+        if above_50 and above_200 and rsi > 55 and stretch_pct < 25:
             verdict, zone = "🟡 WATCH", "Building Momentum"
             reasons = ["Above both EMAs", f"RSI {rsi:.0f} building"]
             next_steps = [f"Pullback entry: EMA50 `${c['ema50']:.2f}`",
                           f"Breakout: above `${c['high_52w']:.2f}`"]
+        elif above_50 and above_200 and rsi > 55 and stretch_pct >= 25:
+            # Catch-all for extended stocks that slipped through
+            verdict, zone = "🟠 EXTENDED", "Overbought"
+            reasons = [f"RSI {rsi:.0f} — elevated", f"{stretch_pct:.0f}% above EMA50"]
+            next_steps = [f"Wait for pullback to EMA50 `${c['ema50']:.2f}`",
+                          "Do not chase current levels"]
         else:
             verdict, zone = "⏸️ NEUTRAL", "No Clear Setup"
             reasons = ["No strong directional signal"]
             next_steps = [f"Bull trigger: above EMA50 `${c['ema50']:.2f}` + RSI > 55"]
 
-    # Market override
+    # ── MTF RSI extreme addendum ──
+    if mtf_rsi_extreme and verdict not in ("🚨 PARABOLIC EXTENSION", "🚨 EXTREMELY EXTENDED"):
+        reasons.append("⚠️ Weekly/Monthly RSI at extremes — elevated reversion risk")
+
+    # ── Market override ──
     if market_ctx:
         vix     = market_ctx.get('^VIX', {}).get('price', 15)
         spy_pct = market_ctx.get('SPY',  {}).get('pct', 0)
@@ -700,7 +782,7 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             reasons.insert(0, f"Market bleeding — VIX {vix:.0f}, SPY {spy_pct:.1f}%")
             next_steps = ["Wait for market to stabilise"]
 
-    # Earnings override
+    # ── Earnings override ──
     if any(x in verdict for x in ["BUY", "MOMENTUM", "WATCH"]):
         _, days_until = get_earnings_date(c['symbol'])
         if days_until is not None and days_until <= EARNINGS_WARNING_DAYS:
@@ -817,6 +899,9 @@ def format_full_analysis(symbol, ctx, verdict, zone, reasons, next_steps,
     drop_em  = "🟢" if drop >= 0 else "🔴"
     sign     = "+" if drop >= 0 else ""
 
+    # Pre-compute stretch — used in multiple sections
+    stretch_pct = (c['current'] - c['ema50']) / c['ema50'] * 100 if c['ema50'] > 0 else 0
+
     # ── STOCK TYPE HEADER ──
     asset_type = stock_info.get('asset_type', 'Stock')
     sector_h   = stock_info.get('sector', SYMBOL_TO_SECTOR.get(symbol, ''))
@@ -829,14 +914,12 @@ def format_full_analysis(symbol, ctx, verdict, zone, reasons, next_steps,
     msg  = f"🔍 *ON-DEMAND ANALYSIS*\n"
     msg += f"{em} *{symbol}* • {ts}\n"
 
-    # Type line
     type_parts = [asset_type]
     if sector_h:    type_parts.append(sector_h)
     if industry and industry != sector_h: type_parts.append(industry)
     if exchange:    type_parts.append(exchange)
     if mcap:        type_parts.append(f"Mkt cap {mcap}")
     msg += f"_{' • '.join(type_parts)}_\n"
-
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n\n"
 
     # ── VERDICT ──
@@ -871,7 +954,7 @@ def format_full_analysis(symbol, ctx, verdict, zone, reasons, next_steps,
     msg += f"Range: L `${pf.format(c['today_low'])}` → H `${pf.format(c['today_high'])}`\n"
     msg += f"Volume: {volume_label(c['vol_ratio'])}\n"
 
-    # CAD pricing for Wealthsimple
+    # CAD pricing
     if cad_price and tsx_symbol:
         msg += f"\n*🍁 WEALTHSIMPLE (CAD)*\n`─────────────────`\n"
         msg += f"TSX: `{tsx_symbol}` → `${cad_price:.2f} CAD`\n"
@@ -879,7 +962,6 @@ def format_full_analysis(symbol, ctx, verdict, zone, reasons, next_steps,
             implied = round(c['current'] * usd_cad, 2)
             msg += f"USD→CAD implied: `${implied:.2f}` (rate: {usd_cad:.4f})\n"
     elif not is_crypto(symbol):
-        # Show USD→CAD conversion even if no TSX listing
         if usd_cad:
             implied = round(c['current'] * usd_cad, 2)
             msg += f"🍁 CAD equiv: `${implied:.2f}` (USD×{usd_cad:.4f}) — no TSX listing\n"
@@ -890,42 +972,63 @@ def format_full_analysis(symbol, ctx, verdict, zone, reasons, next_steps,
         if abs(diff_pct) < 0.5:
             msg += f"🎯 *AT POC* `${pf.format(poc)}` — volume magnet\n"
         elif c['current'] > poc:
-            msg += f"🎯 Above POC `${pf.format(poc)}` — buyers in control\n"
+            msg += f"🎯 Above POC `${pf.format(poc)}` ({diff_pct:+.1f}%) — buyers in control\n"
         else:
-            msg += f"🎯 Below POC `${pf.format(poc)}` — sellers in control\n"
+            msg += f"🎯 Below POC `${pf.format(poc)}` ({diff_pct:+.1f}%) — sellers in control\n"
 
-    # ── TIMEFRAME ALIGNMENT (expanded) ──
+    # ── TIMEFRAME ALIGNMENT ──
     if mtf_verdicts:
         msg += f"\n*🗂️ TIMEFRAME ALIGNMENT*\n`─────────────────`\n"
         for tf_label, v in mtf_verdicts.items():
-            sar_em = "✅" if v.get('sar_bull') else "❌" if v.get('sar_bull') is False else "➖"
-            adx_str = f"ADX {v['adx']:.0f}"
-            adx_em  = "💪" if v['adx'] >= 25 else "⚠️" if v['adx'] < 20 else "➖"
+            sar_em  = "✅" if v.get('sar_bull') else "❌" if v.get('sar_bull') is False else "➖"
+            adx_val = v['adx']
+            adx_em  = "💪" if adx_val >= 25 else "⚠️" if adx_val < 20 else "➖"
+            rsi_display = f"{v['rsi']}"
+            rsi_tag     = v.get('rsi_tag', '')
+            if rsi_tag:
+                rsi_display += f" {rsi_tag}"
             msg += (f"{tf_label:7s}: {v['trend']}\n"
-                    f"         RSI {v['rsi']} | {adx_em} {adx_str} | SAR {sar_em} | {v['adx_sar']}\n")
+                    f"         RSI {rsi_display} | {adx_em} ADX {adx_val:.0f} | SAR {sar_em} | {v['adx_sar']}\n")
 
     # ── TECHNICALS ──
     msg += f"\n*📈 TECHNICALS*\n`─────────────────`\n"
     msg += f"{c['trend']}\n"
-    rsi_tag = "_(oversold)_" if c['rsi'] < 30 else "_(overbought)_" if c['rsi'] > 70 else "_(bullish)_" if c['rsi'] > 60 else "_(neutral)_"
+
+    # RSI label — consistent with verdict
+    if c['rsi'] < 30:
+        rsi_tag = "_(oversold)_"
+    elif c['rsi'] >= 70:
+        rsi_tag = "_(overbought)_"
+    elif c['rsi'] > 60:
+        rsi_tag = "_(bullish)_"
+    else:
+        rsi_tag = "_(neutral)_"
     msg += f"RSI: `{c['rsi']:.0f}` {rsi_tag}\n"
 
-    # Stretch from EMA50
-    stretch_pct = (c['current'] - c['ema50']) / c['ema50'] * 100
-    stretch_warn = ""
-    if stretch_pct > 15:
-        stretch_warn = " ⚠️ _Extended — reversion risk_"
-    elif stretch_pct < -10:
+    # EMA50 stretch — warning is now consistent with verdict action
+    if stretch_pct >= 50:
+        stretch_warn = " 🚨 _Extreme extension — DO NOT chase_"
+    elif stretch_pct >= 30:
+        stretch_warn = " ⚠️ _Extended — wait for pullback_"
+    elif stretch_pct >= 15:
+        stretch_warn = " ⚠️ _Stretched — reversion risk_"
+    elif stretch_pct <= -10:
         stretch_warn = " ✅ _Deeply oversold — mean reversion likely_"
+    else:
+        stretch_warn = ""
     msg += f"EMA50: `${pf.format(c['ema50'])}` ({stretch_pct:+.1f}% away){stretch_warn}\n"
     msg += f"EMA200: `${pf.format(c['ema200'])}`\n"
 
     above_50  = c['current'] > c['ema50']
     above_200 = c['current'] > c['ema200']
-    if above_50 and above_200:       msg += "✅ Above EMA50 & EMA200\n"
-    elif above_200 and not above_50: msg += "⚠️ Below EMA50, above EMA200\n"
-    elif not above_200 and above_50: msg += "🔀 Above EMA50, below EMA200\n"
-    else:                             msg += "🔴 Below both EMAs\n"
+    if above_50 and above_200:
+        msg += "✅ Above EMA50 & EMA200\n"
+    elif above_200 and not above_50:
+        msg += "⚠️ Below EMA50, above EMA200\n"
+    elif not above_200 and above_50:
+        msg += "🔀 Above EMA50, below EMA200\n"
+    else:
+        msg += "🔴 Below both EMAs\n"
 
     if beta_val:
         beta_desc = "low vol" if beta_val < 0.8 else "high vol" if beta_val > 1.5 else "market vol"
@@ -937,20 +1040,25 @@ def format_full_analysis(symbol, ctx, verdict, zone, reasons, next_steps,
     bar = "█" * pos + "░" * (10 - pos)
     msg += f"`{bar}` {c['range_pos']:.0f}% of 52W range\n"
     msg += f"52W: `${pf.format(c['low_52w'])}` → `${pf.format(c['high_52w'])}`\n"
+
+    # Corporate action / abnormal range warning (ported from market_intel)
+    if c['pct_from_52w_low'] > 500:
+        msg += f"⚠️ _52W low `${pf.format(c['low_52w'])}` suggests split/spin-off — range context may be unreliable_\n"
+
     msg += f"ATH: `${pf.format(c['ath'])}` ({c['ath_pct']:+.1f}%) — {ath_recency(c['ath_date'])}\n"
     if support and resistance:
         msg += f"Structure: Support `${pf.format(support)}` • Resistance `${pf.format(resistance)}`\n"
 
     # ── ANALYST TARGETS ──
-    target_mean = stock_info.get('target_mean')
-    target_high = stock_info.get('target_high')
-    target_low  = stock_info.get('target_low')
-    rec_key     = stock_info.get('rec_key', '')
-    analyst_n   = stock_info.get('analyst_count', 0)
+    target_mean  = stock_info.get('target_mean')
+    target_high  = stock_info.get('target_high')
+    target_low   = stock_info.get('target_low')
+    rec_key      = stock_info.get('rec_key', '')
+    analyst_n    = stock_info.get('analyst_count', 0)
 
     if target_mean and not is_crypto(symbol):
         msg += f"\n*🎯 ANALYST TARGETS*\n`─────────────────`\n"
-        upside = (target_mean - c['current']) / c['current'] * 100
+        upside    = (target_mean - c['current']) / c['current'] * 100
         upside_em = "🟢" if upside > 0 else "🔴"
         msg += f"Consensus: `${target_mean:.2f}` {upside_em} {upside:+.1f}% upside"
         if analyst_n:
@@ -961,6 +1069,12 @@ def format_full_analysis(symbol, ctx, verdict, zone, reasons, next_steps,
         if rec_key:
             rec_em = "🟢" if 'Buy' in rec_key else "🔴" if 'Sell' in rec_key else "🟡"
             msg += f"Rating: {rec_em} *{rec_key}*\n"
+        # Flag when stock has blown past analyst consensus — important context
+        if upside < -15:
+            msg += (f"🚨 *Stock is {abs(upside):.0f}% ABOVE analyst consensus*\n"
+                    f"   _Analysts haven't upgraded targets yet, or stock is overextended_\n")
+        elif upside < -5:
+            msg += f"⚠️ _Stock above analyst consensus — limited upside per analysts_\n"
 
     # ── FUNDAMENTALS ──
     short_pct = stock_info.get('short_pct')
@@ -1016,6 +1130,7 @@ def format_full_analysis(symbol, ctx, verdict, zone, reasons, next_steps,
             msg += "\n"
 
     # ── WHAT TO DO ──
+    # next_steps come directly from get_verdict() which now accounts for stretch
     msg += f"\n*💡 WHAT TO DO*\n`─────────────────`\n"
     for step in next_steps:
         msg += f"  → {step}\n"
@@ -1025,27 +1140,8 @@ def format_full_analysis(symbol, ctx, verdict, zone, reasons, next_steps,
         msg += f"\n*🤖 AI ANALYSIS*\n`─────────────────`\n{ai_text}\n"
 
     msg += f"\n`━━━━━━━━━━━━━━━━━━━━━`\n"
-    msg += f"_AlphaEdge v7.0 • On-demand_"
+    msg += f"_AlphaEdge v7.1 • On-demand_"
     return msg
-
-
-def format_short_analysis(symbol, ctx, verdict, zone, rs_label, rs_score, stock_info):
-    em   = SYMBOL_EMOJI.get(symbol, '📊')
-    c    = ctx
-    drop = c['day_change_pct']
-    drop_em = "🟢" if drop >= 0 else "🔴"
-    sign    = "+" if drop >= 0 else ""
-    decimals = 4 if c['current'] < 10 else 2
-    pf   = f"{{:.{decimals}f}}"
-    rs_str  = f" • RS {rs_label}" if rs_label else ""
-    sector_h = stock_info.get('sector', '')
-    sector_str = f" • _{sector_h}_" if sector_h else ""
-    msg  = f"🔍 {em} *{symbol}* `${pf.format(c['current'])}` ({drop_em}{sign}{drop:.1f}%){sector_str}\n"
-    msg += f"{verdict} — _{zone}_\n"
-    msg += f"RSI `{c['rsi']:.0f}` • {c['trend']}{rs_str}"
-    return msg
-
-
 # ═══════════════════════════════════════════════
 # PRICE ALERT SYSTEM
 # ═══════════════════════════════════════════════
