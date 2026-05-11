@@ -239,7 +239,10 @@ def get_cad_price(symbol):
             if not df.empty and len(df) >= 1:
                 df = _clean_df(df)
                 cad_price = float(df['Close'].iloc[-1])
-                if cad_price > 0:
+                # Sanity check — CAD price should be > $0.50
+                # and within reasonable range of USD price
+                # (USD/CAD is ~1.35, so CAD should be > USD * 0.5)
+                if cad_price > 0.50:
                     return round(cad_price, 4 if cad_price < 10 else 2), tsx_sym
         except Exception:
             pass
@@ -594,7 +597,7 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
         return verdict, zone, reasons, next_steps
 
     # 1. MOMENTUM
-    if "UPTREND" in trend and from_ath > -5 and above_50 and above_200 and rsi < 80:
+     if "UPTREND" in trend and from_ath > -15 and above_50 and above_200 and rsi < 80:
         verdict, zone = "🚀 MOMENTUM", "AT ATH — Continuation"
         reasons = [f"At/near ATH ({from_ath:+.1f}%)", "EMA stack fully bullish",
                    f"RSI {rsi:.0f} — not overbought"]
@@ -886,12 +889,12 @@ def build_reentry_table(verdict, ctx, mtf_verdicts, stock_info):
             lines.append(f"{'Add on dip':16s} EMA50 `${pf.format(c['ema50'])}` — best add zone")
 
     elif any(x in verdict for x in ['BUY ZONE', 'WATCH']):
-        # Bullish setup — give entry plan
-        entry_low  = round(c['current'] * 0.98, decimals)
-        entry_high = round(c['current'] * 1.01, decimals)
+        # Better entry is on a pullback, not at current price
+        pullback_low  = round(c['ema50'] * 0.99, decimals)
+        pullback_high = round(c['ema50'] * 1.03, decimals)
 
-        lines.append(f"{'Entry zone':16s} `${pf.format(entry_low)}` – `${pf.format(entry_high)}`")
-        lines.append(f"{'Add on dip':16s} EMA50 `${pf.format(c['ema50'])}` if pulls back")
+        lines.append(f"{'Best entry':16s} Pullback to EMA50 `${pf.format(pullback_low)}` – `${pf.format(pullback_high)}`")
+        lines.append(f"{'Breakout entry':16s} Above `${pf.format(c['high_52w'])}` with volume")
         lines.append(f"{'Target':16s} ATH `${pf.format(c['ath'])}` ({c['ath_pct']:+.1f}% away)")
         lines.append(f"{'Invalidation':16s} Close below EMA200 `${pf.format(c['ema200'])}`")
 
@@ -910,12 +913,6 @@ def build_reentry_table(verdict, ctx, mtf_verdicts, stock_info):
         lines.append(f"{'Bear trigger':16s} Close below EMA200 `${pf.format(c['ema200'])}`")
         lines.append(f"{'RSI watch':16s} > 55 for bull, < 45 for bear")
         lines.append(f"{'Best action':16s} Wait for clear break")
-
-    # Add analyst target if available
-    target_mean = stock_info.get('target_mean')
-    if target_mean and not is_crypto(ctx['symbol']):
-        upside = (target_mean - c['current']) / c['current'] * 100
-        lines.append(f"{'Analyst target':16s} `${target_mean:.2f}` ({upside:+.1f}% from here)")
 
     msg = "*🎯 RE-ENTRY WATCH LEVELS*\n`─────────────────────────`\n"
     for line in lines:
