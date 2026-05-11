@@ -661,11 +661,16 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
         reentry_lo = round(c['ema50'] * 0.98, 2)
         reentry_hi = round(c['ema50'] * 1.05, 2)
         verdict, zone = "🟠 EXTENDED", "Overbought — Wait for Pullback"
-        reasons = [
-            f"RSI {rsi:.0f} — overbought",
-            f"Price {stretch_pct:.0f}% above EMA50 — extended, risk/reward poor",
-            "Not ideal entry — better setups come on pullbacks",
-        ]
+        # Build reasons based on what actually triggered EXTENDED
+        # so RSI label stays consistent with the technicals section
+        reasons = []
+        if rsi >= 70:
+            reasons.append(f"RSI {rsi:.0f} — overbought, momentum stretched")
+        else:
+            reasons.append(f"RSI {rsi:.0f} — elevated but not yet overbought")
+        if stretch_pct >= 30:
+            reasons.append(f"Price {stretch_pct:.0f}% above EMA50 — extended, risk/reward poor")
+        reasons.append("Better setups come on pullbacks — not ideal entry now")
         next_steps = [
             f"Better entry: pullback to EMA50 zone `${reentry_lo}` – `${reentry_hi}`",
             f"RSI trigger: wait for RSI to cool below 60 (currently {rsi:.0f})",
@@ -833,7 +838,8 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             ]
 
     # ── Earnings override ──
-    if any(x in verdict for x in ["BUY", "MOMENTUM", "WATCH"]):
+    # Includes EXTENDED — don't enter extended stocks before a binary event
+    if any(x in verdict for x in ["BUY", "MOMENTUM", "WATCH", "EXTENDED"]):
         _, days_until = get_earnings_date(c['symbol'])
         if days_until is not None and days_until <= EARNINGS_WARNING_DAYS:
             verdict = "⚠️ WAIT — Earnings"
