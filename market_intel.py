@@ -1,8 +1,15 @@
 """
-ALPHAEDGE MARKET INTELLIGENCE v3.0 — AUDITED BUILD
+ALPHAEDGE MARKET INTELLIGENCE v3.1 — UNIVERSE SCHEMA SUPPORT
 ═══════════════════════════════════════════════════════════════
 Trading-system core: data fetch, indicators, verdict engine,
 sector/leadership detection, Telegram delivery.
+
+v3.1 vs v3.0
+  • Loader supports new symbols.yaml `universe:` schema with metadata
+  • Exposes SYMBOL_META (name/exchange/session/tags/roles per symbol)
+  • Exposes YAML_SETTINGS for downstream Config overrides
+  • Sector taxonomy validation against `sectors_canonical:` list
+  • Backward compatible with legacy bucket schema
 
 v3.0 vs v2.2 — fixes & hardening
 ────────────────────────────────
