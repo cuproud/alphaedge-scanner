@@ -1,139 +1,122 @@
 """
-ALPHAEDGE BRIEF v3.1 — MORNING + EVENING (audited build)
+ALPHAEDGE BRIEF v3.2 — UNIFIED BUILD
 ═══════════════════════════════════════════════════════════════
 Fires twice every weekday:
   🌅 9:00 AM ET  — Morning Brief (day setup)
   🌆 4:30 PM ET  — Evening Brief (day recap + after-hours watch)
 
-v3.1 vs v3.0 — fixes & hardening
-────────────────────────────────
-P0 (correctness / reliability)
-  • Atomic, file-locked state gate (no double-fire on overlapping cron runs)
-  • After-hours window computed from timestamps, not bar counts
-  • Centralized Telegram MarkdownV2 escaping for ALL dynamic values
-  • AI output sanitized + hard-truncated to 4 lines before insertion
-  • Real 4096-char auto-split on section boundaries
-  • Per-row try/except on trade loops — one corrupt record can't kill the brief
-
-P1 (logic / design)
-  • Earnings labels are BMO/AMC + time-of-day aware
-  • Morning + evening builders share one collector + one renderer (no copy-paste)
-  • Parallel ticker fetch with bounded concurrency (ThreadPoolExecutor)
-  • Earnings results cached for 12h to avoid yfinance throttling
-  • requests.Session reused with retry/backoff for Gemini calls
-  • losers/gainers slicing fixed (no gainer-leakage when <5 losers exist)
-  • DST-safe window check using time(h,m) comparisons
-
-P2 (quality / UX)
-  • Config dataclass — all magic numbers in one place
-  • Single `H_RULE` / `SUB_RULE` separators for visual consistency
-  • Logging configured in __main__, with rotation; not at import time
-  • `failed_count` surfaced in brief footer for observability
-  • Display TZ = America/Toronto; market TZ = America/New_York
-  • Pure formatters extracted → easy to snapshot-test
+v3.2 vs v3.1 — alignment with market_intel v3.1 + symbols.yaml v3
+────────────────────────────────────────────────────────────────
+• Reads SYMBOL_META → company name + exchange in every header
+  (e.g. "AAPL — Apple Inc. (NASDAQ)") — fulfils original spec
+• Applies YAML_SETTINGS["brief"] overrides at startup
+• Cooldown unified through market_intel.can_alert / mark_alert
+  (drops local claim_slot/release_slot, drops local earnings cache)
+• Reuses market_intel SESSION, tg_escape, send_telegram (auto-split)
+• Pre-fetches earnings once per scan (uses central 12h cache)
+• Display TZ = America/Toronto; market TZ = America/New_York
 """
 
 from __future__ import annotations
 
-import os
-import re
-import json
-import time
-import fcntl
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time as dtime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import requests
 import yfinance as yf
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from market_intel import (
     MONITOR_LIST, SECTORS, STATE_FILE, SYMBOL_EMOJI,
-    calc_relative_strength, format_earnings_warning, get_earnings_date,
-    get_full_context, get_market_ctx, get_verdict, load_json,
-    now_est, save_json, send_telegram,
+    SYMBOL_META, YAML_SETTINGS,
+    calc_relative_strength, format_earnings_warning,
+    get_earnings_date,
+    get_full_context, get_market_ctx, get_verdict,
+    load_json, now_est, save_json, send_telegram,
+    can_alert, mark_alert,
+    tg_escape as md,
+    display_now, market_now,
+    H_RULE, SUB_RULE,
 )
 
 # ════════════════════════════════════════════════════════════
 # CONFIG
 # ════════════════════════════════════════════════════════════
 
-MARKET_TZ  = ZoneInfo("America/New_York")   # market clock — DO NOT change
-DISPLAY_TZ = ZoneInfo("America/Toronto")    # user-facing label (same offset as NY)
+MARKET_TZ  = ZoneInfo("America/New_York")
+DISPLAY_TZ = ZoneInfo("America/Toronto")
 
-LOGS_DIR   = Path("logs"); LOGS_DIR.mkdir(exist_ok=True)
+LOGS_DIR     = Path("logs"); LOGS_DIR.mkdir(exist_ok=True)
 TRADES_FILE  = "active_trades.json"
 HISTORY_FILE = "trade_history.json"
-EARNINGS_CACHE_FILE = "earnings_cache.json"
-
-H_RULE   = "`━━━━━━━━━━━━━━━━━━━━━`"
-SUB_RULE = "`─────────────────`"
-
-TG_MAX_LEN = 4096
 
 
 @dataclass(frozen=True)
 class Config:
-    gemini_api_key: str | None    = os.environ.get("GEMINI_API_KEY")
-    gemini_model:   str           = "gemini-2.0-flash"
-    gemini_timeout: int           = 20
-    gemini_temp:    float         = 0.6
-    gemini_tokens:  int           = 400
-
-    fetch_workers:  int           = 5
-    fetch_timeout:  int           = 25
-
-    earnings_cache_ttl_h: int     = 12
+    fetch_workers:  int = 5
+    fetch_timeout:  int = 25
 
     morning_window: tuple[dtime, dtime] = (dtime(8, 45),  dtime(12, 0))
     evening_window: tuple[dtime, dtime] = (dtime(16, 15), dtime(20, 0))
 
-    ah_move_min_pct: float        = 0.5
-    max_buy_candidates: int       = 8
-    max_avoid_shown:    int       = 6
-    max_movers_shown:   int       = 5
-    max_ah_movers:      int       = 6
+    ah_move_min_pct:    float = 0.5
+    max_buy_candidates: int   = 8
+    max_avoid_shown:    int   = 6
+    max_movers_shown:   int   = 5
+    max_ah_movers:      int   = 6
 
-CFG = Config()
+    # Slot cooldown — one brief per 24h per slot key
+    slot_cooldown_h:    int   = 23
+
+    # Force flags (read at startup from env)
+    force_morning: bool = False
+    force_evening: bool = False
+    force_brief:   bool = False
 
 
-# ════════════════════════════════════════════════════════════
-# HTTP SESSION (reused, with retry)
-# ════════════════════════════════════════════════════════════
+def _apply_yaml_overrides(cfg: Config) -> Config:
+    """Apply settings.brief from symbols.yaml, converting time strings."""
+    overrides = dict((YAML_SETTINGS or {}).get("brief") or {})
+    if not overrides:
+        return cfg
 
-def _build_session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=3, backoff_factor=0.8,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["POST", "GET"]),
-        respect_retry_after_header=True,
+    def _to_window(v):
+        h1, m1 = map(int, v[0].split(":"))
+        h2, m2 = map(int, v[1].split(":"))
+        return (dtime(h1, m1), dtime(h2, m2))
+
+    if isinstance(overrides.get("morning_window"), list):
+        overrides["morning_window"] = _to_window(overrides["morning_window"])
+    if isinstance(overrides.get("evening_window"), list):
+        overrides["evening_window"] = _to_window(overrides["evening_window"])
+
+    valid = {f.name for f in cfg.__dataclass_fields__.values()}
+    safe  = {k: v for k, v in overrides.items() if k in valid}
+    if safe:
+        logging.info(f"brief: applied yaml overrides: {sorted(safe)}")
+    return replace(cfg, **safe)
+
+
+def _load_force_flags(cfg: Config) -> Config:
+    return replace(
+        cfg,
+        force_morning = os.environ.get("FORCE_MORNING", "").lower() in ("true", "1", "yes"),
+        force_evening = os.environ.get("FORCE_EVENING", "").lower() in ("true", "1", "yes"),
+        force_brief   = os.environ.get("FORCE_BRIEF",   "").lower() in ("true", "1", "yes"),
     )
-    s.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8))
-    return s
 
-SESSION = _build_session()
+CFG = _load_force_flags(_apply_yaml_overrides(Config()))
 
 
 # ════════════════════════════════════════════════════════════
 # CLOCK HELPERS
 # ════════════════════════════════════════════════════════════
-
-def market_now() -> datetime:
-    """Authoritative 'now' on the market clock."""
-    return now_est().astimezone(MARKET_TZ)
-
-def display_now() -> datetime:
-    """Same instant, formatted in the user's local Toronto clock."""
-    return market_now().astimezone(DISPLAY_TZ)
 
 def is_weekend() -> bool:
     return market_now().weekday() >= 5
@@ -144,218 +127,23 @@ def in_window(win: tuple[dtime, dtime]) -> bool:
 
 
 # ════════════════════════════════════════════════════════════
-# TELEGRAM MARKDOWN ESCAPING
-# ════════════════════════════════════════════════════════════
-# We use legacy Markdown (parse_mode='Markdown') as the original code does.
-# Legacy Markdown only requires escaping these inside *bold*/_italic_/`code`:
-#   *  _  `  [
-# But ticker symbols can contain '.' / '-' which legacy Markdown tolerates.
-# If you switch to MarkdownV2, swap _MD_SPECIALS for the V2 set.
-
-_MD_SPECIALS = re.compile(r"([_*`\[])")
-
-def md(text: Any) -> str:
-    """Escape a dynamic value for safe Telegram Markdown insertion."""
-    if text is None:
-        return "—"
-    return _MD_SPECIALS.sub(r"\\\1", str(text))
-
-_AI_STRIP = re.compile(r"[`*_\[\]()]")
-
-def sanitize_ai(text: str | None, max_lines: int = 4, max_line_len: int = 140) -> str | None:
-    """Strip Markdown chars from AI text, hard-truncate to N lines."""
-    if not text:
-        return None
-    cleaned = _AI_STRIP.sub("", text).strip()
-    lines = [ln.strip()[:max_line_len] for ln in cleaned.splitlines() if ln.strip()]
-    return "\n".join(lines[:max_lines]) or None
-
-
-# ════════════════════════════════════════════════════════════
-# ATOMIC STATE GATE
+# COMPANY NAME / EXCHANGE LABEL
 # ════════════════════════════════════════════════════════════
 
-def claim_slot(slot_key: str, value: str) -> bool:
+def name_label(sym: str, *, bold_ticker: bool = True) -> str:
     """
-    Atomically set state[slot_key] = value, but only if it isn't already.
-    Returns True iff THIS process won the slot. Prevents double-sends across
-    overlapping cron invocations.
+    Returns 'AAPL — Apple Inc. (NASDAQ)' if metadata available,
+    else just the (escaped) ticker. Ticker is bolded by default.
     """
-    Path(STATE_FILE).touch(exist_ok=True)
-    with open(STATE_FILE, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            raw = f.read() or "{}"
-            try:
-                state = json.loads(raw)
-            except json.JSONDecodeError:
-                logging.warning("State file corrupt; resetting")
-                state = {}
-            if state.get(slot_key) == value:
-                return False
-            state[slot_key] = value
-            f.seek(0); f.truncate()
-            json.dump(state, f)
-            return True
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-def release_slot(slot_key: str) -> None:
-    """Roll back a claim if the brief failed to send."""
-    try:
-        with open(STATE_FILE, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                state = json.loads(f.read() or "{}")
-                state.pop(slot_key, None)
-                f.seek(0); f.truncate()
-                json.dump(state, f)
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-    except Exception as e:
-        logging.error(f"release_slot({slot_key}): {e}")
-
-
-# ════════════════════════════════════════════════════════════
-# EARNINGS CACHE
-# ════════════════════════════════════════════════════════════
-
-def _earnings_cache_get(symbol: str) -> tuple | None:
-    cache = load_json(EARNINGS_CACHE_FILE, {})
-    rec = cache.get(symbol)
-    if not rec:
-        return None
-    cached_at = datetime.fromisoformat(rec["cached_at"])
-    if datetime.now(MARKET_TZ) - cached_at > timedelta(hours=CFG.earnings_cache_ttl_h):
-        return None
-    return rec.get("date"), rec.get("days"), rec.get("session")  # session may be None
-
-def _earnings_cache_put(symbol: str, ed, days, session: str | None) -> None:
-    cache = load_json(EARNINGS_CACHE_FILE, {})
-    cache[symbol] = {
-        "date": ed, "days": days, "session": session,
-        "cached_at": datetime.now(MARKET_TZ).isoformat(),
-    }
-    save_json(EARNINGS_CACHE_FILE, cache)
-
-def get_earnings_cached(symbol: str) -> tuple:
-    """Wraps market_intel.get_earnings_date with a 12h cache."""
-    hit = _earnings_cache_get(symbol)
-    if hit is not None:
-        return hit
-    try:
-        ed, days = get_earnings_date(symbol)
-        # market_intel doesn't expose BMO/AMC; placeholder for future.
-        session = None
-        _earnings_cache_put(symbol, ed, days, session)
-        return ed, days, session
-    except Exception as e:
-        logging.warning(f"earnings fetch {symbol}: {e}")
-        return None, None, None
-
-
-# ════════════════════════════════════════════════════════════
-# AI BRIEF GENERATION
-# ════════════════════════════════════════════════════════════
-
-def _gemini_call(prompt: str, label: str) -> str | None:
-    if not CFG.gemini_api_key:
-        return None
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{CFG.gemini_model}:generateContent?key={CFG.gemini_api_key}")
-    try:
-        r = SESSION.post(
-            url,
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": CFG.gemini_temp,
-                    "maxOutputTokens": CFG.gemini_tokens,
-                },
-            },
-            timeout=CFG.gemini_timeout,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            cands = data.get("candidates") or []
-            if cands:
-                return cands[0]["content"]["parts"][0]["text"].strip()
-            logging.warning(f"Gemini {label}: empty candidates")
-        elif r.status_code == 429:
-            logging.warning(f"Gemini rate-limited ({label})")
-        else:
-            logging.error(f"Gemini {label}: {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        logging.error(f"AI {label}: {e}")
-    return None
-
-
-def ai_daily_outlook(market_ctx, sector_summary, top_movers) -> str | None:
-    mkt = market_ctx or {}
-    spy = mkt.get("SPY", {}).get("pct", 0)
-    qqq = mkt.get("QQQ", {}).get("pct", 0)
-    vix = mkt.get("^VIX", {}).get("price", 15)
-    sec_lines   = "\n".join(f"  {n}: {a:+.2f}%" for n, a in sector_summary[:6])
-    mover_lines = "\n".join(f"  {m['symbol']}: {m['pct']:+.2f}%" for m in top_movers[:6])
-
-    prompt = f"""You are a senior trading strategist writing the morning brief for an active trader.
-
-TODAY'S PRE-MARKET SNAPSHOT:
-SPY: {spy:+.2f}%, QQQ: {qqq:+.2f}%, VIX: {vix:.1f}
-
-TOP MOVERS (pre-market):
-{mover_lines}
-
-SECTOR PERFORMANCE:
-{sec_lines}
-
-Write EXACTLY 4 lines (max 120 chars each). Be direct and actionable.
-
-🌅 [Setup: risk-on/risk-off/mixed — briefly why]
-🎯 [Which sectors/themes to favor today — be specific with tickers if relevant]
-⚠️ [Main risk / what to avoid — pinpoint it]
-💡 [Bias: trade aggressive / selective / defensive — with size guidance]
-
-NO extra headers, bullets, intros, or outros. 4 lines only."""
-    return sanitize_ai(_gemini_call(prompt, "morning"))
-
-
-def ai_evening_summary(market_ctx, sector_summary, day_winners, day_losers, open_trades) -> str | None:
-    mkt = market_ctx or {}
-    spy = mkt.get("SPY", {}).get("pct", 0)
-    qqq = mkt.get("QQQ", {}).get("pct", 0)
-    vix = mkt.get("^VIX", {}).get("price", 15)
-    sec_lines    = "\n".join(f"  {n}: {a:+.2f}%" for n, a in sector_summary[:6])
-    winner_lines = "\n".join(f"  {w['symbol']}: {w['pct']:+.2f}%" for w in day_winners[:4]) or "  none"
-    loser_lines  = "\n".join(f"  {l['symbol']}: {l['pct']:+.2f}%" for l in day_losers[:4])  or "  none"
-    trade_lines  = (f"{len(open_trades)} trade(s) still open going into after-hours"
-                    if open_trades else "No open trades")
-
-    prompt = f"""You are a senior trading strategist writing the end-of-day brief for an active trader.
-
-TODAY'S CLOSE:
-SPY: {spy:+.2f}%, QQQ: {qqq:+.2f}%, VIX: {vix:.1f}
-
-DAY LEADERS:
-{winner_lines}
-
-DAY LAGGARDS:
-{loser_lines}
-
-SECTOR CLOSE:
-{sec_lines}
-
-OPEN POSITIONS: {trade_lines}
-
-Write EXACTLY 4 lines (max 120 chars each). Be direct.
-
-🌆 [Day recap: what drove price — sector rotation, macro, momentum?]
-🎯 [What set up well today — note any themes for tomorrow]
-⚠️ [Overnight risk — what to watch AH / pre-market tomorrow]
-💡 [Overnight bias: cautious / hold / reduce — brief reason]
-
-NO extra headers, bullets, intros, or outros. 4 lines only."""
-    return sanitize_ai(_gemini_call(prompt, "evening"))
+    meta = SYMBOL_META.get(sym, {})
+    name = meta.get("name", "")
+    exch = meta.get("exchange", "")
+    ticker = f"*{md(sym)}*" if bold_ticker else md(sym)
+    if name and exch:
+        return f"{ticker} — {md(name)} ({md(exch)})"
+    if name:
+        return f"{ticker} — {md(name)}"
+    return ticker
 
 
 # ════════════════════════════════════════════════════════════
@@ -364,13 +152,14 @@ NO extra headers, bullets, intros, or outros. 4 lines only."""
 
 @dataclass
 class BriefData:
-    market_ctx:    dict
-    contexts:      dict[str, dict]
-    failed_count:  int
-    sectors:       list[tuple[str, float]]
-    gainers:       list[dict]
-    losers:        list[dict]
-    earnings_soon: list[tuple]   # (sym, date, days, session)
+    market_ctx:     dict
+    contexts:       dict[str, dict]
+    failed_count:   int
+    sectors:        list[tuple[str, float]]
+    gainers:        list[dict]
+    losers:         list[dict]
+    earnings_soon:  list[tuple]   # (sym, date, days, session)
+    earnings_days:  dict[str, int | None]
 
 
 def _fetch_one(symbol: str) -> tuple[str, dict | None, Exception | None]:
@@ -413,20 +202,25 @@ def collect_brief_data() -> BriefData:
     sorted_desc = sorted(contexts.values(), key=lambda c: -c["day_change_pct"])
     pos = [c for c in sorted_desc if c["day_change_pct"] > 0]
     neg = [c for c in sorted_desc if c["day_change_pct"] < 0]
-    gainers = [{"symbol": c["symbol"], "pct": c["day_change_pct"]} for c in pos[:CFG.max_movers_shown]]
-    losers  = [{"symbol": c["symbol"], "pct": c["day_change_pct"]} for c in neg[-CFG.max_movers_shown:][::-1]]
+    gainers = [{"symbol": c["symbol"], "pct": c["day_change_pct"]}
+               for c in pos[: CFG.max_movers_shown]]
+    losers  = [{"symbol": c["symbol"], "pct": c["day_change_pct"]}
+               for c in neg[-CFG.max_movers_shown:][::-1]]
 
-    # Earnings (cached)
-    earnings_soon = []
+    # Earnings — single fetch per symbol (uses central 12h cache)
+    earnings_soon: list[tuple] = []
+    earnings_days: dict[str, int | None] = {}
     for sym in contexts:
-        ed, days, session = get_earnings_cached(sym)
+        ed, days = get_earnings_date(sym)
+        earnings_days[sym] = days
         if ed and days is not None and days <= 1:
-            earnings_soon.append((sym, ed, days, session))
+            # session metadata not yet exposed by market_intel — pass None
+            earnings_soon.append((sym, ed, days, None))
 
     return BriefData(
         market_ctx=market_ctx, contexts=contexts, failed_count=failed,
         sectors=sectors, gainers=gainers, losers=losers,
-        earnings_soon=earnings_soon,
+        earnings_soon=earnings_soon, earnings_days=earnings_days,
     )
 
 
@@ -445,9 +239,9 @@ def compute_ah_movers(symbols: Iterable[str]) -> list[dict]:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-            # Normalize index to NY time
             idx = df.index
-            df.index = idx.tz_convert(MARKET_TZ) if idx.tz is not None else idx.tz_localize("UTC").tz_convert(MARKET_TZ)
+            df.index = (idx.tz_convert(MARKET_TZ) if idx.tz is not None
+                        else idx.tz_localize("UTC").tz_convert(MARKET_TZ))
 
             regular_mask = df.index.time <= dtime(16, 0)
             if not regular_mask.any() or not (~regular_mask).any():
@@ -463,19 +257,14 @@ def compute_ah_movers(symbols: Iterable[str]) -> list[dict]:
         except Exception as e:
             logging.debug(f"AH calc {sym}: {e}")
     movers.sort(key=lambda x: -abs(x["pct"]))
-    return movers[:CFG.max_ah_movers]
+    return movers[: CFG.max_ah_movers]
 
 
 # ════════════════════════════════════════════════════════════
-# EARNINGS LABELING (BMO/AMC + time-aware)
+# EARNINGS LABELING (BMO/AMC + brief-kind aware)
 # ════════════════════════════════════════════════════════════
 
 def earnings_label(days: int, session: str | None, brief_kind: str) -> str:
-    """
-    days   : 0 = today, 1 = tomorrow
-    session: 'BMO' | 'AMC' | None
-    brief_kind: 'morning' | 'evening'
-    """
     if days == 0:
         if session == "BMO":
             return "🔴 REPORTED PRE-MARKET" if brief_kind == "evening" else "🔴 REPORTING PRE-MARKET"
@@ -483,10 +272,8 @@ def earnings_label(days: int, session: str | None, brief_kind: str) -> str:
             return "AFTER CLOSE TONIGHT" if brief_kind == "morning" else "🔴 REPORTING IN MINUTES"
         return "TODAY"
     if days == 1:
-        if session == "BMO":
-            return "TOMORROW PRE-MARKET"
-        if session == "AMC":
-            return "TOMORROW AFTER CLOSE"
+        if session == "BMO": return "TOMORROW PRE-MARKET"
+        if session == "AMC": return "TOMORROW AFTER CLOSE"
         return "TOMORROW"
     return f"in {days}d"
 
@@ -557,13 +344,12 @@ def render_earnings(earnings, brief_kind: str, title: str, footer: str) -> str:
     out = f"\n*{title}*\n{SUB_RULE}\n"
     for sym, _ed, days, session in earnings:
         em = SYMBOL_EMOJI.get(sym, "📊")
-        out += f"  {em} *{md(sym)}* — {earnings_label(days, session, brief_kind)}\n"
+        out += f"  {em} {name_label(sym)} — {earnings_label(days, session, brief_kind)}\n"
     out += f"_{footer}_\n"
     return out
 
 def render_header(emoji: str, title: str) -> str:
-    now = display_now()
-    ts = now.strftime(f"%A, %B %d • %I:%M %p ET")
+    ts = display_now().strftime("%A, %B %d • %I:%M %p ET")
     return f"{emoji} *{title}*\n🕒 {ts}\n{H_RULE}\n\n"
 
 def render_footer(failed_count: int, total: int, tail: str) -> str:
@@ -572,45 +358,6 @@ def render_footer(failed_count: int, total: int, tail: str) -> str:
         out += f"_⚠️ {failed_count}/{total} tickers failed to fetch._\n"
     out += f"_{tail}_"
     return out
-
-
-# ════════════════════════════════════════════════════════════
-# AUTO-SPLIT
-# ════════════════════════════════════════════════════════════
-
-def split_for_telegram(msg: str, limit: int = TG_MAX_LEN) -> list[str]:
-    """Split on blank-line boundaries; never break mid-section."""
-    if len(msg) <= limit:
-        return [msg]
-    chunks, current = [], ""
-    for block in msg.split("\n\n"):
-        candidate = (current + "\n\n" + block) if current else block
-        if len(candidate) <= limit:
-            current = candidate
-        else:
-            if current:
-                chunks.append(current)
-            # Block itself > limit: hard slice as last resort
-            while len(block) > limit:
-                chunks.append(block[:limit])
-                block = block[limit:]
-            current = block
-    if current:
-        chunks.append(current)
-    # Tag continuations
-    if len(chunks) > 1:
-        chunks = [f"{c}\n\n_(part {i+1}/{len(chunks)})_" if i < len(chunks)-1 else c
-                  for i, c in enumerate(chunks)]
-    return chunks
-
-
-def safe_send(msg: str) -> bool:
-    ok = True
-    for chunk in split_for_telegram(msg):
-        if not send_telegram(chunk, silent=False):
-            ok = False
-            logging.error(f"Telegram send failed for chunk len={len(chunk)}")
-    return ok
 
 
 # ════════════════════════════════════════════════════════════
@@ -632,11 +379,14 @@ def build_morning_brief() -> bool:
 
     earnings_syms = {sym for sym, *_ in data.earnings_soon}
 
-    # Verdicts
+    # Verdicts (earnings_days passed in — no redundant fetch)
     buy_candidates, avoid_list = [], []
     for sym, ctx in data.contexts.items():
         try:
-            verdict, zone, reasons = get_verdict(ctx, data.market_ctx)
+            verdict, zone, reasons = get_verdict(
+                ctx, data.market_ctx,
+                earnings_days=data.earnings_days.get(sym),
+            )
         except Exception as e:
             logging.error(f"verdict {sym}: {e}")
             continue
@@ -647,7 +397,8 @@ def build_morning_brief() -> bool:
     buy_candidates.sort(key=lambda x: x[1].get("rsi", 50))
 
     print("  🤖 Getting AI morning outlook...")
-    ai_outlook = ai_daily_outlook(data.market_ctx, data.sectors, data.gainers + data.losers)
+    ai_outlook = ai_daily_outlook(data.market_ctx, data.sectors,
+                                  data.gainers + data.losers)
 
     # ── compose ──
     msg = render_header("🌅", "MORNING BRIEF")
@@ -665,15 +416,17 @@ def build_morning_brief() -> bool:
     msg += render_sectors(data.sectors, "🌡️ SECTOR PERFORMANCE")
     msg += render_movers(data.gainers, data.losers, "📊 TOP MOVERS")
 
-    # Buy candidates
+    # Buy candidates — with company name + exchange
     msg += f"\n*🎯 BUY ZONE CANDIDATES*\n{SUB_RULE}\n"
     if buy_candidates:
         shown = min(CFG.max_buy_candidates, len(buy_candidates))
         for sym, ctx, _v, zone, reasons in buy_candidates[:shown]:
             try:
                 em = SYMBOL_EMOJI.get(sym, "📊")
-                msg += f"  {em} *{md(sym)}* @ `${ctx['current']:.2f}` — _{md(zone)}_\n"
-                msg += f"     RSI(14) `{ctx.get('rsi', 0):.0f}` • {ctx['day_change_pct']:+.2f}% today\n"
+                msg += f"  {em} {name_label(sym)}\n"
+                msg += (f"     `${ctx['current']:.2f}` — _{md(zone)}_ • "
+                        f"RSI(14) `{ctx.get('rsi', 0):.0f}` • "
+                        f"{ctx['day_change_pct']:+.2f}%\n")
                 if reasons:
                     msg += f"     💡 {md(reasons[0])}\n"
             except Exception as e:
@@ -699,7 +452,7 @@ def build_morning_brief() -> bool:
         "Watch for 🩸 sector bleed, 💪 RS signals, 🎯 dip alerts.",
     )
 
-    ok = safe_send(msg)
+    ok = send_telegram(msg, silent=False)
     print(f"{'✅' if ok else '❌'} Morning brief {'sent' if ok else 'FAILED'} ({len(msg)} chars)")
     logging.info(f"Morning brief done | sent={ok} | chars={len(msg)} "
                  f"| candidates={len(buy_candidates)} | failed_fetch={data.failed_count}")
@@ -764,11 +517,12 @@ def build_evening_brief() -> bool:
                 em      = t.get("emoji", "📈")
                 signal  = t.get("signal", "BUY")
                 dir_em  = "🟢" if signal == "BUY" else "🔴"
-                sym     = md(t.get("symbol", k))
+                sym     = t.get("symbol", k)
                 tf      = md(t.get("tf_label", t.get("tf", "—")))
                 entry   = float(t.get("entry", 0))
                 sl      = float(t.get("sl", 0))
-                msg += f"  {em} {dir_em} *{sym}* `{tf}` @ `${entry:.2f}` — SL `${sl:.2f}`\n"
+                msg += (f"  {em} {dir_em} {name_label(sym)} `{tf}`\n"
+                        f"     @ `${entry:.2f}` — SL `${sl:.2f}`\n")
             except Exception as e:
                 logging.error(f"open trade row {k}: {e}")
         msg += "_Use LIMIT orders in after-hours. Watch for gap risk overnight._\n"
@@ -811,11 +565,131 @@ def build_evening_brief() -> bool:
         "Next morning brief: tomorrow at 9:00 AM ET.",
     )
 
-    ok = safe_send(msg)
+    ok = send_telegram(msg, silent=False)
     print(f"{'✅' if ok else '❌'} Evening brief {'sent' if ok else 'FAILED'} ({len(msg)} chars)")
     logging.info(f"Evening brief done | sent={ok} | chars={len(msg)} "
                  f"| open_trades={len(open_trades)} | failed_fetch={data.failed_count}")
     return ok
+
+
+# ════════════════════════════════════════════════════════════
+# AI — MORNING OUTLOOK + EVENING SUMMARY
+# (kept in this file because prompts are brief-specific)
+# ════════════════════════════════════════════════════════════
+
+import re
+import requests
+from market_intel import SESSION  # reuse pooled session w/ retry
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL   = "gemini-2.0-flash"
+GEMINI_TIMEOUT = 20
+
+_AI_STRIP = re.compile(r"[`*_\[\]()]")
+
+def _sanitize_ai(text: str | None, max_lines: int = 4, max_line_len: int = 140) -> str | None:
+    if not text:
+        return None
+    cleaned = _AI_STRIP.sub("", text).strip()
+    lines = [ln.strip()[:max_line_len] for ln in cleaned.splitlines() if ln.strip()]
+    return "\n".join(lines[:max_lines]) or None
+
+
+def _gemini_call(prompt: str, label: str) -> str | None:
+    if not GEMINI_API_KEY:
+        return None
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
+    try:
+        r = SESSION.post(
+            url,
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.6, "maxOutputTokens": 400},
+            },
+            timeout=GEMINI_TIMEOUT,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            cands = data.get("candidates") or []
+            if cands:
+                return cands[0]["content"]["parts"][0]["text"].strip()
+            logging.warning(f"Gemini {label}: empty candidates")
+        elif r.status_code == 429:
+            logging.warning(f"Gemini rate-limited ({label})")
+        else:
+            logging.error(f"Gemini {label}: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        logging.error(f"AI {label}: {e}")
+    return None
+
+
+def ai_daily_outlook(market_ctx, sector_summary, top_movers) -> str | None:
+    mkt = market_ctx or {}
+    spy = mkt.get("SPY", {}).get("pct", 0)
+    qqq = mkt.get("QQQ", {}).get("pct", 0)
+    vix = mkt.get("^VIX", {}).get("price", 15)
+    sec_lines   = "\n".join(f"  {n}: {a:+.2f}%" for n, a in sector_summary[:6])
+    mover_lines = "\n".join(f"  {m['symbol']}: {m['pct']:+.2f}%" for m in top_movers[:6])
+
+    prompt = f"""You are a senior trading strategist writing the morning brief for an active trader.
+
+TODAY'S PRE-MARKET SNAPSHOT:
+SPY: {spy:+.2f}%, QQQ: {qqq:+.2f}%, VIX: {vix:.1f}
+
+TOP MOVERS (pre-market):
+{mover_lines}
+
+SECTOR PERFORMANCE:
+{sec_lines}
+
+Write EXACTLY 4 lines (max 120 chars each). Be direct and actionable.
+
+🌅 [Setup: risk-on/risk-off/mixed — briefly why]
+🎯 [Which sectors/themes to favor today — be specific with tickers if relevant]
+⚠️ [Main risk / what to avoid — pinpoint it]
+💡 [Bias: trade aggressive / selective / defensive — with size guidance]
+
+NO extra headers, bullets, intros, or outros. 4 lines only."""
+    return _sanitize_ai(_gemini_call(prompt, "morning"))
+
+
+def ai_evening_summary(market_ctx, sector_summary, day_winners, day_losers, open_trades) -> str | None:
+    mkt = market_ctx or {}
+    spy = mkt.get("SPY", {}).get("pct", 0)
+    qqq = mkt.get("QQQ", {}).get("pct", 0)
+    vix = mkt.get("^VIX", {}).get("price", 15)
+    sec_lines    = "\n".join(f"  {n}: {a:+.2f}%" for n, a in sector_summary[:6])
+    winner_lines = "\n".join(f"  {w['symbol']}: {w['pct']:+.2f}%" for w in day_winners[:4]) or "  none"
+    loser_lines  = "\n".join(f"  {l['symbol']}: {l['pct']:+.2f}%" for l in day_losers[:4])  or "  none"
+    trade_lines  = (f"{len(open_trades)} trade(s) still open going into after-hours"
+                    if open_trades else "No open trades")
+
+    prompt = f"""You are a senior trading strategist writing the end-of-day brief for an active trader.
+
+TODAY'S CLOSE:
+SPY: {spy:+.2f}%, QQQ: {qqq:+.2f}%, VIX: {vix:.1f}
+
+DAY LEADERS:
+{winner_lines}
+
+DAY LAGGARDS:
+{loser_lines}
+
+SECTOR CLOSE:
+{sec_lines}
+
+OPEN POSITIONS: {trade_lines}
+
+Write EXACTLY 4 lines (max 120 chars each). Be direct.
+
+🌆 [Day recap: what drove price — sector rotation, macro, momentum?]
+🎯 [What set up well today — note any themes for tomorrow]
+⚠️ [Overnight risk — what to watch AH / pre-market tomorrow]
+💡 [Overnight bias: cautious / hold / reduce — brief reason]
+
+NO extra headers, bullets, intros, or outros. 4 lines only."""
+    return _sanitize_ai(_gemini_call(prompt, "evening"))
 
 
 # ════════════════════════════════════════════════════════════
@@ -824,9 +698,9 @@ def build_evening_brief() -> bool:
 
 @dataclass
 class Job:
-    kind: str                 # 'morning' | 'evening'
+    kind:     str                        # 'morning' | 'evening'
     slot_key: str
-    builder: Callable[[], bool]
+    builder:  Callable[[], bool]
 
 JOBS = {
     "morning": Job("morning", "last_morning_brief", build_morning_brief),
@@ -840,17 +714,15 @@ def decide_job() -> Job | None:
 
 def run_job(job: Job, *, force: bool = False) -> None:
     today = market_now().strftime("%Y-%m-%d")
-    if not force and not claim_slot(job.slot_key, today):
+    if not force and not can_alert(job.slot_key, CFG.slot_cooldown_h):
         print(f"ℹ️  {job.kind.title()} brief already sent today ({today})")
         return
     try:
         ok = job.builder()
-        if not ok and not force:
-            release_slot(job.slot_key)
+        if ok:
+            mark_alert(job.slot_key)        # ← only on confirmed send
     except Exception as e:
         logging.exception(f"{job.kind} brief crashed: {e}")
-        if not force:
-            release_slot(job.slot_key)
 
 
 def setup_logging() -> None:
@@ -860,7 +732,6 @@ def setup_logging() -> None:
     handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    # Avoid duplicate handlers if module is re-imported
     if not any(isinstance(h, TimedRotatingFileHandler) for h in root.handlers):
         root.addHandler(handler)
 
@@ -872,15 +743,11 @@ def setup_logging() -> None:
 if __name__ == "__main__":
     setup_logging()
 
-    force_morning = os.environ.get("FORCE_MORNING", "").lower() in ("true", "1", "yes")
-    force_evening = os.environ.get("FORCE_EVENING", "").lower() in ("true", "1", "yes")
-    force_brief   = os.environ.get("FORCE_BRIEF",   "").lower() in ("true", "1", "yes")
-
-    if force_morning:
+    if CFG.force_morning:
         run_job(JOBS["morning"], force=True)
-    elif force_evening:
+    elif CFG.force_evening:
         run_job(JOBS["evening"], force=True)
-    elif force_brief:
+    elif CFG.force_brief:
         job = decide_job()
         if job:
             run_job(job, force=True)
