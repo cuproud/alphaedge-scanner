@@ -201,11 +201,40 @@ LOGS_DIR.mkdir(exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# §3  UNIVERSE LOADER — reads symbols.yaml (single source of truth)
+# §3  UNIVERSE LOADER — supports v3 `universe:` schema + legacy buckets
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# v3 schema (preferred):
+#   universe:
+#     - { symbol: "NVDA", name: "NVIDIA Corp.", exchange: "NASDAQ",
+#         asset_class: "stock", emoji: "💎", sector: "AI / Semis",
+#         session: "extended", roles: ["intel","brief","dip","scanner"] }
+#   settings:
+#     scanner: { sqs_min_for_alert: 75, grade_filter: "A+ and A" }
+#
+# Legacy schema (still works):
+#   crypto:         [ {symbol, emoji, sector}, ... ]
+#   extended_hours: [ ... ]
+#   regular_hours:  [ ... ]
+#   dip_extras:     [ ... ]
+#
+# Bucket derivation when using v3 schema:
+#   • asset_class == "crypto" or "commodity"   → crypto bucket (24/7 tradable)
+#   • session     == "extended"                 → extended_hours bucket
+#   • else                                       → regular_hours bucket
+#
+# Role filtering when using v3 schema:
+#   • If `roles` is present on any entry, only symbols with role "scanner"
+#     are included in the scanner universe. Symbols with only "dip" / "brief"
+#     are still loaded into emoji_map / sector_map / meta but excluded from
+#     ALL_SYMBOLS, so the signal scanner doesn't fire on dip-only tickers.
+#   • If no entry has `roles`, all symbols are included (backward compat).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Universe:
-    """Loads and exposes symbol/sector config from symbols.yaml."""
+    """Loads and exposes symbol/sector/metadata config from symbols.yaml."""
+
+    _VALID_ROLES = {"intel", "brief", "dip", "scanner"}
 
     def __init__(self, path=SYMBOLS_YAML):
         self.path = Path(path)
@@ -213,69 +242,209 @@ class Universe:
             raise FileNotFoundError(
                 f"{path} not found. Create it (see README) before running."
             )
-        with open(self.path, 'r', encoding='utf-8') as f:
+        with open(self.path, "r", encoding="utf-8") as f:
             self._raw = yaml.safe_load(f) or {}
 
-    def _syms(self, bucket):
-        return [x['symbol'] for x in (self._raw.get(bucket) or [])]
+        # Detect schema
+        self._is_v3 = "universe" in self._raw
+
+        # Normalized buckets / lookups built once at load time
+        self._crypto:          list[str] = []
+        self._extended_hours:  list[str] = []
+        self._regular_hours:   list[str] = []
+        self._dip_extras:      list[str] = []
+        self._emoji:           dict[str, str] = {}
+        self._sector:          dict[str, str] = {}
+        self._meta:            dict[str, dict] = {}   # company name, exchange, etc.
+        self._has_roles_field = False
+        self._problems:        list[str] = []
+
+        if self._is_v3:
+            self._load_v3()
+        else:
+            self._load_legacy()
+
+        # Log issues once at startup
+        for p in self._problems[:10]:
+            logging.warning(f"symbols.yaml: {p}")
+        if len(self._problems) > 10:
+            logging.warning(f"symbols.yaml: +{len(self._problems) - 10} more issues")
+
+    # ── schema loaders ──────────────────────────────────────────────────
+
+    def _load_v3(self) -> None:
+        valid_sectors = set(self._raw.get("sectors_canonical") or [])
+        seen: set[str] = set()
+
+        for item in (self._raw.get("universe") or []):
+            sym = item.get("symbol")
+            if not sym:
+                self._problems.append(f"entry missing symbol: {item}")
+                continue
+            if sym in seen:
+                self._problems.append(f"duplicate symbol: {sym}")
+                continue
+            seen.add(sym)
+
+            sec = item.get("sector", "Other")
+            if valid_sectors and sec not in valid_sectors:
+                self._problems.append(f"{sym}: unknown sector '{sec}'")
+
+            emoji = item.get("emoji", "📈")
+            ac    = item.get("asset_class", "stock")
+            sess  = item.get("session", "regular")
+            roles = set(item.get("roles") or [])
+            if roles:
+                self._has_roles_field = True
+                if not roles.issubset(self._VALID_ROLES):
+                    self._problems.append(
+                        f"{sym}: invalid roles {roles - self._VALID_ROLES}"
+                    )
+
+            self._emoji[sym]  = emoji
+            self._sector[sym] = sec
+            self._meta[sym] = {
+                "name":        item.get("name", sym),
+                "exchange":    item.get("exchange", ""),
+                "asset_class": ac,
+                "session":     sess,
+                "tags":        list(item.get("tags") or []),
+                "roles":       sorted(roles),
+            }
+
+            # Derive bucket
+            if ac in ("crypto", "commodity") or sess == "24h":
+                bucket = self._crypto
+            elif sess == "extended":
+                bucket = self._extended_hours
+            else:
+                bucket = self._regular_hours
+
+            # Role-filtered: scanner universe excludes "dip-only" symbols
+            if (not roles) or ("scanner" in roles):
+                bucket.append(sym)
+            else:
+                # Still expose for emoji/sector/meta, but not in tradable universe
+                self._dip_extras.append(sym)
+
+    def _load_legacy(self) -> None:
+        for bucket_name, target in (
+            ("crypto",         self._crypto),
+            ("extended_hours", self._extended_hours),
+            ("regular_hours",  self._regular_hours),
+            ("dip_extras",     self._dip_extras),
+        ):
+            for item in (self._raw.get(bucket_name) or []):
+                sym = item.get("symbol")
+                if not sym:
+                    self._problems.append(f"entry missing symbol: {item}")
+                    continue
+                target.append(sym)
+                self._emoji[sym]  = item.get("emoji", "📈")
+                self._sector[sym] = item.get("sector", "Other")
+                self._meta[sym]   = {
+                    "name":        item.get("name", sym),
+                    "exchange":    item.get("exchange", ""),
+                    "asset_class": ("crypto" if bucket_name == "crypto" else "stock"),
+                    "session":     ("24h"      if bucket_name == "crypto"
+                                    else "extended" if bucket_name == "extended_hours"
+                                    else "regular"),
+                    "tags":        [],
+                    "roles":       [],
+                }
+
+    # ── public accessors ────────────────────────────────────────────────
 
     @property
-    def crypto(self):         return self._syms('crypto')
+    def crypto(self):         return list(self._crypto)
     @property
-    def extended_hours(self): return self._syms('extended_hours')
+    def extended_hours(self): return list(self._extended_hours)
     @property
-    def regular_hours(self):  return self._syms('regular_hours')
+    def regular_hours(self):  return list(self._regular_hours)
     @property
-    def dip_extras(self):     return self._syms('dip_extras')
+    def dip_extras(self):     return list(self._dip_extras)
+
     @property
-    def all_symbols(self):    return self.crypto + self.extended_hours + self.regular_hours
+    def all_symbols(self):
+        """Symbols tradable by the signal scanner (excludes dip-only entries)."""
+        return self.crypto + self.extended_hours + self.regular_hours
 
     @property
     def emoji_map(self):
-        out = {}
-        for bucket in ('crypto', 'extended_hours', 'regular_hours', 'dip_extras'):
-            for item in (self._raw.get(bucket) or []):
-                out[item['symbol']] = item.get('emoji', '📈')
-        return out
+        return dict(self._emoji)
 
     @property
     def sector_map(self):
-        out = {}
-        for bucket in ('crypto', 'extended_hours', 'regular_hours', 'dip_extras'):
-            for item in (self._raw.get(bucket) or []):
-                out[item['symbol']] = item.get('sector', 'Other')
-        return out
+        return dict(self._sector)
+
+    @property
+    def meta_map(self):
+        """{symbol: {name, exchange, asset_class, session, tags, roles}}."""
+        return {k: dict(v) for k, v in self._meta.items()}
 
     @property
     def correlation_groups(self):
-        """{sector: [symbols]} — only sectors with 2+ core symbols."""
+        """{sector: [symbols]} — only sectors with 2+ scanner-universe symbols."""
         core = set(self.all_symbols)
-        groups = {}
-        for sym, sector in self.sector_map.items():
+        groups: dict[str, list[str]] = {}
+        for sym, sector in self._sector.items():
             if sym in core:
                 groups.setdefault(sector, []).append(sym)
         return {k: v for k, v in groups.items() if len(v) >= 2}
 
-    def setting(self, module, key, default=None):
-        return (self._raw.get('settings') or {}).get(module, {}).get(key, default)
+    def name_of(self, sym: str) -> str:
+        return self._meta.get(sym, {}).get("name", sym)
 
-    def summary(self):
-        return (f"{len(self.all_symbols)} core symbols "
-                f"({len(self.crypto)} crypto, {len(self.extended_hours)} ext-hrs, "
-                f"{len(self.regular_hours)} reg-hrs)")
+    def exchange_of(self, sym: str) -> str:
+        return self._meta.get(sym, {}).get("exchange", "")
+
+    def label(self, sym: str, with_bold: bool = True) -> str:
+        """
+        'AAPL — Apple Inc. (NASDAQ)' if meta available, else just escaped ticker.
+        with_bold=True wraps the ticker in *...*. Caller may want bold off
+        inside table cells / digests.
+        """
+        meta = self._meta.get(sym, {})
+        name = meta.get("name") or ""
+        exch = meta.get("exchange") or ""
+        ticker_safe = str(sym).replace('_', r'\_')
+        ticker = f"*{ticker_safe}*" if with_bold else ticker_safe
+        if name and exch and name != sym:
+            return f"{ticker} — {name} ({exch})"
+        if name and name != sym:
+            return f"{ticker} — {name}"
+        return ticker
+
+    def setting(self, module: str, key: str, default=None):
+        return (self._raw.get("settings") or {}).get(module, {}).get(key, default)
+
+    def summary(self) -> str:
+        schema = "v3 universe" if self._is_v3 else "legacy buckets"
+        return (
+            f"{schema} | {len(self.all_symbols)} scanner symbols "
+            f"({len(self.crypto)} crypto, {len(self.extended_hours)} ext-hrs, "
+            f"{len(self.regular_hours)} reg-hrs, "
+            f"+{len(self.dip_extras)} non-scanner)"
+        )
 
 
+# Load universe once at import time
 U = Universe()
-CRYPTO_WATCHLIST = U.crypto
-EXTENDED_HOURS_STOCKS = U.extended_hours
-REGULAR_HOURS_ONLY = U.regular_hours
-ALL_SYMBOLS = U.all_symbols
-SYMBOL_EMOJI = U.emoji_map
-CORRELATION_GROUPS = U.correlation_groups
+CRYPTO_WATCHLIST       = U.crypto
+EXTENDED_HOURS_STOCKS  = U.extended_hours
+REGULAR_HOURS_ONLY     = U.regular_hours
+ALL_SYMBOLS            = U.all_symbols
+SYMBOL_EMOJI           = U.emoji_map
+SYMBOL_SECTOR          = U.sector_map     # legacy alias used downstream
+SYMBOL_META            = U.meta_map        # NEW — exposes name/exchange/etc.
+CORRELATION_GROUPS     = U.correlation_groups
 
 # Allow YAML to override config defaults
 SQS_BASE_THRESHOLD = U.setting('scanner', 'sqs_min_for_alert', SQS_BASE_THRESHOLD)
-GRADE_FILTER = U.setting('scanner', 'grade_filter', GRADE_FILTER)
+GRADE_FILTER       = U.setting('scanner', 'grade_filter',      GRADE_FILTER)
+
+logging.info(f"scanner: universe loaded — {U.summary()}")
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -325,6 +494,11 @@ def get_session():
     return "🌑 Overnight"
 
 def is_crypto(sym):
+    """Prefer YAML-declared asset_class; fall back to suffix heuristic."""
+    meta = SYMBOL_META.get(sym, {})
+    ac = meta.get("asset_class")
+    if ac in ("crypto", "commodity"):
+        return True
     return sym.endswith('-USD') or sym == 'GC=F'
 
 def is_extended_hours_session():
@@ -332,7 +506,6 @@ def is_extended_hours_session():
 
 def is_regular_market_open():
     return get_session() in ('🔔 Market Open', '📊 Midday', '⚡ Power Hour')
-
 def get_active_watchlist():
     """Return only symbols tradable in current session."""
     s = get_session()
@@ -502,6 +675,13 @@ def md_escape(text):
 def safe_sym(sym):
     """Symbols like BRK.B or GC=F — just escape underscores."""
     return str(sym).replace('_', r'\_')
+
+def sym_label(sym, with_bold=True):
+    """
+    Convenience wrapper around U.label() so the rest of the file can render
+    'AAPL — Apple Inc. (NASDAQ)' without importing Universe everywhere.
+    """
+    return U.label(sym, with_bold=with_bold)
 
 def fmt_price(val, decimals=2):
     try:
@@ -1057,6 +1237,7 @@ def get_daily_close(sym):
         return None
 
 def sanity_check_price(sym, live, daily_close=None):
+    """Reject if live and daily disagree by > PRICE_SANITY_DEVIATION."""
     daily = daily_close if daily_close is not None else get_daily_close(sym)
     if daily is None or daily <= 0:
         return True
@@ -1087,10 +1268,10 @@ def get_htf_bias(symbol):
 def get_mtf_score(symbol, tf_str):
     """Returns 0-3 bull score for a single TF."""
     tf_map = {
-        '15m': ('5d', '15m'),
+        '15m': ('5d',  '15m'),
         '1h':  ('3mo', '1h'),
         '4h':  ('6mo', '1h'),
-        '1d':  ('2y', '1d'),
+        '1d':  ('2y',  '1d'),
     }
     if tf_str not in tf_map:
         return 0
@@ -1107,10 +1288,10 @@ def get_mtf_score(symbol, tf_str):
             }).dropna()
         if len(df) < 50:
             return 0
-        e50 = ema(df['Close'], 50).iloc[-2]
+        e50  = ema(df['Close'], 50).iloc[-2]
         e200 = ema(df['Close'], min(200, len(df))).iloc[-2]
-        rsi = pine_rsi(df['Close'], RSI_LEN).iloc[-2]
-        c = df['Close'].iloc[-2]
+        rsi  = pine_rsi(df['Close'], RSI_LEN).iloc[-2]
+        c    = df['Close'].iloc[-2]
         score = 0
         if e50 > e200: score += 1
         if rsi > 50:   score += 1
@@ -1122,6 +1303,7 @@ def get_mtf_score(symbol, tf_str):
 
 def get_mtf_sum(symbol):
     return sum(get_mtf_score(symbol, tf) for tf in MTF_FRAMES)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # §14  SIGNAL ANALYSIS ENGINE — Pine parity + all bug fixes
@@ -1135,56 +1317,59 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
     ✅ FIX: Flip detection looks at last 2 bars (catches recent flips).
     ✅ FIX: rsi_bull / rsi_bear mutually exclusive.
     ✅ FIX: Single data fetch per call.
+    ✅ FIX: Renamed POC `lookback` → `poc_lookback` (no longer shadows tf_config['lookback']).
+    ✅ NEW: Result dict carries name/exchange/sector/label from SYMBOL_META so
+            §17 alert builders can render 'AAPL — Apple Inc. (NASDAQ)' headers.
 
     Returns: (result_dict, reason_or_None)
     """
-    tf = tf_config['tf']
-    lookback = tf_config['lookback']
-    min_bars = tf_config['min_bars']
+    tf            = tf_config['tf']
+    tf_lookback   = tf_config['lookback']           # ← renamed to avoid shadowing
+    min_bars      = tf_config['min_bars']
 
     try:
-        df = yf.download(symbol, period=lookback, interval=tf,
+        df = yf.download(symbol, period=tf_lookback, interval=tf,
                          progress=False, auto_adjust=True)
         if df.empty or len(df) < min_bars:
             return None, "insufficient data"
         df = _clean_df(df)
 
         # ─── Indicators ───
-        df['ema20'] = ema(df['Close'], 20)
-        df['ema50'] = ema(df['Close'], 50)
+        df['ema20']  = ema(df['Close'], 20)
+        df['ema50']  = ema(df['Close'], 50)
         df['ema200'] = ema(df['Close'], min(200, len(df)))
-        df['rsi'] = pine_rsi(df['Close'], RSI_LEN)
-        df['atr'] = pine_atr(df, ATR_LEN)
+        df['rsi']    = pine_rsi(df['Close'], RSI_LEN)
+        df['atr']    = pine_atr(df, ATR_LEN)
         df['macd'], df['signal'] = pine_macd(df['Close'], MACD_FAST, MACD_SLOW, MACD_SIG)
         df['adx'], df['plus_di'], df['minus_di'] = pine_adx(df, ADX_LEN)
         st_trend, _, _ = pine_supertrend(df, ST_PERIODS, ST_MULT)
-        df['st'] = st_trend
-        df['vwap'] = pine_vwap(df)
+        df['st']      = st_trend
+        df['vwap']    = pine_vwap(df)
         df['vol_avg'] = sma(df['Volume'], 20)
 
         # BB/KC Squeeze
         bb_basis = sma(df['Close'], 20)
-        bb_dev = df['Close'].rolling(20).std()
-        bb_up = bb_basis + SQ_BB_MULT * bb_dev
-        bb_lo = bb_basis - SQ_BB_MULT * bb_dev
-        kc_mid = ema(df['Close'], 20)
-        kc_rng = pine_atr(df, 20)
-        kc_up = kc_mid + SQ_KC_MULT * kc_rng
-        kc_lo = kc_mid - SQ_KC_MULT * kc_rng
-        in_squeeze = (bb_up < kc_up) & (bb_lo > kc_lo)
-        sqz_fired = in_squeeze.shift(1).fillna(False) & ~in_squeeze
+        bb_dev   = df['Close'].rolling(20).std()
+        bb_up    = bb_basis + SQ_BB_MULT * bb_dev
+        bb_lo    = bb_basis - SQ_BB_MULT * bb_dev
+        kc_mid   = ema(df['Close'], 20)
+        kc_rng   = pine_atr(df, 20)
+        kc_up    = kc_mid + SQ_KC_MULT * kc_rng
+        kc_lo    = kc_mid - SQ_KC_MULT * kc_rng
+        in_squeeze     = (bb_up < kc_up) & (bb_lo > kc_lo)
+        sqz_fired      = in_squeeze.shift(1).fillna(False) & ~in_squeeze
         sqz_bull_break = sqz_fired & (df['Close'] > bb_basis)
         sqz_bear_break = sqz_fired & (df['Close'] < bb_basis)
 
         # AE Range Filter (volume-driven, Pine parity)
-        srng = smooth_range(df['Close'], AE_LENGTH, 3)
-        basetype = range_filter(df['Close'], df['Volume'], srng)
-        hband = basetype + srng
-        lowband = basetype - srng
-        uprng_raw = trend_up_value(basetype)
-        df['hband'] = hband
+        srng       = smooth_range(df['Close'], AE_LENGTH, 3)
+        basetype   = range_filter(df['Close'], df['Volume'], srng)
+        hband      = basetype + srng
+        lowband    = basetype - srng
+        uprng_raw  = trend_up_value(basetype)
+        df['hband']   = hband
         df['lowband'] = lowband
-        df['uprng'] = uprng_raw > 0
+        df['uprng']   = uprng_raw > 0
 
         # ═══ USE LAST CLOSED BAR FOR SIGNALS (v7.0 fix) ═══
         if len(df) < 4:
@@ -1194,30 +1379,30 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
         bar2 = df.iloc[-4]       # for flip detection window
 
         bar_price = float(last['Close'])
-        atr_val = float(last['atr'])
+        atr_val   = float(last['atr'])
         if atr_val <= 0 or pd.isna(atr_val):
             return None, "invalid ATR"
 
-        rsi_val = float(last['rsi'])
-        adx_val = float(last['adx'])
-        ema50_v = float(last['ema50'])
-        ema200_v = float(last['ema200'])
-        uprng = bool(last['uprng'])
-        st_now = int(last['st'])
-        vwap_v = float(last['vwap'])
-        plus_di = float(last['plus_di'])
-        minus_di = float(last['minus_di'])
+        rsi_val   = float(last['rsi'])
+        adx_val   = float(last['adx'])
+        ema50_v   = float(last['ema50'])
+        ema200_v  = float(last['ema200'])
+        uprng     = bool(last['uprng'])
+        st_now    = int(last['st'])
+        vwap_v    = float(last['vwap'])
+        plus_di   = float(last['plus_di'])
+        minus_di  = float(last['minus_di'])
 
         # ─── RSI Divergence (simplified) ───
         rsi_bull_div = False
         rsi_bear_div = False
         if USE_RSI_DIV and len(df) > RSI_DIV_LOOK * 3:
             try:
-                lows = df['Low'].iloc[-RSI_DIV_LOOK * 3:-RSI_DIV_LOOK]
+                lows     = df['Low'].iloc[-RSI_DIV_LOOK * 3:-RSI_DIV_LOOK]
                 rsi_lows = df['rsi'].iloc[-RSI_DIV_LOOK * 3:-RSI_DIV_LOOK]
                 if len(lows) > 2 and lows.iloc[-1] < lows.iloc[0] and rsi_lows.iloc[-1] > rsi_lows.iloc[0]:
                     rsi_bull_div = rsi_val >= RSI_DIV_FLOOR
-                highs = df['High'].iloc[-RSI_DIV_LOOK * 3:-RSI_DIV_LOOK]
+                highs     = df['High'].iloc[-RSI_DIV_LOOK * 3:-RSI_DIV_LOOK]
                 rsi_highs = df['rsi'].iloc[-RSI_DIV_LOOK * 3:-RSI_DIV_LOOK]
                 if len(highs) > 2 and highs.iloc[-1] > highs.iloc[0] and rsi_highs.iloc[-1] < rsi_highs.iloc[0]:
                     rsi_bear_div = rsi_val <= RSI_BEAR_CEIL
@@ -1238,7 +1423,7 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
             rsi_bull, rsi_bear = False, True
 
         macd_bull = last['macd'] > last['signal']
-        ema_bull = ema50_v > ema200_v
+        ema_bull  = ema50_v > ema200_v
 
         # ─── Confluence (9 points total) ───
         bull = 0
@@ -1264,8 +1449,8 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
         bear += 1 if bool(sqz_bear_break.iloc[-2]) else 0
 
         # ─── Triggers ───
-        prev_close = float(prev['Close'])
-        prev_hband = float(prev['hband'])
+        prev_close   = float(prev['Close'])
+        prev_hband   = float(prev['hband'])
         prev_lowband = float(prev['lowband'])
         cross_up = prev_close <= prev_hband and bar_price > float(last['hband'])
         cross_dn = prev_close >= prev_lowband and bar_price < float(last['lowband'])
@@ -1282,19 +1467,19 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
         adx_pass_bear = (adx_val > ADX_GATE_LEVEL) or (bear >= ADX_BYPASS_MIN)
 
         htf_st_both_bear = (htf_bull is False) and (st_now == -1)
-        htf_st_both_bull = (htf_bull is True) and (st_now == 1)
-        ct_buy = USE_COUNTER_TREND_BLOCK and bull < 6 and htf_st_both_bear
+        htf_st_both_bull = (htf_bull is True)  and (st_now == 1)
+        ct_buy  = USE_COUNTER_TREND_BLOCK and bull < 6 and htf_st_both_bear
         ct_sell = USE_COUNTER_TREND_BLOCK and bear < 6 and htf_st_both_bull
 
         mtf_block_sell = USE_MTF_GATE and mtf_sum >= MTF_GATE_BULL
-        mtf_block_buy = USE_MTF_GATE and mtf_sum <= MTF_GATE_BEAR
+        mtf_block_buy  = USE_MTF_GATE and mtf_sum <= MTF_GATE_BEAR
 
         # Chop filter
         chop_ok = True
         if USE_CHOP_FILTER and last_signal_info:
             try:
                 prev_price = last_signal_info.get('price')
-                prev_atr = last_signal_info.get('atr', atr_val)
+                prev_atr   = last_signal_info.get('atr', atr_val)
                 if prev_price and prev_atr:
                     if abs(bar_price - prev_price) < prev_atr * CHOP_ATR_MULT:
                         chop_ok = False
@@ -1312,7 +1497,7 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
         # Resolve conflicts
         if raw_buy and raw_sell:
             if bull >= bear: raw_sell = False
-            else: raw_buy = False
+            else:            raw_buy  = False
 
         if not raw_buy and not raw_sell:
             if bull >= 7 and not trigger_bull: return None, f"bull={bull} no trigger"
@@ -1325,7 +1510,7 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
             return None, None
 
         signal = 'BUY' if raw_buy else 'SELL'
-        score = bull if raw_buy else bear
+        score  = bull if raw_buy else bear
 
         # ═══ v7.0 FEATURE: VIX blocks longs in panic ═══
         vix_blocked, vix_reason = vix_blocks(signal)
@@ -1334,22 +1519,22 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
 
         # ─── SQS calc ───
         def calc_sqs(is_bull):
-            sc = bull if is_bull else bear
+            sc       = bull if is_bull else bear
             conf_pct = sc / 9 * 40   # /9 since we have 9 confluence points
-            mtf_pct = (mtf_sum / 12 * 25) if is_bull else ((12 - mtf_sum) / 12 * 25)
-            if adx_val >= REGIME_ADX_TREND: reg_pct = 15.0
-            elif adx_val < REGIME_ADX_RANGE: reg_pct = 5.0
-            else: reg_pct = 8.0
+            mtf_pct  = (mtf_sum / 12 * 25) if is_bull else ((12 - mtf_sum) / 12 * 25)
+            if   adx_val >= REGIME_ADX_TREND: reg_pct = 15.0
+            elif adx_val <  REGIME_ADX_RANGE: reg_pct = 5.0
+            else:                              reg_pct = 8.0
             vol_avg_v = float(last['vol_avg']) if not pd.isna(last['vol_avg']) else 1
-            cur_vol = float(last['Volume'])
-            if cur_vol > vol_avg_v * 1.5: vol_pct = 10.0
-            elif cur_vol > vol_avg_v: vol_pct = 6.0
-            else: vol_pct = 3.0
-            atr_avg = df['atr'].rolling(50).mean().iloc[-2]
+            cur_vol   = float(last['Volume'])
+            if   cur_vol > vol_avg_v * 1.5: vol_pct = 10.0
+            elif cur_vol > vol_avg_v:       vol_pct = 6.0
+            else:                            vol_pct = 3.0
+            atr_avg   = df['atr'].rolling(50).mean().iloc[-2]
             vol_ratio = atr_val / atr_avg if atr_avg and atr_avg > 0 else 1.0
-            if 0.8 <= vol_ratio <= 1.5: volat_pct = 10.0
+            if   0.8 <= vol_ratio <= 1.5: volat_pct = 10.0
             elif 0.6 <= vol_ratio <= 2.0: volat_pct = 7.0
-            else: volat_pct = 3.0
+            else:                          volat_pct = 3.0
             return min(100, conf_pct + mtf_pct + reg_pct + vol_pct + volat_pct)
 
         sqs = calc_sqs(raw_buy)
@@ -1359,21 +1544,21 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
             return None, f"SQS {sqs:.0f} < {effective_threshold}"
 
         # ─── Live price & sanity ───
-        live_price = get_real_time_price(symbol)
+        live_price  = get_real_time_price(symbol)
         entry_price = live_price if live_price else bar_price
         daily_close = get_daily_close(symbol)
         if live_price and not sanity_check_price(symbol, live_price, daily_close):
             return None, f"bad data (live=${live_price:.2f})"
 
         # ─── SL/TP ───
-        recent_low = float(df['Low'].iloc[-SWING_LOOKBACK - 1:-1].min())
+        recent_low  = float(df['Low'].iloc[-SWING_LOOKBACK - 1:-1].min())
         recent_high = float(df['High'].iloc[-SWING_LOOKBACK - 1:-1].max())
-        max_sl_pct = MAX_SL_PCT_CRYPTO if is_crypto(symbol) else MAX_SL_PCT_STOCKS
-        min_sl_pct = MIN_SL_PCT_CRYPTO if is_crypto(symbol) else MIN_SL_PCT_STOCKS
+        max_sl_pct  = MAX_SL_PCT_CRYPTO if is_crypto(symbol) else MAX_SL_PCT_STOCKS
+        min_sl_pct  = MIN_SL_PCT_CRYPTO if is_crypto(symbol) else MIN_SL_PCT_STOCKS
 
         if signal == 'BUY':
-            atr_sl = entry_price - atr_val * SL_MULT
-            struct_sl = recent_low - atr_val * STRUCT_BUFFER
+            atr_sl    = entry_price - atr_val * SL_MULT
+            struct_sl = recent_low  - atr_val * STRUCT_BUFFER
             sl = max(atr_sl, struct_sl)
             min_dist = atr_val * MIN_SL_DIST
             if (entry_price - sl) < min_dist:
@@ -1387,7 +1572,7 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
             tp2 = entry_price + risk * TP2_MULT
             tp3 = entry_price + risk * TP3_MULT
         else:
-            atr_sl = entry_price + atr_val * SL_MULT
+            atr_sl    = entry_price + atr_val * SL_MULT
             struct_sl = recent_high + atr_val * STRUCT_BUFFER
             sl = min(atr_sl, struct_sl)
             min_dist = atr_val * MIN_SL_DIST
@@ -1404,28 +1589,30 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
 
         # ─── Nearby levels ───
         nearby_high = float(df['High'].iloc[-60:].max())
-        nearby_low = float(df['Low'].iloc[-60:].min())
+        nearby_low  = float(df['Low'].iloc[-60:].min())
         nearby = {
             'resistance': nearby_high if bar_price < nearby_high else None,
-            'support':    nearby_low if bar_price > nearby_low else None,
+            'support':    nearby_low  if bar_price > nearby_low  else None,
             'ema50':      ema50_v,
             'ema200':     ema200_v,
         }
 
         # ─── v7.0 FEATURE: POC ───
-        lookback = 260 if tf == '30m' else 130
-        poc_data = compute_poc(df, bins=30, lookback_bars=lookback)
+        # ✅ FIX: renamed local `lookback` → `poc_lookback` so we don't
+        #         shadow tf_config['lookback'] (which is now `tf_lookback`).
+        poc_lookback = 260 if tf == '30m' else 130
+        poc_data = compute_poc(df, bins=30, lookback_bars=poc_lookback)
 
         # ─── Meta ───
         tf_minutes = 30 if tf == '30m' else 60
-        expiry = now_est() + timedelta(minutes=tf_minutes * 2)
-        decimals = 4 if entry_price < 10 else 2
+        expiry     = now_est() + timedelta(minutes=tf_minutes * 2)
+        decimals   = 4 if entry_price < 10 else 2
 
-        if adx_val >= REGIME_ADX_TREND: regime = 'TRENDING'
-        elif adx_val < REGIME_ADX_RANGE: regime = 'RANGING'
-        else: regime = 'TRANSITIONAL'
+        if   adx_val >= REGIME_ADX_TREND: regime = 'TRENDING'
+        elif adx_val <  REGIME_ADX_RANGE: regime = 'RANGING'
+        else:                              regime = 'TRANSITIONAL'
 
-        if flip_bull:   trigger_type = "AE Flip Bullish"
+        if   flip_bull: trigger_type = "AE Flip Bullish"
         elif flip_bear: trigger_type = "AE Flip Bearish"
         elif cross_up:  trigger_type = "Breakout Above Band"
         elif cross_dn:  trigger_type = "Breakdown Below Band"
@@ -1438,80 +1625,94 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
             strong_trend = (not ema_bull and bar_price < ema50_v and
                             22 < adx_val < 55 and minus_di > plus_di)
 
+        # ─── v7.0 NEW: YAML metadata for richer alert headers ───
+        meta = SYMBOL_META.get(symbol, {})
+
         return {
-            'symbol': symbol,
-            'emoji': SYMBOL_EMOJI.get(symbol, '📈'),
-            'signal': signal,
-            'price': round(entry_price, decimals),
-            'bar_price': round(bar_price, decimals),
-            'atr': round(atr_val, decimals),
-            'score': int(score),
-            'grade': grade_label(score),
-            'sqs': round(sqs),
-            'tier': tier_label(sqs),
-            'trigger': trigger_type,
-            'sl': round(sl, decimals),
-            'sl_pct': round(abs(sl - entry_price) / entry_price * 100, 2),
-            'tp1': round(tp1, decimals),
-            'tp2': round(tp2, decimals),
-            'tp3': round(tp3, decimals),
-            'risk': round(risk, decimals),
-            'rsi': round(rsi_val, 1),
-            'adx': round(adx_val, 1),
-            'stretch': round(abs(bar_price - ema50_v) / atr_val, 1),
-            'regime': regime,
-            'timeframe': tf,
-            'tf_label': tf_config['label'],
-            'session': get_session(),
-            'decimals': decimals,
-            'strong_trend': bool(strong_trend),
-            'is_crypto': is_crypto(symbol),
+            'symbol':        symbol,
+            'name':          meta.get('name', symbol),            # NEW
+            'exchange':      meta.get('exchange', ''),            # NEW
+            'sector':        SYMBOL_SECTOR.get(symbol, 'Other'),  # NEW
+            'asset_class':   meta.get('asset_class', 'stock'),    # NEW
+            'label':         sym_label(symbol, with_bold=True),   # NEW pre-rendered
+            'emoji':         SYMBOL_EMOJI.get(symbol, '📈'),
+            'signal':        signal,
+            'price':         round(entry_price, decimals),
+            'bar_price':     round(bar_price, decimals),
+            'atr':           round(atr_val, decimals),
+            'score':         int(score),
+            'grade':         grade_label(score),
+            'sqs':           round(sqs),
+            'tier':          tier_label(sqs),
+            'trigger':       trigger_type,
+            'sl':            round(sl, decimals),
+            'sl_pct':        round(abs(sl - entry_price) / entry_price * 100, 2),
+            'tp1':           round(tp1, decimals),
+            'tp2':           round(tp2, decimals),
+            'tp3':           round(tp3, decimals),
+            'risk':          round(risk, decimals),
+            'rsi':           round(rsi_val, 1),
+            'adx':           round(adx_val, 1),
+            'stretch':       round(abs(bar_price - ema50_v) / atr_val, 1),
+            'regime':        regime,
+            'timeframe':     tf,
+            'tf_label':      tf_config['label'],
+            'session':       get_session(),
+            'decimals':      decimals,
+            'strong_trend':  bool(strong_trend),
+            'is_crypto':     is_crypto(symbol),
             'is_extended_hours': is_extended_hours_session() and not is_crypto(symbol),
-            'mtf_sum': mtf_sum,
-            'htf_bull': htf_bull,
-            'nearby': nearby,
-            'poc_data': poc_data,
-            'expiry_time': expiry.isoformat(),
+            'mtf_sum':       mtf_sum,
+            'htf_bull':      htf_bull,
+            'nearby':        nearby,
+            'poc_data':      poc_data,
+            'expiry_time':   expiry.isoformat(),
             'effective_threshold': effective_threshold,
         }, None
 
     except Exception as e:
         logging.error(f"{symbol} [{tf}]: {e}")
         return None, f"error: {e}"
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # §15  TRADE TRACKING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def create_trade(sig):
+    """Snapshot a trade from a signal. Captures YAML metadata so later alerts
+    keep showing the company name + exchange even if symbols.yaml is edited."""
     return {
-        'symbol': sig['symbol'],
-        'emoji': sig['emoji'],
-        'signal': sig['signal'],
-        'entry': sig['price'],
-        'sl': sig['sl'],
-        'tp1': sig['tp1'],
-        'tp2': sig['tp2'],
-        'tp3': sig['tp3'],
-        'risk': sig['risk'],
-        'atr_at_entry': sig.get('atr'),
-        'decimals': sig['decimals'],
-        'grade': sig['grade'],
-        'sqs': sig['sqs'],
-        'tier': sig['tier'],
-        'tf': sig['timeframe'],
-        'tf_label': sig['tf_label'],
-        'trigger': sig.get('trigger'),
+        'symbol':           sig['symbol'],
+        'name':             sig.get('name', sig['symbol']),       # NEW
+        'exchange':         sig.get('exchange', ''),              # NEW
+        'sector':           sig.get('sector', 'Other'),           # NEW
+        'label':            sig.get('label', safe_sym(sig['symbol'])),  # NEW pre-rendered
+        'emoji':            sig['emoji'],
+        'signal':           sig['signal'],
+        'entry':            sig['price'],
+        'sl':               sig['sl'],
+        'tp1':              sig['tp1'],
+        'tp2':              sig['tp2'],
+        'tp3':              sig['tp3'],
+        'risk':             sig['risk'],
+        'atr_at_entry':     sig.get('atr'),
+        'decimals':         sig['decimals'],
+        'grade':            sig['grade'],
+        'sqs':              sig['sqs'],
+        'tier':             sig['tier'],
+        'tf':               sig['timeframe'],
+        'tf_label':         sig['tf_label'],
+        'trigger':          sig.get('trigger'),
         'ai_text_at_entry': sig.get('ai_text'),
-        'opened_at': now_est().isoformat(),
-        'opened_session': sig['session'],
-        'mtf_sum': sig.get('mtf_sum'),
-        'htf_bull': sig.get('htf_bull'),
+        'opened_at':        now_est().isoformat(),
+        'opened_session':   sig['session'],
+        'mtf_sum':          sig.get('mtf_sum'),
+        'htf_bull':         sig.get('htf_bull'),
         'tp1_hit': False, 'tp2_hit': False, 'tp3_hit': False,
         'tp1_hit_at': None, 'tp2_hit_at': None, 'tp3_hit_at': None,
-        'closed': False, 'closed_reason': None,
-        'closed_at': None, 'final_r': None,
+        'closed':        False,
+        'closed_reason': None,
+        'closed_at':     None,
+        'final_r':       None,
     }
 
 def check_trade_progress(trade):
@@ -1520,7 +1721,7 @@ def check_trade_progress(trade):
     if not live:
         return [], False
     current, _, _ = live
-    events = []
+    events  = []
     is_long = trade['signal'] == 'BUY'
 
     # Timeout
@@ -1529,10 +1730,10 @@ def check_trade_progress(trade):
         if opened.tzinfo is None:
             opened = opened.replace(tzinfo=EST)
         if now_est() - opened > timedelta(hours=MAX_TRADE_AGE_HOURS):
-            trade['closed'] = True
+            trade['closed']        = True
             trade['closed_reason'] = 'Timeout (72h)'
-            trade['closed_at'] = now_est().isoformat()
-            trade['final_r'] = 0
+            trade['closed_at']     = now_est().isoformat()
+            trade['final_r']       = 0
             events.append({'type': 'TIMEOUT', 'price': current})
             return events, True
     except Exception:
@@ -1541,48 +1742,48 @@ def check_trade_progress(trade):
     # SL
     sl_hit = (is_long and current <= trade['sl']) or (not is_long and current >= trade['sl'])
     if sl_hit:
-        trade['closed'] = True
+        trade['closed']        = True
         trade['closed_reason'] = 'SL Hit'
-        trade['closed_at'] = now_est().isoformat()
-        trade['final_r'] = 0 if trade['tp1_hit'] else -1
+        trade['closed_at']     = now_est().isoformat()
+        trade['final_r']       = 0 if trade['tp1_hit'] else -1
         events.append({'type': 'SL', 'price': trade['sl']})
         return events, True
 
     # TPs
     if is_long:
         if not trade['tp1_hit'] and current >= trade['tp1']:
-            trade['tp1_hit'] = True
+            trade['tp1_hit']    = True
             trade['tp1_hit_at'] = now_est().isoformat()
             events.append({'type': 'TP1', 'price': trade['tp1']})
         if not trade['tp2_hit'] and current >= trade['tp2']:
-            trade['tp2_hit'] = True
+            trade['tp2_hit']    = True
             trade['tp2_hit_at'] = now_est().isoformat()
             events.append({'type': 'TP2', 'price': trade['tp2']})
         if not trade['tp3_hit'] and current >= trade['tp3']:
-            trade['tp3_hit'] = True
-            trade['tp3_hit_at'] = now_est().isoformat()
-            trade['closed'] = True
+            trade['tp3_hit']       = True
+            trade['tp3_hit_at']    = now_est().isoformat()
+            trade['closed']        = True
             trade['closed_reason'] = 'TP3 Hit'
-            trade['closed_at'] = now_est().isoformat()
-            trade['final_r'] = 3
+            trade['closed_at']     = now_est().isoformat()
+            trade['final_r']       = 3
             events.append({'type': 'TP3', 'price': trade['tp3']})
             return events, True
     else:
         if not trade['tp1_hit'] and current <= trade['tp1']:
-            trade['tp1_hit'] = True
+            trade['tp1_hit']    = True
             trade['tp1_hit_at'] = now_est().isoformat()
             events.append({'type': 'TP1', 'price': trade['tp1']})
         if not trade['tp2_hit'] and current <= trade['tp2']:
-            trade['tp2_hit'] = True
+            trade['tp2_hit']    = True
             trade['tp2_hit_at'] = now_est().isoformat()
             events.append({'type': 'TP2', 'price': trade['tp2']})
         if not trade['tp3_hit'] and current <= trade['tp3']:
-            trade['tp3_hit'] = True
-            trade['tp3_hit_at'] = now_est().isoformat()
-            trade['closed'] = True
+            trade['tp3_hit']       = True
+            trade['tp3_hit_at']    = now_est().isoformat()
+            trade['closed']        = True
             trade['closed_reason'] = 'TP3 Hit'
-            trade['closed_at'] = now_est().isoformat()
-            trade['final_r'] = 3
+            trade['closed_at']     = now_est().isoformat()
+            trade['final_r']       = 3
             events.append({'type': 'TP3', 'price': trade['tp3']})
             return events, True
 
@@ -1601,6 +1802,10 @@ def archive_trade(trade):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_ai_analysis(sig):
+    """
+    Gemini analysis with company-name + sector context in the prompt
+    (so AI knows it's analyzing 'NVIDIA Corp. — AI / Semis', not just 'NVDA').
+    """
     if not GEMINI_API_KEY:
         return None
 
@@ -1608,9 +1813,17 @@ def get_ai_analysis(sig):
     if sig.get('is_extended_hours'):
         ah_note = "\nNOTE: After-hours/pre-market signal — liquidity thin."
 
+    # ── NEW: enrich prompt with YAML metadata ──
+    company_line = sig['symbol']
+    name = sig.get('name')
+    if name and name != sig['symbol']:
+        company_line = f"{sig['symbol']} ({name})"
+    sector = sig.get('sector')
+    sector_line = f"\nSECTOR: {sector}" if sector and sector != 'Other' else ""
+
     prompt = f"""Analyze this trading signal in EXACTLY 3 short lines (max 100 chars each).
 
-SYMBOL: {sig['symbol']} ({sig['signal']} @ ${sig['price']})
+SYMBOL: {company_line} ({sig['signal']} @ ${sig['price']}){sector_line}
 TF: {sig['timeframe']} | Trigger: {sig['trigger']}
 Score: {sig['score']}/9 ({sig['grade']}) | SQS: {sig['sqs']}/100
 RSI: {sig['rsi']} | ADX: {sig['adx']} | Regime: {sig['regime']}
@@ -1622,11 +1835,12 @@ Respond EXACTLY (no extra lines):
 ⚠️ [main risk]
 💡 [STRONG BUY/BUY/NEUTRAL/CAUTION/AVOID] — [brief reason]"""
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}")
     try:
         r = requests.post(url, json={
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.6, "maxOutputTokens": 200}
+            "generationConfig": {"temperature": 0.6, "maxOutputTokens": 200},
         }, timeout=15)
         if r.status_code == 200:
             data = r.json()
@@ -1642,15 +1856,15 @@ Respond EXACTLY (no extra lines):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def price_ladder(trade, current):
-    d = trade['decimals']
+    d       = trade['decimals']
     is_long = trade['signal'] == 'BUY'
     levels = [
-        ('TP3', trade['tp3'], '🎯', trade['tp3_hit']),
-        ('TP2', trade['tp2'], '🎯', trade['tp2_hit']),
-        ('TP1', trade['tp1'], '🎯', trade['tp1_hit']),
-        ('NOW', current, '⬅️', None),
+        ('TP3', trade['tp3'],   '🎯', trade['tp3_hit']),
+        ('TP2', trade['tp2'],   '🎯', trade['tp2_hit']),
+        ('TP1', trade['tp1'],   '🎯', trade['tp1_hit']),
+        ('NOW', current,        '⬅️', None),
         ('Ent', trade['entry'], '📍', None),
-        ('SL ', trade['sl'], '🛑', None),
+        ('SL ', trade['sl'],    '🛑', None),
     ]
     levels.sort(key=lambda x: -x[1] if is_long else x[1])
     lines = []
@@ -1672,154 +1886,221 @@ def get_session_tips(session, is_crypto_signal):
     }
     return tips.get(session)
 
+# ── §17 ── REPLACE the existing format_new_signal() with this ──────────────────
+
+def _header_block(sig):
+    """
+    Clean, heading-style header block:
+
+        🚨🔥 ELITE BUY SIGNAL
+        ━━━━━━━━━━━━━━━━━━━━━
+        💎 NVDA — NVIDIA Corp.
+        🏷️ AI / Semis · NASDAQ
+        ⏰ ⚡30m · 🔔 Market Open
+        🕒 Fri Nov 15 · 09:45 AM ET
+        ━━━━━━━━━━━━━━━━━━━━━
+    """
+    sym_em       = sig.get('emoji', '📈')
+    sym_safe     = safe_sym(sig['symbol'])
+    name         = sig.get('name', '') or ''
+    exch         = sig.get('exchange', '') or ''
+    sector       = sig.get('sector', '') or ''
+    direction    = sig['signal']  # BUY / SELL
+    tier_text    = sig['tier']    # already includes emoji (🏆 ELITE etc.)
+    tf_label     = sig['tf_label']
+    session      = sig['session']
+    is_crypto_s  = sig.get('is_crypto', False)
+    is_ah        = sig.get('is_extended_hours', False)
+
+    vix      = get_vix_regime()
+    vix_warn = bool(vix and vix.get('regime') in ('spike', 'extreme'))
+    prefix   = urgency_prefix(sig['sqs'], sig['strong_trend'], vix_warn).strip()
+    # Strip trailing tier label noise — we already render tier on the next line
+    tier_plain = tier_text.split(' ', 1)[-1] if ' ' in tier_text else tier_text
+
+    # Line 1 — banner title
+    title = f"{prefix} *{tier_plain} {direction} SIGNAL*".strip()
+
+    # Line 2 — company line (ticker + name)
+    if name and name != sig['symbol']:
+        company = f"{sym_em} *{sym_safe}* — {md_escape(name)}"
+    else:
+        company = f"{sym_em} *{sym_safe}*"
+
+    # Line 3 — sector · exchange (skip if both blank)
+    meta_bits = []
+    if sector and sector != 'Other':
+        meta_bits.append(md_escape(sector))
+    if exch:
+        meta_bits.append(md_escape(exch))
+    meta_line = "🏷️ " + " · ".join(meta_bits) if meta_bits else ""
+
+    # Line 4 — timeframe · session
+    tf_session = f"⏰ {tf_label} · {session}"
+
+    # Line 5 — full timestamp
+    now = now_est()
+    tz_abbr = now.tzname() or "ET"
+    ts_line = f"🕒 {now.strftime(f'%a %b %d · %I:%M %p {tz_abbr}')}"
+
+    # Compose
+    lines = [
+        title,
+        "`━━━━━━━━━━━━━━━━━━━━━`",
+        company,
+    ]
+    if meta_line:
+        lines.append(meta_line)
+    lines.append(tf_session)
+    lines.append(ts_line)
+    lines.append("`━━━━━━━━━━━━━━━━━━━━━`")
+    return "\n".join(lines) + "\n"
+
+
+def _context_banner(sig):
+    """
+    Optional context banner that appears *after* the header, *before* sections.
+    Renders VIX warning + after-hours warning if relevant.
+    """
+    out = []
+    vix = get_vix_regime()
+    if vix and vix.get('warning') and vix['regime'] in ('spike', 'extreme'):
+        out.append(vix['warning'])
+    if sig.get('is_extended_hours'):
+        out.append("⚠️ *After-hours — thin liquidity!* Use LIMIT orders, expect wider spreads.")
+    return ("\n".join(out) + "\n") if out else ""
+
+
+def _section(title, body):
+    """Render a uniformly styled section: `*TITLE*\n─────…\n<body>\n`."""
+    return f"\n*{title}*\n`─────────────────`\n{body}"
+
+
 def format_new_signal(sig, ai_text=None):
     """
-    Full-detail signal alert with:
-    • Urgency emoji prefix (v7.0)
-    • Plain-English R:R (v7.0)
-    • POC context (v7.0)
-    • SQS trending (v7.0)
-    • VIX warning (v7.0)
-    • Markdown-safe (v7.0)
+    v7.1 alert layout — heading block + tightly organized sections.
+
+    Sections (in order):
+      • Header block (banner + company + meta + timeframe + timestamp)
+      • Context banner (VIX / AH warnings)
+      • QUALITY    (SQS + meter + trend + MTF + HTF)
+      • TRADE PLAN (entry / stop / R:R / TPs)
+      • LEVELS     (POC + nearby support/resistance/EMAs)
+      • TECHNICALS (RSI / ADX / regime / trigger / stretch)
+      • TIMING     (expiry + session tips)
+      • AI         (optional, only if Gemini text present)
     """
-    emoji = "🟢" if sig['signal'] == 'BUY' else "🔴"
-    d = sig['decimals']
-    sym_safe = safe_sym(sig['symbol'])
-    sym_em = sig['emoji']
+    d            = sig['decimals']
+    direction_em = "🟢" if sig['signal'] == 'BUY' else "🔴"
 
-    # VIX context for header
-    vix = get_vix_regime()
-    vix_warn = bool(vix and vix.get('regime') in ('spike', 'extreme'))
+    # ─── Header + context banner ──────────────────────────────────────
+    msg  = _header_block(sig)
+    ban  = _context_banner(sig)
+    if ban:
+        msg += ban
 
-    # Urgency prefix
-    prefix = urgency_prefix(sig['sqs'], sig['strong_trend'], vix_warn)
+    # ─── QUALITY ──────────────────────────────────────────────────────
+    body  = f"{direction_em} *Entry @* `${fmt_price(sig['price'], d)}` · {sig['trigger']}\n"
+    body += f"SQS *{sig['sqs']}/100* · {sig['tier']}\n"
+    body += f"`{sqs_meter(sig['sqs'])}`\n"
+    body += f"Confluence: *{sig['score']}/9* (Grade {sig['grade']})\n"
 
-    # Header
-    msg = f"{prefix}{sig['tier']} {emoji} *{sig['signal']} {sym_em} {sym_safe}* `[{sig['tf_label']}]`\n"
-    msg += f"{sig['session']} • {fmt_time()}\n"
-    msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
-
-    # VIX warning banner
-    if vix and vix.get('warning') and vix['regime'] in ('spike', 'extreme'):
-        msg += f"{vix['warning']}\n"
-        msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
-
-    if sig.get('is_extended_hours'):
-        msg += "⚠️ *After-hours — thin liquidity!*\n"
-        msg += "_Use LIMIT orders, expect wider spreads._\n"
-        msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
-
-    # Price + quality
-    msg += f"💵 *Live Entry:* `${fmt_price(sig['price'], d)}`\n"
-    msg += f"🎯 *Trigger:* {sig['trigger']}\n"
-    msg += f"📊 *Quality:* {sig['score']}/9 ({sig['grade']}) • SQS *{sig['sqs']}*\n"
-    msg += f"`{sqs_meter(sig['sqs'])}`\n"
-
-    # SQS trend (v7.0)
     trend_note = format_sqs_trend_note(sig['symbol'])
     if trend_note:
-        msg += f"{trend_note}\n"
+        body += f"{trend_note}\n"
 
-    # MTF / HTF
     if sig.get('mtf_sum') is not None:
-        mtf = sig['mtf_sum']
+        mtf     = sig['mtf_sum']
         mtf_bar = "█" * mtf + "░" * (12 - mtf)
-        msg += f"🗂️ *Multi-TF:* `{mtf_bar}` {mtf}/12\n"
+        body += f"Multi-TF:  `{mtf_bar}` {mtf}/12\n"
     if sig.get('htf_bull') is not None:
         htf_state = "▲ Bullish" if sig['htf_bull'] else "▼ Bearish"
-        aligned = "✓" if (sig['signal'] == 'BUY') == sig['htf_bull'] else "⚠️"
-        msg += f"🏔️ *Higher TF:* {htf_state} {aligned}\n"
+        aligned   = "✓ aligned" if (sig['signal'] == 'BUY') == sig['htf_bull'] else "⚠️ against"
+        body += f"Higher TF: {htf_state} ({aligned})\n"
 
     if sig['sqs'] < 75:
-        msg += "_⚠️ Borderline quality — consider half-size_\n"
+        body += "_⚠️ Borderline quality — consider half-size._\n"
+    msg += _section("📊 QUALITY", body)
 
-    # ═══ Plain-English TRADE PLAN ═══
-    msg += "\n*🎯 TRADE PLAN*\n"
-    msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
-    risk_dollars = abs(sig['price'] - sig['sl'])
-    reward_dollars = abs(sig['tp3'] - sig['price'])
-    msg += f"📍 Entry:  `${fmt_price(sig['price'], d)}`\n"
-    msg += f"🛑 Stop:   `${fmt_price(sig['sl'], d)}` ({sig['sl_pct']}% away)\n"
+    # ─── TRADE PLAN ───────────────────────────────────────────────────
+    risk_dollars   = abs(sig['price'] - sig['sl'])
+    reward_dollars = abs(sig['tp3']   - sig['price'])
+    body  = f"📍 Entry: `${fmt_price(sig['price'], d)}`\n"
+    body += f"🛑 Stop:  `${fmt_price(sig['sl'], d)}` (_{sig['sl_pct']}% away_)\n"
     if sig['sl_pct'] < 1.0:
-        msg += "   _⚠️ Very tight stop — noise risk_\n"
+        body += "   _⚠️ Very tight stop — noise risk_\n"
     elif sig['sl_pct'] > 5.0:
-        msg += "   _⚠️ Wide stop — larger drawdown risk_\n"
+        body += "   _⚠️ Wide stop — larger drawdown risk_\n"
+    body += f"💰 {fmt_risk_reward_line(risk_dollars, reward_dollars)}\n\n"
+    body += f"  • {tp_line(1, sig['price'], sig['tp1'], sig['risk'])}\n"
+    body += f"  • {tp_line(2, sig['price'], sig['tp2'], sig['risk'])}\n"
+    body += f"  • {tp_line(3, sig['price'], sig['tp3'], sig['risk'])}\n"
+    msg += _section("🎯 TRADE PLAN", body)
 
-    # Plain-English R:R
-    msg += f"💰 {fmt_risk_reward_line(risk_dollars, reward_dollars)}\n\n"
-    msg += f"  • {tp_line(1, sig['price'], sig['tp1'], sig['risk'])}\n"
-    msg += f"  • {tp_line(2, sig['price'], sig['tp2'], sig['risk'])}\n"
-    msg += f"  • {tp_line(3, sig['price'], sig['tp3'], sig['risk'])}\n"
-
-    # ─── POC line (v7.0) ───
+    # ─── LEVELS (POC + nearby) ────────────────────────────────────────
+    levels_lines = []
     poc_line = format_poc_line(sig['price'], sig.get('poc_data'))
     if poc_line:
-        msg += f"\n{poc_line}\n"
+        levels_lines.append(poc_line)
 
-    # Key levels
-    nearby = sig.get('nearby', {})
-    meaningful = []
-    if nearby:
-        for name, key, arrow in [
-            ('Resistance', 'resistance', '⬆️'),
-            ('Support', 'support', '⬇️'),
-            ('EMA50', 'ema50', '〰️'),
-            ('EMA200', 'ema200', '〰️'),
-        ]:
-            val = nearby.get(key)
-            if val:
-                dist = abs(val - sig['price']) / sig['price'] * 100
-                if dist >= 0.3:
-                    meaningful.append((name, val, dist, arrow))
-    if meaningful:
-        msg += "\n*🔍 KEY LEVELS*\n"
-        msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
-        for name, val, dist, arrow in meaningful:
-            msg += f"{arrow} {name}: `${fmt_price(val, d)}` ({dist:.1f}%)\n"
+    nearby = sig.get('nearby', {}) or {}
+    for name, key, arrow in [
+        ('Resistance', 'resistance', '⬆️'),
+        ('Support',    'support',    '⬇️'),
+        ('EMA50',      'ema50',      '〰️'),
+        ('EMA200',     'ema200',     '〰️'),
+    ]:
+        val = nearby.get(key)
+        if not val:
+            continue
+        dist = abs(val - sig['price']) / sig['price'] * 100
+        if dist >= 0.3:
+            levels_lines.append(f"{arrow} {name}: `${fmt_price(val, d)}` (_{dist:.1f}% away_)")
 
-    # Technicals
-    msg += "\n*📈 TECHNICALS*\n"
-    msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
-    msg += f"RSI: `{sig['rsi']}` | ADX: `{sig['adx']}` | Stretch: `{sig['stretch']}×`\n"
-    msg += f"Regime: {sig['regime']} | Trend: {'Strong ✓' if sig['strong_trend'] else 'Mixed ⚠️'}\n"
+    if levels_lines:
+        msg += _section("🔍 LEVELS", "\n".join(levels_lines) + "\n")
 
-    # Expiry
+    # ─── TECHNICALS ───────────────────────────────────────────────────
+    body  = f"RSI: *{sig['rsi']}* · ADX: *{sig['adx']}* · Stretch: *{sig['stretch']}×*\n"
+    body += f"Regime: *{sig['regime']}* · Trend: {'Strong ✓' if sig['strong_trend'] else 'Mixed ⚠️'}\n"
+    body += f"Trigger: _{md_escape(sig['trigger'])}_\n"
+    msg += _section("📈 TECHNICALS", body)
+
+    # ─── TIMING ───────────────────────────────────────────────────────
     exp_abs = absolute_time(sig['expiry_time'])
     exp_rel = time_until(sig['expiry_time'])
-    msg += f"\n⏳ *Valid until:* {exp_abs} ({exp_rel})\n"
-    msg += "_Re-evaluate on next candle after expiry._\n"
-
-    # Session tips
+    body    = f"⏳ Valid until: *{exp_abs}* (_{exp_rel}_)\n"
+    body   += "_Re-evaluate on next candle after expiry._\n"
     tips = get_session_tips(sig['session'], sig.get('is_crypto', False))
     if tips:
-        msg += f"\n{tips}\n"
+        body += f"{tips}\n"
+    msg += _section("⏰ TIMING", body)
 
-    # AI
+    # ─── AI ───────────────────────────────────────────────────────────
     if ai_text:
-        msg += "\n*🤖 AI ANALYSIS*\n"
-        msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
-        msg += f"{ai_text}\n"
+        msg += _section("🤖 AI ANALYSIS", f"{ai_text}\n")
 
     return msg
 
 def format_trade_event(trade, event, current):
-    emoji = "🟢" if trade['signal'] == 'BUY' else "🔴"
-    d = trade['decimals']
-    sym_em = trade.get('emoji', '📈')
-    sym_safe = safe_sym(trade['symbol'])
-    age = time_ago(trade['opened_at'])
-    et = event['type']
-    risk = trade.get('risk', 0)
+    direction_em = "🟢" if trade['signal'] == 'BUY' else "🔴"
+    d            = trade['decimals']
+    sym_em       = trade.get('emoji', '📈')
+    label        = trade.get('label') or f"*{safe_sym(trade['symbol'])}*"
+    age          = time_ago(trade['opened_at'])
+    et           = event['type']
+    risk         = trade.get('risk', 0)
 
     def profit_phrase(price):
-        if not risk:
-            return ""
+        if not risk: return ""
         r_mult = abs(price - trade['entry']) / risk
         profit = abs(price - trade['entry'])
         return f"+${profit:.2f} ({r_mult:.1f}× your risk)"
 
+    tf_lbl = trade.get('tf_label', trade['tf'])
+
     if et == 'TP1':
-        header = f"✅ *TARGET 1 HIT* {emoji} {sym_em} {sym_safe} `[{trade.get('tf_label', trade['tf'])}]`"
+        header = f"✅ *TARGET 1 HIT* {direction_em} {sym_em} {label} `[{tf_lbl}]`"
         sub = "💡 *Recommended next step:*"
         steps = [
             f"  ✓ Move stop: `${fmt_price(trade['sl'], d)}` → `${fmt_price(trade['entry'], d)}` (breakeven)",
@@ -1828,7 +2109,7 @@ def format_trade_event(trade, event, current):
         ]
         profit_str = profit_phrase(trade['tp1'])
     elif et == 'TP2':
-        header = f"✅✅ *TARGET 2 HIT* {emoji} {sym_em} {sym_safe} `[{trade.get('tf_label', trade['tf'])}]`"
+        header = f"✅✅ *TARGET 2 HIT* {direction_em} {sym_em} {label} `[{tf_lbl}]`"
         sub = "💡 *Recommended next step:*"
         steps = [
             f"  ✓ Move stop to Target 1 `${fmt_price(trade['tp1'], d)}`",
@@ -1837,12 +2118,12 @@ def format_trade_event(trade, event, current):
         ]
         profit_str = profit_phrase(trade['tp2'])
     elif et == 'TP3':
-        header = f"🏆 *ALL TARGETS HIT* {emoji} {sym_em} {sym_safe}"
+        header = f"🏆 *ALL TARGETS HIT* {direction_em} {sym_em} {label}"
         sub = "🎉 *Trade complete!*"
         steps = ["  ✓ Close remaining position", "  ✓ Full reward achieved", "  ✓ Log this win"]
         profit_str = profit_phrase(trade['tp3'])
     elif et == 'SL':
-        header = f"🛑 *STOP HIT* {emoji} {sym_em} {sym_safe}"
+        header = f"🛑 *STOP HIT* {direction_em} {sym_em} {label}"
         if trade['tp1_hit']:
             sub = "✅ *Trailed profit exit — still a winner*"
             steps = ["  ✓ Partial gain locked in", "  ✓ No further action", "  ✓ Review setup"]
@@ -1853,14 +2134,14 @@ def format_trade_event(trade, event, current):
             loss = abs(trade['sl'] - trade['entry'])
             profit_str = f"-${loss:.2f} (1× your risk — as planned)"
     elif et == 'TIMEOUT':
-        header = f"⏰ *TRADE TIMED OUT* {emoji} {sym_em} {sym_safe}"
+        header = f"⏰ *TRADE TIMED OUT* {direction_em} {sym_em} {label}"
         sub = "_72h expiry — auto-closed_"
         steps = ["  ✓ Signal aged out"]
         profit_str = "—"
     else:
         return None
 
-    msg = f"{header}\n"
+    msg  = f"{header}\n"
     msg += f"⏱ Trade age: {age}\n"
     msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
     msg += f"💵 *Current price:* `${fmt_price(current, d)}`\n"
@@ -1875,7 +2156,7 @@ def format_trade_event(trade, event, current):
     return msg
 
 def format_digest(signals):
-    msg = f"🔔 *SIGNAL DIGEST — {len(signals)} alerts*\n"
+    msg  = f"🔔 *SIGNAL DIGEST — {len(signals)} alerts*\n"
     msg += f"{get_session()} • {fmt_time()}\n"
     msg += "`━━━━━━━━━━━━━━━━━━━━━`\n\n"
 
@@ -1890,15 +2171,16 @@ def format_digest(signals):
 
     for sig in signals:
         em = "🟢" if sig['signal'] == 'BUY' else "🔴"
-        multi = " 🎯🎯" if sig['symbol'] in multi_tf else ""
-        ah = " ⚠️" if sig.get('is_extended_hours') else ""
+        multi  = " 🎯🎯" if sig['symbol'] in multi_tf else ""
+        ah     = " ⚠️" if sig.get('is_extended_hours') else ""
         prefix = urgency_prefix(sig['sqs'], sig['strong_trend'])
-        sym = safe_sym(sig['symbol'])
-        msg += f"{prefix}{sig['tier']} {em} *{sym}* `[{sig['tf_label']}]`{ah}{multi}\n"
-        msg += f"  {sig['emoji']} {sig['signal']} @ `${fmt_price(sig['price'], sig['decimals'])}` • SQS {sig['sqs']} • MTF {sig.get('mtf_sum','?')}/12\n"
+        label  = sig.get('label') or f"*{safe_sym(sig['symbol'])}*"
+        msg += f"{prefix}{sig['tier']} {em} {label} `[{sig['tf_label']}]`{ah}{multi}\n"
+        msg += (f"  {sig['emoji']} {sig['signal']} @ `${fmt_price(sig['price'], sig['decimals'])}` "
+                f"• SQS {sig['sqs']} • MTF {sig.get('mtf_sum','?')}/12\n")
         msg += f"  🎯 {sig['trigger']} | RSI {sig['rsi']}\n"
 
-        risk_dollars = abs(sig['price'] - sig['sl'])
+        risk_dollars   = abs(sig['price'] - sig['sl'])
         reward_dollars = abs(sig['tp3'] - sig['price'])
         msg += f"  💰 Risk `${risk_dollars:.2f}` → Make `${reward_dollars:.2f}`\n\n"
 
@@ -1906,7 +2188,7 @@ def format_digest(signals):
         msg += f"🎯🎯 *Multi-TF confirmation:* {', '.join(sorted(multi_tf))}\n"
         msg += "_Fired on multiple timeframes — highest conviction._\n\n"
 
-    msg += f"_Full details for each below._"
+    msg += "_Full details for each below._"
     return msg
 
 def format_open_positions_summary(trades):
@@ -1926,42 +2208,42 @@ def format_open_positions_summary(trades):
             continue
         current = live[0]
         is_long = trade['signal'] == 'BUY'
-        pnl = (current - trade['entry']) if is_long else (trade['entry'] - current)
-        r_mult = pnl / trade['risk'] if trade['risk'] > 0 else 0
-        if is_long: longs += 1
-        else: shorts += 1
+        pnl     = (current - trade['entry']) if is_long else (trade['entry'] - current)
+        r_mult  = pnl / trade['risk'] if trade['risk'] > 0 else 0
+        if is_long: longs  += 1
+        else:       shorts += 1
         lbl = trade.get('tf_label', trade['tf'])
         if lbl in tf_counts:
             tf_counts[lbl] += 1
 
-        if trade.get('tp3_hit'):   status, bucket = "🏆 3× risk", "winner"
+        if   trade.get('tp3_hit'): status, bucket = "🏆 3× risk", "winner"
         elif trade.get('tp2_hit'): status, bucket = "🎯🎯 2× risk", "winner"
         elif trade.get('tp1_hit'): status, bucket = "🎯 1× risk, trailing", "winner"
         elif r_mult >= 0.5:        status, bucket = "📈 winning", "winner"
         elif r_mult <= -0.7:       status, bucket = "⚠️ near stop", "near_sl"
         elif r_mult < -0.15:       status, bucket = "🔻 losing", "loser"
         elif abs(r_mult) < 0.15:   status, bucket = "➖ flat", "flat"
-        else:                      status, bucket = "📊 building", "building"
+        else:                       status, bucket = "📊 building", "building"
 
         enriched.append({'trade': trade, 'current': current, 'r_mult': r_mult,
                          'status': status, 'bucket': bucket})
 
     enriched.sort(key=lambda x: -x['r_mult'])
-    valid = [e for e in enriched if e['current'] is not None]
-    total_r = sum(e['r_mult'] for e in valid)
-    winners = [e for e in valid if e['r_mult'] > 0.1]
-    losers = [e for e in valid if e['r_mult'] < -0.1]
-    near_sl = [e for e in valid if e['bucket'] == 'near_sl']
+    valid    = [e for e in enriched if e['current'] is not None]
+    total_r  = sum(e['r_mult'] for e in valid)
+    winners  = [e for e in valid if e['r_mult'] > 0.1]
+    losers   = [e for e in valid if e['r_mult'] < -0.1]
+    near_sl  = [e for e in valid if e['bucket'] == 'near_sl']
 
-    now = now_est()
+    now     = now_est()
     tz_abbr = now.tzname() or "EDT"
-    ts = now.strftime(f'%a %b %d • %I:%M %p {tz_abbr}')
+    ts      = now.strftime(f'%a %b %d • %I:%M %p {tz_abbr}')
 
-    msg = f"📊 *OPEN POSITIONS ({len(active)})*\n"
+    msg  = f"📊 *OPEN POSITIONS ({len(active)})*\n"
     msg += f"🕒 {ts}\n"
     msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
     total_str = fmt_r(total_r, plain=True)
-    total_em = "🟢" if total_r >= 0 else "🔴"
+    total_em  = "🟢" if total_r >= 0 else "🔴"
     msg += f"{total_em} *Overall P&L:* {total_str}\n"
     msg += f"🟢 Long: {longs} | 🔴 Short: {shorts}"
     if tf_counts['⚡30m'] or tf_counts['📊1h']:
@@ -1973,13 +2255,14 @@ def format_open_positions_summary(trades):
     msg += "\n"
 
     def _row(e, emph=False):
-        t = e['trade']
-        em = t.get('emoji', '📈')
+        t      = e['trade']
+        em     = t.get('emoji', '📈')
         dir_em = "🟢" if t['signal'] == 'BUY' else "🔴"
-        r_str = fmt_r(e['r_mult'], plain=True)
-        r_str = f"*{r_str}*" if emph else r_str
-        sym = safe_sym(t['symbol'])
-        line = f"  {em} {dir_em} *{sym}* `{t.get('tf_label', t['tf'])}` {r_str}"
+        r_str  = fmt_r(e['r_mult'], plain=True)
+        if emph: r_str = f"*{r_str}*"
+        # Use saved label (with name/exchange) if present; else fall back to ticker
+        label = t.get('label') or f"*{safe_sym(t['symbol'])}*"
+        line  = f"  {em} {dir_em} {label} `{t.get('tf_label', t['tf'])}` {r_str}"
         line += f" • {time_ago(t['opened_at'])}"
         if emph and e.get('status'):
             line += f" • {e['status']}"
@@ -2008,15 +2291,19 @@ def format_open_positions_summary(trades):
     if nodata_items:
         msg += f"\n❔ *No live data* ({len(nodata_items)})\n"
         for e in nodata_items:
-            msg += f"  {e['trade'].get('emoji', '📈')} {safe_sym(e['trade']['symbol'])}\n"
+            t = e['trade']
+            label = t.get('label') or safe_sym(t['symbol'])
+            msg += f"  {t.get('emoji', '📈')} {label}\n"
 
     msg += "\n`━━━━━━━━━━━━━━━━━━━━━`\n"
     if winners:
-        best = max(valid, key=lambda e: e['r_mult'])
-        msg += f"🏆 Best: *{safe_sym(best['trade']['symbol'])}* {fmt_r(best['r_mult'], plain=True)}\n"
+        best  = max(valid, key=lambda e: e['r_mult'])
+        b_lbl = best['trade'].get('label') or f"*{safe_sym(best['trade']['symbol'])}*"
+        msg += f"🏆 Best: {b_lbl} {fmt_r(best['r_mult'], plain=True)}\n"
     if losers:
-        worst = min(valid, key=lambda e: e['r_mult'])
-        msg += f"💥 Worst: *{safe_sym(worst['trade']['symbol'])}* {fmt_r(worst['r_mult'], plain=True)}\n"
+        worst  = min(valid, key=lambda e: e['r_mult'])
+        w_lbl  = worst['trade'].get('label') or f"*{safe_sym(worst['trade']['symbol'])}*"
+        msg += f"💥 Worst: {w_lbl} {fmt_r(worst['r_mult'], plain=True)}\n"
 
     return msg
 
@@ -2025,7 +2312,7 @@ def format_weekly_summary():
     if not history:
         return None
     cutoff = now_est() - timedelta(days=7)
-    week = []
+    week   = []
     for t in history:
         try:
             ca = t.get('closed_at')
@@ -2041,13 +2328,13 @@ def format_weekly_summary():
     if not week:
         return None
 
-    wins = [t for t in week if (t.get('final_r') or 0) > 0]
-    losses = [t for t in week if (t.get('final_r') or 0) < 0]
-    be = [t for t in week if (t.get('final_r') or 0) == 0]
+    wins    = [t for t in week if (t.get('final_r') or 0) > 0]
+    losses  = [t for t in week if (t.get('final_r') or 0) < 0]
+    be      = [t for t in week if (t.get('final_r') or 0) == 0]
     total_r = sum((t.get('final_r') or 0) for t in week)
-    wr = len(wins) / len(week) * 100 if week else 0
-    best = max(week, key=lambda t: t.get('final_r', 0) or 0)
-    worst = min(week, key=lambda t: t.get('final_r', 0) or 0)
+    wr      = len(wins) / len(week) * 100 if week else 0
+    best    = max(week, key=lambda t: t.get('final_r', 0) or 0)
+    worst   = min(week, key=lambda t: t.get('final_r', 0) or 0)
 
     grades = {'A+': [0, 0], 'A': [0, 0], 'B': [0, 0], 'C': [0, 0]}
     for t in week:
@@ -2057,15 +2344,18 @@ def format_weekly_summary():
             if (t.get('final_r') or 0) > 0:
                 grades[g][1] += 1
 
-    msg = f"📊 *WEEKLY SUMMARY*\n{cutoff.strftime('%b %d')} → {now_est().strftime('%b %d')}\n"
+    best_lbl  = best.get('label')  or f"*{safe_sym(best['symbol'])}*"
+    worst_lbl = worst.get('label') or f"*{safe_sym(worst['symbol'])}*"
+
+    msg  = f"📊 *WEEKLY SUMMARY*\n{cutoff.strftime('%b %d')} → {now_est().strftime('%b %d')}\n"
     msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
     msg += f"Total signals: *{len(week)}*\n"
     msg += f"✅ Wins: *{len(wins)}* ({wr:.0f}%)\n"
     msg += f"❌ Losses: *{len(losses)}*\n"
     msg += f"➖ Breakeven: *{len(be)}*\n\n"
     msg += f"💹 *Total: {fmt_r(total_r, plain=True)}*\n"
-    msg += f"🏆 Best: *{safe_sym(best['symbol'])}* ({fmt_r(best.get('final_r', 0) or 0, plain=True)})\n"
-    msg += f"💥 Worst: *{safe_sym(worst['symbol'])}* ({fmt_r(worst.get('final_r', 0) or 0, plain=True)})\n\n"
+    msg += f"🏆 Best: {best_lbl} ({fmt_r(best.get('final_r', 0) or 0, plain=True)})\n"
+    msg += f"💥 Worst: {worst_lbl} ({fmt_r(worst.get('final_r', 0) or 0, plain=True)})\n\n"
     msg += "*GRADE PERFORMANCE*\n`━━━━━━━━━━━━━━━━━━━━━`\n"
     for g, (tot, w) in grades.items():
         if tot > 0:
@@ -2082,82 +2372,103 @@ def format_weekly_summary():
 
 
 def analyze_single_symbol(symbol: str):
+    """
+    Ad-hoc analysis entry point (e.g. Telegram bot command).
+    Validates against the loaded Universe and routes through the same engine.
+    """
+    if not symbol:
+        return "❌ Invalid symbol format"
     symbol = symbol.upper().strip()
-
-    # basic validation (IMPORTANT)
-    if not symbol or len(symbol) > 10:
+    if len(symbol) > 10:
         return "❌ Invalid symbol format"
 
+    # Friendly check: is this symbol actually in our universe?
+    # (We don't hard-reject — yfinance might still have it — but warn the user.)
+    known = (symbol in SYMBOL_META) or (symbol in ALL_SYMBOLS) or (symbol in U.dip_extras)
+    not_in_universe_note = ""
+    if not known:
+        not_in_universe_note = (
+            f"\n_⚠️ {safe_sym(symbol)} is not in symbols.yaml — "
+            f"attempting fetch anyway. Add it to enable full alerts._"
+        )
+
     try:
-        tf_cfg = TIMEFRAMES[0]  # use 30m or your default TF
+        tf_cfg = TIMEFRAMES[0]  # default = 30m
 
         ctx = {
             'htf_bull': get_htf_bias(symbol),
-            'mtf_sum': get_mtf_sum(symbol)
+            'mtf_sum':  get_mtf_sum(symbol),
         }
+
+        # Pull last signal info for chop filter (same as scheduled scans)
+        cache = load_cache()
+        last_info = get_last_signal_info(cache, symbol, tf_cfg['tf'])
 
         result, reason = analyze_symbol(
             symbol,
             tf_cfg,
             ctx['htf_bull'],
             ctx['mtf_sum'],
-            None
+            last_info,
         )
 
         if not result:
-            return f"⚠️ No valid setup found for {symbol}"
+            why = f" — _{md_escape(reason)}_" if reason else ""
+            return f"⚠️ No valid setup for {safe_sym(symbol)}{why}{not_in_universe_note}"
 
         ai_text = None
         if result['sqs'] >= AI_TIER_THRESHOLD and GEMINI_API_KEY:
             ai_text = get_ai_analysis(result)
-
         result['ai_text'] = ai_text
 
-        return format_new_signal(result, ai_text)
+        out = format_new_signal(result, ai_text)
+        if not_in_universe_note:
+            out += not_in_universe_note
+        return out
 
     except Exception as e:
-        return f"❌ Error analyzing {symbol}: {str(e)[:50]}"
-
+        logging.exception(f"analyze_single_symbol {symbol}")
+        return f"❌ Error analyzing {safe_sym(symbol)}: {str(e)[:80]}"
 # ═══════════════════════════════════════════════════════════════════════════════
-# §18  TELEGRAM TRANSPORT
+# §18  TELEGRAM TRANSPORT — smart splitting on section boundaries
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def send_telegram(message, silent=False):
-    """Send Telegram message, auto-splitting if > 4000 chars."""
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logging.warning("Telegram credentials missing")
-        return False
+TG_LIMIT_SOFT = 3900   # leave headroom for "(part N/M)" suffix
 
-    if len(message) > 4000:
-        parts = []
-        current = ""
-        for line in message.split('\n'):
-            if len(current) + len(line) + 1 > 3900:
+def _split_for_telegram(message, limit=TG_LIMIT_SOFT):
+    """
+    Split on blank-line / section boundaries (preserves Markdown integrity).
+    Falls back to hard-split only if a single section exceeds the limit.
+    """
+    if len(message) <= limit:
+        return [message]
+
+    parts, current = [], ""
+    # Split first on double-newlines so each section stays intact
+    for block in message.split("\n\n"):
+        candidate = (current + "\n\n" + block) if current else block
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
                 parts.append(current)
-                current = line + '\n'
-            else:
-                current += line + '\n'
-        if current:
-            parts.append(current)
-        success = True
-        for i, part in enumerate(parts):
-            hdr = f"_(part {i+1}/{len(parts)})_\n" if len(parts) > 1 else ""
-            if not _tg_send(hdr + part, silent):
-                success = False
-            time.sleep(0.3)
-        return success
-    return _tg_send(message, silent)
-# ═══════════════════════════════════════════════════════════════════════════════
-# New addition > telegram analysis >  CORRELATION DETECTOR
-# ═══════════════════════════════════════════════════════════════════════════════
+            # If a single block is itself too big, hard-chunk it
+            while len(block) > limit:
+                parts.append(block[:limit])
+                block = block[limit:]
+            current = block
+    if current:
+        parts.append(current)
+    return parts
+
 def _tg_send(message, silent=False):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json={
-            'chat_id': CHAT_ID,
-            'text': message,
-            'parse_mode': 'Markdown',
-            'disable_notification': silent,
+            'chat_id':                 CHAT_ID,
+            'text':                    message,
+            'parse_mode':              'Markdown',
+            'disable_notification':    silent,
             'disable_web_page_preview': True,
         }, timeout=10)
         if r.status_code != 200:
@@ -2166,7 +2477,8 @@ def _tg_send(message, silent=False):
             if "can't parse" in r.text.lower() or 'parse' in r.text.lower():
                 logging.warning("Retrying without parse_mode")
                 r = requests.post(url, json={
-                    'chat_id': CHAT_ID, 'text': message,
+                    'chat_id':              CHAT_ID,
+                    'text':                 message,
                     'disable_notification': silent,
                 }, timeout=10)
                 return r.status_code == 200
@@ -2175,18 +2487,40 @@ def _tg_send(message, silent=False):
         logging.error(f"Telegram send: {e}")
         return False
 
+def send_telegram(message, silent=False):
+    """Send Telegram message — auto-splits on section boundaries when > 3900 chars."""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logging.warning("Telegram credentials missing")
+        return False
+
+    parts = _split_for_telegram(message)
+    if len(parts) == 1:
+        return _tg_send(parts[0], silent)
+
+    ok = True
+    for i, part in enumerate(parts):
+        suffix = f"\n\n_(part {i+1}/{len(parts)})_" if i < len(parts) - 1 else ""
+        if not _tg_send(part + suffix, silent):
+            ok = False
+        time.sleep(0.3)
+    return ok
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # §19  CORRELATION DETECTOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def format_correlation_alert(new_sigs, open_trades):
+    """
+    Renders 'multiple signals/positions in same sector' notice.
+    Uses pre-rendered labels (company name + exchange) when available.
+    """
     combined = [(s['symbol'], 'new') for s in new_sigs]
     if open_trades:
         for k, t in open_trades.items():
             if not t.get('closed'):
                 combined.append((t['symbol'], 'open'))
 
+    # Group symbols by correlation sector (from YAML)
     risk = {}
     for grp, syms in CORRELATION_GROUPS.items():
         matching = [(s, src) for s, src in combined if s in syms]
@@ -2199,22 +2533,24 @@ def format_correlation_alert(new_sigs, open_trades):
         if len(seen) >= 2:
             risk[grp] = {
                 'symbols': sorted(seen.keys()),
-                'new': sum(1 for v in seen.values() if v == 'new'),
-                'open': sum(1 for v in seen.values() if v == 'open'),
+                'new':     sum(1 for v in seen.values() if v == 'new'),
+                'open':    sum(1 for v in seen.values() if v == 'open'),
             }
 
     if not risk:
         return None
 
-    msg = "⚠️ *CORRELATION NOTICE*\n`━━━━━━━━━━━━━━━━━━━━━`\n"
-    msg += "_Multiple signals/positions in same sector_\n"
+    msg  = "⚠️ *CORRELATION NOTICE*\n"
+    msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
+    msg += "_Multiple signals/positions in the same sector_\n"
     for grp, d in risk.items():
         parts = []
-        if d['new']: parts.append(f"{d['new']} new")
+        if d['new']:  parts.append(f"{d['new']} new")
         if d['open']: parts.append(f"{d['open']} open")
         tag = f" ({', '.join(parts)})" if parts else ""
-        safe_list = ', '.join(safe_sym(s) for s in d['symbols'])
-        msg += f"\n🔗 *{grp}*{tag}\n  {safe_list}\n"
+        # Use company-aware labels (e.g. "*NVDA* — NVIDIA Corp.") via sym_label
+        labels = [sym_label(s, with_bold=False) for s in d['symbols']]
+        msg += f"\n🔗 *{md_escape(grp)}*{tag}\n  " + " · ".join(labels) + "\n"
     msg += "\n💡 _These often move together — manage overall exposure._"
     return msg
 
@@ -2243,9 +2579,27 @@ def is_signal_expired(sig):
         return now_est() > exp
     except Exception:
         return False
+      
+def _startup_banner(session, active_list, eff_threshold):
+    """Pretty console banner — printed once at the top of every run."""
+    print(f"\n{'═' * 70}")
+    print(f"  AlphaEdge Scanner v7.1  ·  {fmt_datetime()}")
+    print(f"{'═' * 70}")
+    print(f"  Universe  : {U.summary()}")
+    print(f"  Session   : {session}  (watchlist {len(active_list)}/{len(ALL_SYMBOLS)} active)")
+    print(f"  Threshold : {eff_threshold}  (base {SQS_BASE_THRESHOLD})  ·  Grade filter: {GRADE_FILTER}")
+    print(f"  AI        : {'ON' if GEMINI_API_KEY else 'off'}  ·  TG: {'ON' if TELEGRAM_TOKEN else 'off'}")
 
+    vix = get_vix_regime()
+    if vix:
+        flag = "🚨" if vix['regime'] == 'extreme' else (
+               "⚠️" if vix['regime'] == 'spike'   else (
+               "🟡" if vix['regime'] == 'elevated' else "✅"))
+        print(f"  VIX       : {flag} {vix['vix']} ({vix['regime']})  ·  blocks longs: {vix['blocks_longs']}")
+    print(f"{'─' * 70}\n")
+  
 def main():
-    session = get_session()
+    session     = get_session()
     active_list = get_active_watchlist()
 
     # Compute/refresh dynamic threshold once per run
@@ -2253,25 +2607,15 @@ def main():
         compute_dynamic_threshold()
     eff_threshold = get_effective_threshold()
 
-    print(f"\n{'=' * 70}")
-    print(f"AlphaEdge Scanner v7.0 @ {fmt_datetime()}")
-    print(f"Session: {session}")
-    print(f"Watchlist: {len(active_list)}/{len(ALL_SYMBOLS)} symbols ({U.summary()})")
-    print(f"AI: {bool(GEMINI_API_KEY)} | Threshold: {eff_threshold} (base {SQS_BASE_THRESHOLD}) | Grade: {GRADE_FILTER}")
+    _startup_banner(session, active_list, eff_threshold)
 
-    # VIX regime at top
-    vix = get_vix_regime()
-    if vix:
-        print(f"VIX: {vix['vix']} ({vix['regime']}) | Blocks longs: {vix['blocks_longs']}")
-    print(f"{'=' * 70}\n")
+    logging.info(f"Scan v7.1 | session={session} | active={len(active_list)} | "
+                 f"threshold={eff_threshold} | universe={U.summary()}")
 
-    logging.info(f"Scan v7.0 | Session: {session} | Active: {len(active_list)} | "
-                 f"Threshold: {eff_threshold}")
-
-    cache = load_cache()   # auto-cleaned
+    cache  = load_cache()   # auto-cleaned
     trades = load_json(TRADES_FILE, {})
 
-    # ─── STEP 1: Check active trades ───
+    # ─── STEP 1: Check active trades ─────────────────────────────────
     if trades:
         print(f"📊 Checking {len(trades)} active trade(s)...")
         to_remove = []
@@ -2282,12 +2626,13 @@ def main():
                 continue
             try:
                 sym = trade['symbol']
-                print(f"  → {sym:10s} [{trade.get('tf_label', trade['tf']):5s}] ({trade['signal']})...", end=" ")
+                tf_lbl = trade.get('tf_label', trade['tf'])
+                print(f"  → {sym:10s} [{tf_lbl:5s}] ({trade['signal']})...", end=" ")
                 events, closed = check_trade_progress(trade)
                 if not events:
                     print("no change")
                     continue
-                live = get_live_ohlc(sym)
+                live    = get_live_ohlc(sym)
                 current = live[0] if live else trade['entry']
                 for event in events:
                     msg = format_trade_event(trade, event, current)
@@ -2319,10 +2664,10 @@ def main():
                 if ps:
                     send_telegram(ps, silent=True)
 
-    # ─── STEP 2: Scan new signals ───
+    # ─── STEP 2: Scan new signals ────────────────────────────────────
     print(f"🔍 Scanning {len(active_list)} symbols...")
-    new_sigs = []
-    skip_dupe = skip_active = ai_calls = 0
+    new_sigs    = []
+    skip_dupe   = skip_active = ai_calls = 0
     near_misses = []
 
     # Pre-fetch HTF + MTF (one pass)
@@ -2330,9 +2675,10 @@ def main():
     print("  📡 Pre-fetching HTF/MTF context...")
     for sym in active_list:
         try:
-            htf_bull = get_htf_bias(sym)
-            mtf_sum = get_mtf_sum(sym)
-            symbol_context[sym] = {'htf_bull': htf_bull, 'mtf_sum': mtf_sum}
+            symbol_context[sym] = {
+                'htf_bull': get_htf_bias(sym),
+                'mtf_sum':  get_mtf_sum(sym),
+            }
             time.sleep(FETCH_DELAY)
         except Exception as e:
             logging.error(f"Context {sym}: {e}")
@@ -2341,7 +2687,7 @@ def main():
     for sym in active_list:
         ctx = symbol_context.get(sym, {'htf_bull': None, 'mtf_sum': 6})
         for tf_cfg in TIMEFRAMES:
-            tf = tf_cfg['tf']
+            tf    = tf_cfg['tf']
             label = tf_cfg['label']
             print(f"  → {sym:10s} [{label:5s}]...", end=" ")
 
@@ -2352,7 +2698,6 @@ def main():
                 continue
 
             last_sig_info = get_last_signal_info(cache, sym, tf)
-
             try:
                 result, reason = analyze_symbol(
                     sym, tf_cfg, ctx['htf_bull'], ctx['mtf_sum'], last_sig_info
@@ -2381,7 +2726,7 @@ def main():
                 print("🔕 cooldown")
                 continue
 
-            # Record SQS for trending (v7.0)
+            # Record SQS for trending
             record_sqs(sym, result['sqs'])
 
             ai_text = None
@@ -2400,7 +2745,7 @@ def main():
             logging.info(f"SIGNAL: {sym} {tf} {result['signal']} "
                          f"SQS={result['sqs']} MTF={result.get('mtf_sum')}")
 
-    # ─── STEP 3: Deliver alerts ───
+    # ─── STEP 3: Deliver alerts ──────────────────────────────────────
     if new_sigs:
         new_sigs.sort(key=lambda s: s['sqs'], reverse=True)
         if len(new_sigs) >= DIGEST_THRESHOLD:
@@ -2434,13 +2779,14 @@ def main():
         if ws:
             send_telegram(ws, silent=False)
 
-    # ─── Final report ───
-    print(f"\n{'=' * 70}")
-    print(f"✅ New: {len(new_sigs)} | 🔕 Cooldown: {skip_dupe} | 🔒 Active: {skip_active}")
-    print(f"⚪ Near-miss: {len(near_misses)} | 🤖 AI: {ai_calls} | 📊 Open: {len(trades)}")
-    print(f"Session: {session} | Threshold: {eff_threshold}")
-    print(f"{'=' * 70}")
-    logging.info(f"Scan done | New:{len(new_sigs)} Active:{len(trades)} AI:{ai_calls}")
+    # ─── Final report ────────────────────────────────────────────────
+    print(f"\n{'─' * 70}")
+    print(f"  Result  : ✅ New {len(new_sigs)}  ·  🔕 Cooldown {skip_dupe}  ·  🔒 Active {skip_active}")
+    print(f"            ⚪ Near-miss {len(near_misses)}  ·  🤖 AI {ai_calls}  ·  📊 Open {len(trades)}")
+    print(f"  Session : {session}  ·  Threshold: {eff_threshold}")
+    print(f"{'═' * 70}\n")
+    logging.info(f"Scan done | new={len(new_sigs)} active={len(trades)} ai={ai_calls} "
+                 f"cooldown={skip_dupe} skip_active={skip_active} near_miss={len(near_misses)}")
 
 
 if __name__ == "__main__":
