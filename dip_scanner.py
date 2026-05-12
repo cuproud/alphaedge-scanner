@@ -1,33 +1,18 @@
 """
-ALPHAEDGE DIP BUY SCANNER v3.1 — AUDITED BUILD
+ALPHAEDGE DIP BUY SCANNER v3.2 — UNIFIED BUILD
 ═══════════════════════════════════════════════════════════════
-Finds healthy pullbacks in strong uptrends that are temporarily
-oversold across 12 high-growth sectors.
+Finds healthy pullbacks in strong uptrends that are temporarily oversold.
 
-v3.1 vs v3.0 — fixes & hardening
-────────────────────────────────
-P0
-  • Cooldown recorded ONLY after successful Telegram send
-  • Atomic state writes (fcntl-locked) — no race with brief.py
-  • Single 1y/1d yfinance download per ticker, reused for 5d/EMA-slope
-  • Markdown escaping for every dynamic value (md())
-  • Reason codes added for accurate disqualification stats
-  • Logging configured in __main__ with daily rotation
-
-P1
-  • Parallel fetch with bounded ThreadPoolExecutor
-  • Earnings results cached 12h
-  • Buy zone derived from ATR/swing-low instead of degenerate min/max
-  • EMA slope = % change vs price, not raw delta
-  • DST-safe window check using time(h,m)
-  • Top-N selection happens per tier, not globally
-  • Structured per-candidate JSONL logging for backtests
-
-P2
-  • Mobile-friendly Telegram layout (21-char rules, narrow rows)
-  • Tier groups sorted by sector for visual clustering
-  • Config dataclass — all magic numbers in one place
-  • Display TZ = America/Toronto; market TZ = America/New_York
+v3.2 vs v3.1 — alignment with market_intel v3.0 + symbols.yaml v3
+────────────────────────────────────────────────────────────────
+• Universe loaded from symbols.yaml (filter: roles ∋ "dip") —
+  no more hardcoded SECTOR_MAP / EXTRA_EMOJI duplication
+• Cooldown uses market_intel.mark_alert (single atomic state path)
+• Earnings uses market_intel.get_earnings_date (12h cache, central)
+• Price-stats fetch reuses market_intel._yf_download cache
+• Markdown escape + Telegram split delegated to market_intel
+• Config applies YAML settings.dip_scanner overrides at startup
+• Sector taxonomy now matches brief.py + intel scan output exactly
 """
 
 from __future__ import annotations
@@ -35,136 +20,108 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import sys
-import fcntl
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from datetime import datetime, time as dtime, timedelta
+from dataclasses import dataclass, field, replace
+from datetime import datetime, time as dtime
 from enum import Enum
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 from market_intel import (
-    SYMBOL_EMOJI, STATE_FILE,
-    _clean_df, calc_relative_strength, can_alert,
-    get_earnings_date, get_full_context, get_market_ctx,
-    load_json, now_est, save_json, send_telegram,
+    SECTORS,
+    SYMBOL_EMOJI,
+    SYMBOL_META,           # NEW: per-symbol metadata from yaml
+    SYMBOL_TO_SECTOR,
+    YAML_SETTINGS,         # NEW: optional overrides from yaml
+    _yf_download,          # cache-aware downloader
+    calc_relative_strength,
+    can_alert,
+    display_now,
+    get_earnings_date,     # already 12h-cached internally
+    get_full_context,
+    get_market_ctx,
+    mark_alert,            # atomic, used after confirmed send
+    market_now,
+    send_telegram,         # already auto-splits + escapes
+    tg_escape as md,
+    H_RULE as _MI_HRULE,   # we render our own narrower rule for mobile
 )
 
 # ════════════════════════════════════════════════════════════
-# CONFIG
+# CONFIG (with yaml overrides)
 # ════════════════════════════════════════════════════════════
 
-MARKET_TZ  = ZoneInfo("America/New_York")
-DISPLAY_TZ = ZoneInfo("America/Toronto")     # same offset, user-facing label
-
 LOGS_DIR = Path("logs"); LOGS_DIR.mkdir(exist_ok=True)
-EARNINGS_CACHE_FILE = "earnings_cache.json"
-QUALIFIED_LOG_FILE  = LOGS_DIR / "dip_qualified.jsonl"
+QUALIFIED_LOG_FILE = LOGS_DIR / "dip_qualified.jsonl"
 
-H_RULE   = "─────────────────────"
-TG_LIMIT = 4096
+H_RULE = "─────────────────────"   # 21 chars — mobile friendly
 
 
 @dataclass(frozen=True)
 class Config:
-    # qualification thresholds
-    rsi_min: float          = 25
-    rsi_max: float          = 48
-    drop_1d_max: float      = -1.5
-    drop_5d_max: float      = -4.0
-    ath_min: float          = -30.0
-    vol_ratio_min: float    = 0.6
-    ema200_flex_pct: float  = 5.0      # allow up to 5% below if slope rising
-    ema_slope_min_pct: float = 0.5     # min % rise over lookback to count
+    rsi_min: float           = 25
+    rsi_max: float           = 48
+    drop_1d_max: float       = -1.5
+    drop_5d_max: float       = -4.0
+    ath_min: float           = -30.0
+    vol_ratio_min: float     = 0.6
+    ema200_flex_pct: float   = 5.0
+    ema_slope_min_pct: float = 0.5
 
-    # cooldown / windows
-    cooldown_hours: int     = 4
+    cooldown_hours: int      = 4
     scan_window: tuple[dtime, dtime] = (dtime(7, 30), dtime(20, 30))
 
-    # fetch
-    fetch_workers: int      = 5
-    earnings_cache_ttl_h: int = 12
+    fetch_workers: int       = 5
+    max_loss_pct: float      = 8.0
 
-    # buy zone
-    max_loss_pct: float     = 8.0      # hard cap on stop distance
+    top_per_tier: int        = 5
+    max_total_shown: int     = 12
 
-    # alert layout
-    top_per_tier: int       = 5
-    max_total_shown: int    = 12
 
-CFG = Config()
+def _apply_yaml_overrides(cfg: Config) -> Config:
+    overrides = (YAML_SETTINGS or {}).get("dip_scanner") or {}
+    if not overrides:
+        return cfg
+    valid = {f.name for f in cfg.__dataclass_fields__.values()}
+    safe  = {k: v for k, v in overrides.items() if k in valid}
+    if safe:
+        logging.info(f"dip_scanner: applied yaml overrides: {sorted(safe)}")
+    return replace(cfg, **safe)
+
+CFG = _apply_yaml_overrides(Config())
 
 
 # ════════════════════════════════════════════════════════════
-# UNIVERSE
+# UNIVERSE — derived from symbols.yaml (no hardcoding)
 # ════════════════════════════════════════════════════════════
 
-SECTOR_MAP: dict[str, list[str]] = {
-    "🤖 AI & Software":          ['NVDA','MSFT','GOOGL','META','PLTR','CRM','NOW','SNOW',
-                                  'DDOG','CRWD','ADBE','ORCL','AI','PATH','BBAI','SOUN',
-                                  'UPST','NBIS','APP','S'],
-    "🔬 Semiconductors":          ['AMD','AVGO','TSM','ASML','MU','SMCI','MRVL','ARM',
-                                  'ANET','LSCC','MPWR','KLAC','AMAT','ONTO','ACLS'],
-    "⚛️ Quantum Computing":      ['IONQ','RGTI','QBTS','QUBT','ARQQ','QTUM'],
-    "☢️ Nuclear & Energy":        ['OKLO','CEG','VST','SMR','NNE','LEU','CCJ','UEC',
-                                  'BWXT','TLN'],
-    "🚀 Space & Defense":         ['RKLB','LUNR','ASTS','RDW','MNTS','PL','KTOS',
-                                  'LMT','RTX','NOC','LDOS'],
-    "🧬 Healthcare & Biotech":    ['LLY','NVO','REGN','MRNA','ISRG','DXCM','VEEV',
-                                  'ARGX','NBIX','EXAS','TEM','RXRX','CRSP','BEAM',
-                                  'NTLA','DNA'],
-    "💡 Photonics & Optics":      ['COHR','IIVI','LITE','CIEN','FNSR','POET','LAZR',
-                                  'LIDR','OUST'],
-    "₿ Crypto & Fintech":         ['MSTR','MARA','RIOT','COIN','IREN','SOFI','HOOD',
-                                  'NU','AFRM'],
-    "🏭 Mega Cap Tech":           ['AAPL','AMZN','TSLA','NFLX'],
-    "🛒 Consumer & Growth":       ['SHOP','UBER','SPOT','DUOL','CAVA','COST','CELH',
-                                  'ONON','DECK','BIRK'],
-    "💰 Financials":              ['JPM','V','MA','AXP','GS','SCHW'],
-    "🏗️ Infrastructure":          ['PWR','EME','PRIM','GEV','APH','ETN'],
-}
+def _build_dip_universe() -> tuple[list[str], dict[str, str]]:
+    """Symbols whose role list includes 'dip'. Falls back to all if meta empty."""
+    if SYMBOL_META:
+        syms = [s for s, m in SYMBOL_META.items() if "dip" in (m.get("roles") or [])]
+        if not syms:                            # no symbol opted in → use all
+            syms = list(SYMBOL_META.keys())
+    else:
+        # legacy fallback if yaml missing — use whatever market_intel exposes
+        syms = list({s for ss in SECTORS.values() for s in ss})
+    sym_sector = {s: SYMBOL_TO_SECTOR.get(s, "Other") for s in syms}
+    return syms, sym_sector
 
-DIP_UNIVERSE = list(dict.fromkeys(s for syms in SECTOR_MAP.values() for s in syms))
-
-# Symbol → primary sector (first occurrence wins; PLTR → AI & Software)
-SYMBOL_SECTOR: dict[str, str] = {}
-for sector, syms in SECTOR_MAP.items():
-    for s in syms:
-        SYMBOL_SECTOR.setdefault(s, sector)
-
-EXTRA_EMOJI = {
-    'AAPL':'🍎','AVGO':'🔷','TSM':'🏭','ASML':'🔬','SMCI':'💻','MRVL':'🛸',
-    'ARM':'🦾','CRM':'☁️','ADBE':'🎨','ORCL':'🗄️','CRWD':'🛡️','PLTR':'🔮',
-    'SNOW':'❄️','NOW':'⏱️','DDOG':'🐕','APP':'📱','DUOL':'🦉','HOOD':'🏹',
-    'CEG':'⚡','VST':'🔌','SMR':'⚛️','NNE':'☢️','LLY':'💊','REGN':'🧬',
-    'JPM':'🏦','V':'💳','MA':'💳','AXP':'🪙','QUBT':'🔬','MSTR':'₿','MARA':'⛏️',
-    'RIOT':'⛏️','COIN':'🪙','SHOP':'🛍️','UBER':'🚗','SPOT':'🎵','ANET':'🌐',
-    'COST':'🏪','CAVA':'🫒','IONQ':'⚛️','RGTI':'⚛️','QBTS':'⚛️','OKLO':'☢️',
-    'CCJ':'☢️','LEU':'☢️','RKLB':'🚀','LUNR':'🌙','ASTS':'📡','ISRG':'🤖',
-    'MRNA':'💉','CRSP':'✂️','COHR':'💡','LAZR':'💡','AI':'🤖','SOUN':'🔊',
-    'PATH':'🤖','SOFI':'💰','NU':'💜','AFRM':'💳','PWR':'🏗️','GEV':'⚡',
-    'NFLX':'🎬','TSLA':'⚡','AMD':'🔴','NVDA':'💚','META':'👓','GOOGL':'🔍',
-    'MSFT':'🪟','AMZN':'📦','UEC':'☢️','BWXT':'☢️','TLN':'⚡','KTOS':'🎯',
-    'ARQQ':'⚛️','POET':'💡','DNA':'🧬','RXRX':'🧪',
-}
-FULL_EMOJI = {**SYMBOL_EMOJI, **EXTRA_EMOJI}
+DIP_UNIVERSE, SYMBOL_SECTOR = _build_dip_universe()
+SECTOR_COUNT = len({s for s in SYMBOL_SECTOR.values()})
 
 
 # ════════════════════════════════════════════════════════════
 # CLOCK
 # ════════════════════════════════════════════════════════════
 
-def market_now()  -> datetime: return now_est().astimezone(MARKET_TZ)
-def display_now() -> datetime: return market_now().astimezone(DISPLAY_TZ)
-def is_weekend()  -> bool:     return market_now().weekday() >= 5
+def is_weekend() -> bool:
+    return market_now().weekday() >= 5
 
 def in_window(win: tuple[dtime, dtime]) -> bool:
     t = market_now().time()
@@ -172,84 +129,18 @@ def in_window(win: tuple[dtime, dtime]) -> bool:
 
 
 # ════════════════════════════════════════════════════════════
-# TELEGRAM ESCAPING
+# COOLDOWN (uses market_intel atomic state)
 # ════════════════════════════════════════════════════════════
 
-_MD_SPECIALS = re.compile(r"([_*`\[])")
+def cooldown_key(symbol: str) -> str:
+    return f"dip_alert_{symbol}"
 
-def md(text: Any) -> str:
-    if text is None: return "—"
-    return _MD_SPECIALS.sub(r"\\\1", str(text))
-
-
-# ════════════════════════════════════════════════════════════
-# ATOMIC STATE
-# ════════════════════════════════════════════════════════════
-
-def _state_update(mutator) -> None:
-    Path(STATE_FILE).touch(exist_ok=True)
-    with open(STATE_FILE, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            try:
-                state = json.loads(f.read() or "{}")
-            except json.JSONDecodeError:
-                logging.warning("State corrupt; resetting")
-                state = {}
-            mutator(state)
-            f.seek(0); f.truncate()
-            json.dump(state, f)
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-def record_alert_fired(symbol: str) -> None:
-    key = f"dip_alert_{symbol}"
-    now_iso = market_now().isoformat()
-    _state_update(lambda s: s.__setitem__(key, now_iso))
-
-def cooldown_hours_left(symbol: str) -> float:
-    """0 = ready to alert; >0 = hours of cooldown remaining."""
-    key = f"dip_alert_{symbol}"
-    try:
-        if can_alert(key, CFG.cooldown_hours):
-            return 0.0
-        state = load_json(STATE_FILE) if Path(STATE_FILE).exists() else {}
-        last_str = state.get(key)
-        if not last_str:
-            return 0.0
-        last = datetime.fromisoformat(last_str)
-        if last.tzinfo is None:
-            last = last.replace(tzinfo=MARKET_TZ)
-        elapsed_h = (market_now() - last).total_seconds() / 3600
-        return max(0.0, CFG.cooldown_hours - elapsed_h)
-    except Exception as e:
-        logging.warning(f"cooldown check {symbol}: {e}")
-        return 0.0  # fail open
+def is_in_cooldown(symbol: str) -> bool:
+    return not can_alert(cooldown_key(symbol), CFG.cooldown_hours)
 
 
 # ════════════════════════════════════════════════════════════
-# EARNINGS CACHE (12h)
-# ════════════════════════════════════════════════════════════
-
-def get_earnings_cached(symbol: str) -> tuple:
-    cache = load_json(EARNINGS_CACHE_FILE, {})
-    rec = cache.get(symbol)
-    if rec:
-        cached_at = datetime.fromisoformat(rec["cached_at"])
-        if datetime.now(MARKET_TZ) - cached_at < timedelta(hours=CFG.earnings_cache_ttl_h):
-            return rec.get("date"), rec.get("days")
-    try:
-        ed, days = get_earnings_date(symbol)
-    except Exception:
-        ed, days = None, None
-    cache[symbol] = {"date": ed, "days": days,
-                     "cached_at": datetime.now(MARKET_TZ).isoformat()}
-    save_json(EARNINGS_CACHE_FILE, cache)
-    return ed, days
-
-
-# ════════════════════════════════════════════════════════════
-# SINGLE PRICE-HISTORY DOWNLOAD per ticker (replaces 2 separate calls)
+# PRICE STATS — reuses market_intel._yf_download cache
 # ════════════════════════════════════════════════════════════
 
 @dataclass
@@ -260,38 +151,30 @@ class PriceStats:
     atr_14: float | None
 
 def fetch_price_stats(symbol: str) -> PriceStats:
+    df = _yf_download(symbol, period="1y", interval="1d")
+    if df is None or df.empty or len(df) < 30:
+        return PriceStats(None, None, None, None)
     try:
-        df = yf.download(symbol, period="1y", interval="1d",
-                         progress=False, auto_adjust=True)
-        if df is None or df.empty:
-            return PriceStats(None, None, None, None)
-        df = _clean_df(df)
-        if len(df) < 30:
-            return PriceStats(None, None, None, None)
-
         close = df["Close"]
-
         # 5d change
         drop_5d = float((close.iloc[-1] / close.iloc[-6] - 1) * 100) if len(close) >= 6 else None
 
-        # EMA200 slope as % change vs current price over 10 bars
+        # EMA200 slope as % of price over 10 bars
         ema200_rising = None
         if len(close) >= 210:
             ema = close.ewm(span=200, adjust=False).mean()
             pct = float((ema.iloc[-1] - ema.iloc[-10]) / close.iloc[-1] * 100)
             ema200_rising = pct >= CFG.ema_slope_min_pct
 
-        # 20-day swing low (excluding today)
+        # 20-day swing low (excludes today's partial)
         swing_low_20d = float(close.iloc[-21:-1].min()) if len(close) >= 21 else None
 
-        # ATR(14) — Wilder's
+        # ATR(14) — Wilder
         atr_14 = None
-        if len(df) >= 15 and {"High","Low","Close"}.issubset(df.columns):
+        if len(df) >= 15 and {"High", "Low", "Close"}.issubset(df.columns):
             high, low = df["High"], df["Low"]
-            prev_close = close.shift(1)
-            tr = pd.concat([high - low,
-                            (high - prev_close).abs(),
-                            (low  - prev_close).abs()], axis=1).max(axis=1)
+            prev = close.shift(1)
+            tr = pd.concat([high - low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
             atr_14 = float(tr.rolling(14).mean().iloc[-1])
 
         return PriceStats(drop_5d, ema200_rising, swing_low_20d, atr_14)
@@ -336,12 +219,14 @@ def qualify_dip(ctx: dict, stats: PriceStats) -> QualifyResult:
     res = QualifyResult()
     sym = ctx["symbol"]
 
-    # ─── Trend ─────────────────────────────────────────────
-    if not ctx.get("ema200") or ctx["ema200"] <= 0:
+    # Use ema200_real if exposed by market_intel v3.0 — None if insufficient history
+    ema200 = ctx.get("ema200_real") or ctx.get("ema200")
+    if not ema200 or ema200 <= 0:
         res.fail_code, res.fail_detail = FailCode.MISSING_FIELDS, "ema200"
         return res
-    pct_from_ema200 = (ctx["current"] / ctx["ema200"] - 1) * 100
-    above_200 = ctx["current"] > ctx["ema200"]
+
+    pct_from_ema200 = (ctx["current"] / ema200 - 1) * 100
+    above_200 = ctx["current"] > ema200
 
     if above_200:
         res.trend_note = f"Above EMA200 ({pct_from_ema200:+.1f}%)"
@@ -357,19 +242,16 @@ def qualify_dip(ctx: dict, stats: PriceStats) -> QualifyResult:
         res.fail_detail = f"{pct_from_ema200:+.1f}%"
         return res
 
-    # ─── RSI ───────────────────────────────────────────────
+    # RSI
     rsi = ctx["rsi"]
     if rsi < CFG.rsi_min:
-        res.fail_code, res.fail_detail = FailCode.RSI_TOO_LOW, f"{rsi:.0f}"
-        return res
+        res.fail_code, res.fail_detail = FailCode.RSI_TOO_LOW, f"{rsi:.0f}"; return res
     if rsi > CFG.rsi_max:
-        res.fail_code, res.fail_detail = FailCode.RSI_TOO_HIGH, f"{rsi:.0f}"
-        return res
+        res.fail_code, res.fail_detail = FailCode.RSI_TOO_HIGH, f"{rsi:.0f}"; return res
 
-    # ─── Dip ───────────────────────────────────────────────
+    # Dip
     if stats.drop_5d is None:
-        res.fail_code = FailCode.NO_5D_DATA
-        return res
+        res.fail_code = FailCode.NO_5D_DATA; return res
     res.drop_5d = stats.drop_5d
     day_drop = ctx["day_change_pct"]
     if not (day_drop <= CFG.drop_1d_max or stats.drop_5d <= CFG.drop_5d_max):
@@ -377,30 +259,26 @@ def qualify_dip(ctx: dict, stats: PriceStats) -> QualifyResult:
         res.fail_detail = f"1d {day_drop:+.1f}% / 5d {stats.drop_5d:+.1f}%"
         return res
 
-    # ─── ATH ───────────────────────────────────────────────
+    # ATH
     if ctx["ath_pct"] < CFG.ath_min:
         res.fail_code = FailCode.TOO_FAR_FROM_ATH
-        res.fail_detail = f"{ctx['ath_pct']:+.0f}%"
-        return res
+        res.fail_detail = f"{ctx['ath_pct']:+.0f}%"; return res
 
-    # ─── Volume ────────────────────────────────────────────
+    # Volume
     if ctx["vol_ratio"] < CFG.vol_ratio_min:
         res.fail_code = FailCode.VOLUME_THIN
-        res.fail_detail = f"{ctx['vol_ratio']:.2f}×"
-        return res
+        res.fail_detail = f"{ctx['vol_ratio']:.2f}×"; return res
 
-    # ─── Earnings ──────────────────────────────────────────
-    _, days_to_earn = get_earnings_cached(sym)
+    # Earnings (central cache)
+    _, days_to_earn = get_earnings_date(sym)
     if days_to_earn is not None and 0 <= days_to_earn <= 3:
         res.fail_code = FailCode.EARNINGS_SOON
-        res.fail_detail = f"{days_to_earn}d"
-        return res
+        res.fail_detail = f"{days_to_earn}d"; return res
 
-    # ═══ Scoring (0–16) ════════════════════════════════════
+    # ─── Scoring (0–16) ────────────────────────────────────
     score, reasons = 0, []
     above_50 = ctx["current"] > ctx["ema50"]
 
-    # Trend (1–3)
     if above_50 and above_200:
         score += 3; reasons.append("📈 Strong trend (above EMA50 & EMA200)")
     elif above_200:
@@ -408,7 +286,6 @@ def qualify_dip(ctx: dict, stats: PriceStats) -> QualifyResult:
     else:
         score += 1; reasons.append("⚠️ Testing EMA200 (slope rising)")
 
-    # RSI depth (1–3)
     if rsi <= 30:
         score += 3; reasons.append(f"🔥 Deeply oversold (RSI {rsi:.0f})")
     elif rsi <= 35:
@@ -416,24 +293,20 @@ def qualify_dip(ctx: dict, stats: PriceStats) -> QualifyResult:
     else:
         score += 1; reasons.append(f"📊 Cooling off (RSI {rsi:.0f})")
 
-    # ATH proximity (0–3)
     ap = ctx["ath_pct"]
     if   ap > -5:  score += 3; reasons.append(f"🏔️ Very near ATH ({ap:+.1f}%)")
     elif ap > -10: score += 2; reasons.append(f"📍 Close to ATH ({ap:+.1f}%)")
     elif ap > -20: score += 1; reasons.append(f"📍 Moderate pullback ({ap:+.1f}%)")
 
-    # Volume (0–2)
     vr = ctx["vol_ratio"]
     if   vr > 1.8: score += 2; reasons.append(f"🔊 High vol capitulation ({vr:.1f}×)")
     elif vr > 1.2: score += 1; reasons.append(f"📊 Above-avg volume ({vr:.1f}×)")
 
-    # 5d severity (1–3)
     d5 = stats.drop_5d
     if   d5 <= -10: score += 3; reasons.append(f"💥 Sharp 5d selloff ({d5:+.1f}%)")
     elif d5 <= -7:  score += 2; reasons.append(f"📉 Significant 5d drop ({d5:+.1f}%)")
     else:           score += 1; reasons.append(f"📉 Moderate 5d dip ({d5:+.1f}%)")
 
-    # RS (0–2)
     try:
         rs_score, rs_label = calc_relative_strength(ctx)
         res.rs_score, res.rs_label = rs_score, rs_label
@@ -443,23 +316,21 @@ def qualify_dip(ctx: dict, stats: PriceStats) -> QualifyResult:
     except Exception as e:
         logging.debug(f"RS {sym}: {e}")
 
-    # ─── Buy zone (ATR / swing-low aware) ──────────────────
+    # Buy zone (ATR / swing-low aware)
     current = ctx["current"]
-    atr = stats.atr_14 or (current * 0.02)              # 2% fallback
-    swing = stats.swing_low_20d or (current - 2 * atr)
-    ema50 = ctx["ema50"]
+    atr     = stats.atr_14 or (current * 0.02)
+    swing   = stats.swing_low_20d or (current - 2 * atr)
+    ema50   = ctx["ema50"]
 
-    # Lower band: swing low or EMA50 - 0.5 ATR, whichever higher (tighter)
     buy_low  = max(swing, ema50 - 0.5 * atr)
     buy_high = max(current, ema50)
     if buy_low >= buy_high:
         buy_low = buy_high * 0.99
 
-    # Stop: max of (EMA200, swing-low - 1 ATR), but cap loss at max_loss_pct
-    raw_stop = max(ctx["ema200"], swing - atr)
+    raw_stop = max(ema200, swing - atr)
     cap_stop = current * (1 - CFG.max_loss_pct / 100)
     stop = max(raw_stop, cap_stop)
-    stop = min(stop, current * 0.999)                   # never above price
+    stop = min(stop, current * 0.999)
 
     res.qualified = True
     res.score = score
@@ -469,7 +340,7 @@ def qualify_dip(ctx: dict, stats: PriceStats) -> QualifyResult:
 
 
 # ════════════════════════════════════════════════════════════
-# ALERT FORMATTING
+# ALERT FORMATTING — uses SYMBOL_META for company name + exchange
 # ════════════════════════════════════════════════════════════
 
 def _tier(score: int) -> tuple[str, str]:
@@ -477,11 +348,22 @@ def _tier(score: int) -> tuple[str, str]:
     if score >= 9:  return ("⭐", "STRONG")
     return ("✅", "WATCHLIST")
 
+def _name_label(sym: str) -> str:
+    """e.g. 'NVDA — NVIDIA Corp. (NASDAQ)' if metadata available."""
+    meta = SYMBOL_META.get(sym, {})
+    name = meta.get("name", "")
+    exch = meta.get("exchange", "")
+    if name and exch:
+        return f"{md(sym)} — {md(name)} ({md(exch)})"
+    if name:
+        return f"{md(sym)} — {md(name)}"
+    return md(sym)
+
 def format_candidate(c: dict, rank: int) -> str:
     ctx, q = c["ctx"], c["q"]
-    sym = ctx["symbol"]
-    em  = FULL_EMOJI.get(sym, "📊")
-    sector = SYMBOL_SECTOR.get(sym, "📊 Other")
+    sym    = ctx["symbol"]
+    em     = SYMBOL_EMOJI.get(sym, "📊")
+    sector = SYMBOL_SECTOR.get(sym, "Other")
     badge, _ = _tier(q.score)
 
     rs_part = ""
@@ -491,8 +373,8 @@ def format_candidate(c: dict, rank: int) -> str:
 
     stop_pct = (q.stop / ctx["current"] - 1) * 100 if q.stop else 0
 
-    block  = f"\n{badge} *#{rank} {md(sym)}* `${ctx['current']:.2f}` • Score *{q.score}/16*\n"
-    block += f"   {md(sector)}\n"
+    block  = f"\n{badge} *#{rank}* {em} {_name_label(sym)}\n"
+    block += f"   `${ctx['current']:.2f}` • Score *{q.score}/16* • {md(sector)}\n"
     block += f"   1D `{ctx['day_change_pct']:+.2f}%` • 5D `{q.drop_5d:+.2f}%` • RSI `{ctx['rsi']:.0f}`\n"
     block += f"   ATH `{ctx['ath_pct']:+.1f}%` • Vol `{ctx['vol_ratio']:.1f}×`{rs_part}\n"
     for r in q.reasons[:2]:
@@ -503,8 +385,7 @@ def format_candidate(c: dict, rank: int) -> str:
 
 
 def format_alert(candidates: list[dict], market_ctx: dict, stats: dict) -> str:
-    now = display_now()
-    ts = now.strftime("%a %b %d • %I:%M %p ET")
+    ts = display_now().strftime("%a %b %d • %I:%M %p ET")
 
     msg  = f"🎯 *DIP SCANNER*\n"
     msg += f"🕒 {ts}\n"
@@ -524,7 +405,6 @@ def format_alert(candidates: list[dict], market_ctx: dict, stats: dict) -> str:
         if   vix_p >= 25: msg += "_⚠️ High VIX — reduce position sizes_\n"
         elif vix_p >= 20: msg += "_⚡ Elevated VIX — be selective_\n"
 
-    # Group by tier; within each tier, sort by sector then score
     tiers = {"ELITE": [], "STRONG": [], "WATCHLIST": []}
     for c in candidates:
         _, name = _tier(c["q"].score)
@@ -566,26 +446,6 @@ def format_alert(candidates: list[dict], market_ctx: dict, stats: dict) -> str:
     return msg
 
 
-def split_for_telegram(msg: str, limit: int = TG_LIMIT) -> list[str]:
-    if len(msg) <= limit:
-        return [msg]
-    chunks, current = [], ""
-    for block in msg.split("\n\n"):
-        cand = (current + "\n\n" + block) if current else block
-        if len(cand) <= limit:
-            current = cand
-        else:
-            if current: chunks.append(current)
-            while len(block) > limit:
-                chunks.append(block[:limit]); block = block[limit:]
-            current = block
-    if current: chunks.append(current)
-    if len(chunks) > 1:
-        chunks = [f"{c}\n\n_(part {i+1}/{len(chunks)})_" if i < len(chunks) - 1 else c
-                  for i, c in enumerate(chunks)]
-    return chunks
-
-
 # ════════════════════════════════════════════════════════════
 # SCAN PIPELINE
 # ════════════════════════════════════════════════════════════
@@ -595,7 +455,7 @@ def _scan_one(symbol: str) -> tuple[str, dict | None, PriceStats | None, str | N
         ctx = get_full_context(symbol)
         if not ctx:
             return symbol, None, None, "no_ctx"
-        required = ("current","ema200","ema50","rsi","day_change_pct","ath_pct","vol_ratio")
+        required = ("current", "ema50", "rsi", "day_change_pct", "ath_pct", "vol_ratio")
         if any(ctx.get(f) is None for f in required):
             return symbol, None, None, "missing_fields"
         stats = fetch_price_stats(symbol)
@@ -606,9 +466,9 @@ def _scan_one(symbol: str) -> tuple[str, dict | None, PriceStats | None, str | N
 
 def run_dip_scan() -> None:
     print(f"\n{'='*50}")
-    print(f"🎯 ALPHAEDGE DIP SCANNER v3.1")
+    print(f"🎯 ALPHAEDGE DIP SCANNER v3.2")
     print(f"🕒 {display_now().strftime('%Y-%m-%d %H:%M ET')}")
-    print(f"📊 Universe: {len(DIP_UNIVERSE)} stocks / {len(SECTOR_MAP)} sectors")
+    print(f"📊 Universe: {len(DIP_UNIVERSE)} stocks / {SECTOR_COUNT} sectors")
     print('='*50)
     logging.info(f"Scan start | universe={len(DIP_UNIVERSE)}")
 
@@ -620,10 +480,9 @@ def run_dip_scan() -> None:
 
     market_ctx = get_market_ctx()
 
-    # Pre-filter cooldown
     eligible, in_cooldown = [], 0
     for sym in DIP_UNIVERSE:
-        if cooldown_hours_left(sym) > 0:
+        if is_in_cooldown(sym):
             in_cooldown += 1
         else:
             eligible.append(sym)
@@ -651,7 +510,6 @@ def run_dip_scan() -> None:
             print(f"  {sym:6s} 🎯 score={q.score}/16")
             candidates.append({"ctx": ctx, "q": q})
 
-    # Sort by score then deeper dip
     candidates.sort(key=lambda c: (-c["q"].score, c["q"].drop_5d or 0))
 
     print(f"\n{'-'*50}")
@@ -672,32 +530,29 @@ def run_dip_scan() -> None:
                "cooldown": in_cooldown, "disqualified": disq},
     )
 
-    # Send first; only commit cooldown for symbols that actually went out
-    sent_ok = True
-    for chunk in split_for_telegram(msg):
-        if not send_telegram(chunk, silent=False):
-            sent_ok = False
-            logging.error(f"Telegram chunk failed (len={len(chunk)})")
+    # send_telegram already handles auto-split + parse-mode fallback
+    sent_ok = send_telegram(msg, silent=False)
 
     if sent_ok:
         for c in candidates[: CFG.max_total_shown]:
             sym = c["ctx"]["symbol"]
-            record_alert_fired(sym)
+            mark_alert(cooldown_key(sym))     # ← atomic, only after send
             try:
                 with open(QUALIFIED_LOG_FILE, "a") as f:
                     f.write(json.dumps({
-                        "ts":    market_now().isoformat(),
-                        "sym":   sym,
-                        "score": c["q"].score,
-                        "rsi":   c["ctx"]["rsi"],
-                        "drop_5d": c["q"].drop_5d,
+                        "ts":       market_now().isoformat(),
+                        "sym":      sym,
+                        "score":    c["q"].score,
+                        "rsi":      c["ctx"]["rsi"],
+                        "drop_5d":  c["q"].drop_5d,
                         "buy_low":  c["q"].buy_low,
                         "buy_high": c["q"].buy_high,
-                        "stop": c["q"].stop,
+                        "stop":     c["q"].stop,
                     }) + "\n")
             except Exception as e:
                 logging.warning(f"jsonl log {sym}: {e}")
-        print(f"\n✅ Alert sent ({len(candidates)} qualified, top {min(CFG.max_total_shown, len(candidates))} shown)")
+        print(f"\n✅ Alert sent ({len(candidates)} qualified, "
+              f"top {min(CFG.max_total_shown, len(candidates))} shown)")
     else:
         print("\n❌ Telegram send failed — cooldown NOT recorded; will retry next scan")
 
@@ -712,8 +567,7 @@ def run_diagnostics() -> None:
         print(f"\n{'-'*40}\n📊 {symbol}")
         try:
             ctx = get_full_context(symbol)
-            if not ctx:
-                print("   ❌ no ctx"); continue
+            if not ctx: print("   ❌ no ctx"); continue
             stats = fetch_price_stats(symbol)
             print(f"   Price ${ctx.get('current')} • EMA50 ${ctx.get('ema50')} • EMA200 ${ctx.get('ema200')}")
             print(f"   RSI {ctx.get('rsi')} • Day {ctx.get('day_change_pct')}% • ATH {ctx.get('ath_pct')}%")
