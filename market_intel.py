@@ -225,21 +225,28 @@ def _load_from_yaml():
 
 _yaml = _load_from_yaml()
 if _yaml:
-    MONITOR_LIST, SECTORS, SYMBOL_EMOJI = _yaml
-    logging.info(f"market_intel: loaded {len(MONITOR_LIST)} symbols from yaml")
+    MONITOR_LIST  = _yaml["symbols"]
+    SECTORS       = _yaml["sectors"]
+    SYMBOL_EMOJI  = _yaml["emoji"]
+    SYMBOL_META   = _yaml["meta"]            # NEW — exposed for brief headers
+    YAML_SETTINGS = _yaml["settings"]        # NEW — exposed for Config overrides
+    logging.info(f"market_intel: loaded {len(MONITOR_LIST)} symbols from yaml "
+                 f"({len(SECTORS)} sectors)")
 else:
+    SYMBOL_META   = {}                        # NEW — empty fallback
+    YAML_SETTINGS = {}                        # NEW — empty fallback
     SECTORS = {
-        "AI/Semis":       ["NVDA", "AMD", "MU", "SNDK", "NBIS"],
-        "Crypto":         ["BTC-USD", "ETH-USD", "XRP-USD"],
-        "Crypto-Adj":     ["IREN"],            # SOFI removed (was duplicate)
-        "Quantum":        ["IONQ", "RGTI", "QBTS"],
-        "Nuclear/Energy": ["OKLO", "UAMY"],
-        "Mega Tech":      ["GOOGL", "MSFT", "META", "AMZN", "AAPL"],
-        "EV/Auto":        ["TSLA"],
-        "Fintech":        ["SOFI"],
-        "Biotech":        ["NVO", "WGRX"],
-        "Streaming":      ["NFLX"],
-        "Safe Haven":     ["GC=F"],
+        "AI / Semis":         ["NVDA", "AMD", "MU", "SNDK", "NBIS"],
+        "Crypto":             ["BTC-USD", "ETH-USD", "XRP-USD"],
+        "Crypto Mining":      ["IREN"],
+        "Quantum":            ["IONQ", "RGTI", "QBTS"],
+        "Nuclear / Energy":   ["OKLO", "UAMY"],
+        "Mega Tech":          ["GOOGL", "MSFT", "META", "AMZN", "AAPL"],
+        "EV / Auto":          ["TSLA"],
+        "Fintech":            ["SOFI"],
+        "Healthcare":         ["NVO", "WGRX"],
+        "Streaming":          ["NFLX"],
+        "Safe Haven":         ["GC=F"],
     }
     MONITOR_LIST = list(dict.fromkeys(s for syms in SECTORS.values() for s in syms))
     SYMBOL_EMOJI = {
@@ -251,13 +258,13 @@ else:
         "OKLO": "☢️", "IREN": "🪙", "UAMY": "⚒️", "WGRX": "💊",
         "SOFI": "🏦", "NVO": "💉",
     }
+    logging.info("market_intel: symbols.yaml not found — using hardcoded fallback")
 
 # Reverse lookup (PRIMARY sector — first-write wins)
 SYMBOL_TO_SECTOR: dict[str, str] = {}
 for _sec, _syms in SECTORS.items():
     for _s in _syms:
         SYMBOL_TO_SECTOR.setdefault(_s, _sec)
-
 
 # ════════════════════════════════════════════════════════════
 # PER-SCAN CACHES (in-memory, cleared per scan)
