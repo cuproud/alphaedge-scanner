@@ -1,97 +1,165 @@
-# ═══════════════════════════════════════════════════════
-# ALPHAEDGE UNIVERSE CONFIGURATION
-# ═══════════════════════════════════════════════════════
-# Edit this file to add/remove symbols across ALL scanners.
-# No code changes needed. Just update here and restart.
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# ALPHAEDGE UNIVERSE CONFIGURATION  v3.0
+# ═══════════════════════════════════════════════════════════════
+# Single source of truth for ALL scanners.
+# Edit here → restart any scanner → changes take effect.
+#
+# Schema (per stock):
+#   symbol:     "TICKER"            (yfinance-compatible — required)
+#   name:       "Company Inc."      (used in brief headers — required)
+#   exchange:   "NASDAQ" | "NYSE" | "CRYPTO" | "COMEX"
+#   asset_class: "stock" | "crypto" | "commodity"   (drives session logic)
+#   emoji:      "💎"                (single emoji for Telegram — required)
+#   sector:     "AI / Semis"        (PRIMARY — used for bleed/leadership)
+#   tags:       ["Crypto-Adj"]      (secondary classifications, optional)
+#   roles:      ["intel","brief","dip"]   (which scanners include this)
+#   session:    "regular" | "extended" | "24h"
+#
+# Validation rules (enforced by loader):
+#   • symbol must be unique
+#   • emoji length must be 1–2 chars
+#   • sector must be in `sectors_canonical` list at the bottom
+#   • asset_class ∈ {stock, crypto, commodity}
+#   • roles must be subset of {intel, brief, dip, scanner}
+# ═══════════════════════════════════════════════════════════════
 
-# ─── Crypto & Commodities (24/7 tradable) ───
-crypto:
-  - { symbol: BTC-USD, emoji: ₿,  sector: Crypto }
-  - { symbol: ETH-USD, emoji: Ξ,  sector: Crypto }
-  - { symbol: XRP-USD, emoji: ◇,  sector: Crypto }
-  - { symbol: GC=F,    emoji: 🥇, sector: Safe Haven }
+schema_version: 3
 
-# ─── Extended-Hours Stocks (pre-market + after-hours) ───
-extended_hours:
-  - { symbol: NVDA,  emoji: 💎, sector: AI/Semis }
-  - { symbol: TSLA,  emoji: 🚘, sector: EV/Auto }
-  - { symbol: AMD,   emoji: ⚡, sector: AI/Semis }
-  - { symbol: MSFT,  emoji: 🪟, sector: Mega Tech }
-  - { symbol: META,  emoji: 👓, sector: Mega Tech }
-  - { symbol: AMZN,  emoji: 📦, sector: Mega Tech }
-  - { symbol: GOOGL, emoji: 🔍, sector: Mega Tech }
-  - { symbol: NFLX,  emoji: 🎬, sector: Streaming }
-  - { symbol: AAPL,  emoji: 🍎, sector: Mega Tech }
+# ─── Crypto & Commodities (24/7 — no session filtering) ───────
+universe:
 
-# ─── Regular-Hours Only ───
-regular_hours:
-  - { symbol: MU,   emoji: 💾, sector: AI/Semis }
-  - { symbol: SNDK, emoji: 💽, sector: AI/Semis }
-  - { symbol: NBIS, emoji: 🌐, sector: AI/Semis }
-  - { symbol: IONQ, emoji: ⚛️, sector: Quantum }
-  - { symbol: RGTI, emoji: 🧪, sector: Quantum }
-  - { symbol: QBTS, emoji: 🔬, sector: Quantum }
-  - { symbol: OKLO, emoji: ☢️, sector: Nuclear/Energy }
-  - { symbol: IREN, emoji: 🪙, sector: Crypto Mining }
-  - { symbol: UAMY, emoji: ⚒️, sector: Materials }
-  - { symbol: WGRX, emoji: 💊, sector: Biotech }
-  - { symbol: SOFI, emoji: 🏦, sector: Fintech }
-  - { symbol: NVO,  emoji: 💉, sector: Pharma }
+  - { symbol: "BTC-USD", name: "Bitcoin",   exchange: "CRYPTO", asset_class: "crypto",    emoji: "₿",  sector: "Crypto",     session: "24h", roles: ["intel","brief"] }
+  - { symbol: "ETH-USD", name: "Ethereum",  exchange: "CRYPTO", asset_class: "crypto",    emoji: "Ξ",  sector: "Crypto",     session: "24h", roles: ["intel","brief"] }
+  - { symbol: "XRP-USD", name: "Ripple",    exchange: "CRYPTO", asset_class: "crypto",    emoji: "◇",  sector: "Crypto",     session: "24h", roles: ["intel","brief"] }
+  - { symbol: "GC=F",    name: "Gold Futures", exchange: "COMEX", asset_class: "commodity", emoji: "🥇", sector: "Safe Haven", session: "24h", roles: ["intel","brief"] }
 
-# ─── Extra symbols for Dip Scanner only ───
-# (these are scanned for dips but NOT in main signal scanner
-#  to avoid alert overload)
-dip_extras:
-  - { symbol: AVGO, emoji: 🔷, sector: AI/Semis }
-  - { symbol: TSM,  emoji: 🏭, sector: AI/Semis }
-  - { symbol: ASML, emoji: 🔬, sector: AI/Semis }
-  - { symbol: SMCI, emoji: 💻, sector: AI/Semis }
-  - { symbol: MRVL, emoji: 🛸, sector: AI/Semis }
-  - { symbol: ARM,  emoji: 🦾, sector: AI/Semis }
-  - { symbol: CRM,  emoji: ☁️, sector: SaaS }
-  - { symbol: ADBE, emoji: 🎨, sector: SaaS }
-  - { symbol: ORCL, emoji: 🗄️, sector: SaaS }
-  - { symbol: CRWD, emoji: 🛡️, sector: Cybersec }
-  - { symbol: PLTR, emoji: 🔮, sector: AI/Data }
-  - { symbol: SNOW, emoji: ❄️, sector: SaaS }
-  - { symbol: NOW,  emoji: ⏱️, sector: SaaS }
-  - { symbol: DDOG, emoji: 🐕, sector: SaaS }
-  - { symbol: APP,  emoji: 📱, sector: AdTech }
-  - { symbol: DUOL, emoji: 🦉, sector: EdTech }
-  - { symbol: HOOD, emoji: 🏹, sector: Fintech }
-  - { symbol: CEG,  emoji: ⚡, sector: Nuclear/Energy }
-  - { symbol: VST,  emoji: 🔌, sector: Nuclear/Energy }
-  - { symbol: SMR,  emoji: ⚛️, sector: Nuclear/Energy }
-  - { symbol: NNE,  emoji: ☢️, sector: Nuclear/Energy }
-  - { symbol: LLY,  emoji: 💊, sector: Pharma }
-  - { symbol: REGN, emoji: 🧬, sector: Biotech }
-  - { symbol: JPM,  emoji: 🏦, sector: Financial }
-  - { symbol: V,    emoji: 💳, sector: Financial }
-  - { symbol: MA,   emoji: 💳, sector: Financial }
-  - { symbol: AXP,  emoji: 🪙, sector: Financial }
-  - { symbol: QUBT, emoji: 🔬, sector: Quantum }
-  - { symbol: MSTR, emoji: ₿,  sector: Crypto-Adj }
-  - { symbol: MARA, emoji: ⛏️, sector: Crypto Mining }
-  - { symbol: RIOT, emoji: ⛏️, sector: Crypto Mining }
-  - { symbol: COIN, emoji: 🪙, sector: Crypto-Adj }
-  - { symbol: SHOP, emoji: 🛍️, sector: E-Commerce }
-  - { symbol: UBER, emoji: 🚗, sector: Gig Economy }
-  - { symbol: SPOT, emoji: 🎵, sector: Streaming }
-  - { symbol: ANET, emoji: 🌐, sector: Networking }
-  - { symbol: COST, emoji: 🏪, sector: Retail }
-  - { symbol: CAVA, emoji: 🫒, sector: Restaurants }
+  # ─── Mega Tech (extended-hours capable) ─────────────────────
+  - { symbol: "AAPL",  name: "Apple Inc.",                exchange: "NASDAQ", asset_class: "stock", emoji: "🍎", sector: "Mega Tech", session: "extended", roles: ["intel","brief","dip"] }
+  - { symbol: "MSFT",  name: "Microsoft Corp.",           exchange: "NASDAQ", asset_class: "stock", emoji: "🪟", sector: "Mega Tech", session: "extended", roles: ["intel","brief","dip"] }
+  - { symbol: "GOOGL", name: "Alphabet Inc. Class A",     exchange: "NASDAQ", asset_class: "stock", emoji: "🔍", sector: "Mega Tech", session: "extended", roles: ["intel","brief","dip"] }
+  - { symbol: "META",  name: "Meta Platforms",            exchange: "NASDAQ", asset_class: "stock", emoji: "👓", sector: "Mega Tech", session: "extended", roles: ["intel","brief","dip"] }
+  - { symbol: "AMZN",  name: "Amazon.com Inc.",           exchange: "NASDAQ", asset_class: "stock", emoji: "📦", sector: "Mega Tech", session: "extended", roles: ["intel","brief","dip"] }
+  - { symbol: "NFLX",  name: "Netflix Inc.",              exchange: "NASDAQ", asset_class: "stock", emoji: "🎬", sector: "Streaming", session: "extended", roles: ["intel","brief","dip"] }
+  - { symbol: "TSLA",  name: "Tesla Inc.",                exchange: "NASDAQ", asset_class: "stock", emoji: "🚘", sector: "EV / Auto", session: "extended", roles: ["intel","brief","dip"] }
 
-# ─── Scanner settings (optional overrides) ───
+  # ─── Semiconductors / AI infra ──────────────────────────────
+  - { symbol: "NVDA",  name: "NVIDIA Corp.",              exchange: "NASDAQ", asset_class: "stock", emoji: "💎", sector: "AI / Semis", session: "extended", roles: ["intel","brief","dip"] }
+  - { symbol: "AMD",   name: "Advanced Micro Devices",    exchange: "NASDAQ", asset_class: "stock", emoji: "⚡", sector: "AI / Semis", session: "extended", roles: ["intel","brief","dip"] }
+  - { symbol: "MU",    name: "Micron Technology",         exchange: "NASDAQ", asset_class: "stock", emoji: "💾", sector: "AI / Semis", session: "regular",  roles: ["intel","brief","dip"] }
+  - { symbol: "AVGO",  name: "Broadcom Inc.",             exchange: "NASDAQ", asset_class: "stock", emoji: "🔷", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
+  - { symbol: "TSM",   name: "Taiwan Semiconductor",      exchange: "NYSE",   asset_class: "stock", emoji: "🏭", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
+  - { symbol: "ASML",  name: "ASML Holding",              exchange: "NASDAQ", asset_class: "stock", emoji: "🔬", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
+  - { symbol: "SMCI",  name: "Super Micro Computer",      exchange: "NASDAQ", asset_class: "stock", emoji: "💻", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
+  - { symbol: "MRVL",  name: "Marvell Technology",        exchange: "NASDAQ", asset_class: "stock", emoji: "🛸", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
+  - { symbol: "ARM",   name: "Arm Holdings",              exchange: "NASDAQ", asset_class: "stock", emoji: "🦾", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
+  - { symbol: "ANET",  name: "Arista Networks",           exchange: "NYSE",   asset_class: "stock", emoji: "🌐", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
+  - { symbol: "SNDK",  name: "SanDisk (post-spin)",       exchange: "NASDAQ", asset_class: "stock", emoji: "💽", sector: "AI / Semis", session: "regular",  roles: ["intel","brief"] }
+  - { symbol: "NBIS",  name: "Nebius Group",              exchange: "NASDAQ", asset_class: "stock", emoji: "🌐", sector: "AI / Semis", session: "regular",  roles: ["intel","brief"] }
+
+  # ─── AI Software / SaaS / Data ──────────────────────────────
+  - { symbol: "PLTR",  name: "Palantir Technologies",     exchange: "NASDAQ", asset_class: "stock", emoji: "🔮", sector: "AI Software", session: "regular", tags: ["Defense"], roles: ["dip"] }
+  - { symbol: "CRM",   name: "Salesforce Inc.",           exchange: "NYSE",   asset_class: "stock", emoji: "☁️", sector: "AI Software", session: "regular", roles: ["dip"] }
+  - { symbol: "ADBE",  name: "Adobe Inc.",                exchange: "NASDAQ", asset_class: "stock", emoji: "🎨", sector: "AI Software", session: "regular", roles: ["dip"] }
+  - { symbol: "ORCL",  name: "Oracle Corp.",              exchange: "NYSE",   asset_class: "stock", emoji: "🗄️", sector: "AI Software", session: "regular", roles: ["dip"] }
+  - { symbol: "SNOW",  name: "Snowflake Inc.",            exchange: "NYSE",   asset_class: "stock", emoji: "❄️", sector: "AI Software", session: "regular", roles: ["dip"] }
+  - { symbol: "NOW",   name: "ServiceNow Inc.",           exchange: "NYSE",   asset_class: "stock", emoji: "⏱️", sector: "AI Software", session: "regular", roles: ["dip"] }
+  - { symbol: "DDOG",  name: "Datadog Inc.",              exchange: "NASDAQ", asset_class: "stock", emoji: "🐕", sector: "AI Software", session: "regular", roles: ["dip"] }
+  - { symbol: "CRWD",  name: "CrowdStrike Holdings",      exchange: "NASDAQ", asset_class: "stock", emoji: "🛡️", sector: "AI Software", session: "regular", tags: ["Cybersecurity"], roles: ["dip"] }
+  - { symbol: "APP",   name: "AppLovin Corp.",            exchange: "NASDAQ", asset_class: "stock", emoji: "📱", sector: "AI Software", session: "regular", roles: ["dip"] }
+  - { symbol: "DUOL",  name: "Duolingo Inc.",             exchange: "NASDAQ", asset_class: "stock", emoji: "🦉", sector: "AI Software", session: "regular", roles: ["dip"] }
+
+  # ─── Quantum Computing ─────────────────────────────────────
+  - { symbol: "IONQ",  name: "IonQ Inc.",                 exchange: "NYSE",   asset_class: "stock", emoji: "⚛️", sector: "Quantum", session: "regular", roles: ["intel","brief","dip"] }
+  - { symbol: "RGTI",  name: "Rigetti Computing",         exchange: "NASDAQ", asset_class: "stock", emoji: "🧪", sector: "Quantum", session: "regular", roles: ["intel","brief","dip"] }
+  - { symbol: "QBTS",  name: "D-Wave Quantum",            exchange: "NYSE",   asset_class: "stock", emoji: "🔬", sector: "Quantum", session: "regular", roles: ["intel","brief","dip"] }
+  - { symbol: "QUBT",  name: "Quantum Computing Inc.",    exchange: "NASDAQ", asset_class: "stock", emoji: "🔬", sector: "Quantum", session: "regular", roles: ["dip"] }
+
+  # ─── Nuclear / Energy ──────────────────────────────────────
+  - { symbol: "OKLO",  name: "Oklo Inc.",                 exchange: "NYSE",   asset_class: "stock", emoji: "☢️", sector: "Nuclear / Energy", session: "regular", roles: ["intel","brief","dip"] }
+  - { symbol: "CEG",   name: "Constellation Energy",      exchange: "NASDAQ", asset_class: "stock", emoji: "⚡", sector: "Nuclear / Energy", session: "regular", roles: ["dip"] }
+  - { symbol: "VST",   name: "Vistra Corp.",              exchange: "NYSE",   asset_class: "stock", emoji: "🔌", sector: "Nuclear / Energy", session: "regular", roles: ["dip"] }
+  - { symbol: "SMR",   name: "NuScale Power",             exchange: "NYSE",   asset_class: "stock", emoji: "⚛️", sector: "Nuclear / Energy", session: "regular", roles: ["dip"] }
+  - { symbol: "NNE",   name: "Nano Nuclear Energy",       exchange: "NASDAQ", asset_class: "stock", emoji: "☢️", sector: "Nuclear / Energy", session: "regular", roles: ["dip"] }
+
+  # ─── Crypto-Adjacent / Crypto Mining ───────────────────────
+  - { symbol: "IREN",  name: "IREN Limited",              exchange: "NASDAQ", asset_class: "stock", emoji: "🪙", sector: "Crypto Mining", session: "regular", tags: ["Data Center"], roles: ["intel","brief","dip"] }
+  - { symbol: "MARA",  name: "MARA Holdings",             exchange: "NASDAQ", asset_class: "stock", emoji: "⛏️", sector: "Crypto Mining", session: "regular", roles: ["dip"] }
+  - { symbol: "RIOT",  name: "Riot Platforms",            exchange: "NASDAQ", asset_class: "stock", emoji: "⛏️", sector: "Crypto Mining", session: "regular", roles: ["dip"] }
+  - { symbol: "MSTR",  name: "MicroStrategy",             exchange: "NASDAQ", asset_class: "stock", emoji: "₿",  sector: "Crypto Mining", session: "regular", tags: ["BTC Treasury"], roles: ["dip"] }
+  - { symbol: "COIN",  name: "Coinbase Global",           exchange: "NASDAQ", asset_class: "stock", emoji: "🪙", sector: "Crypto Mining", session: "regular", tags: ["Exchange"], roles: ["dip"] }
+
+  # ─── Fintech / Financials ──────────────────────────────────
+  - { symbol: "SOFI",  name: "SoFi Technologies",         exchange: "NASDAQ", asset_class: "stock", emoji: "🏦", sector: "Fintech", session: "regular", tags: ["Crypto-Adj"], roles: ["intel","brief","dip"] }
+  - { symbol: "HOOD",  name: "Robinhood Markets",         exchange: "NASDAQ", asset_class: "stock", emoji: "🏹", sector: "Fintech", session: "regular", tags: ["Crypto-Adj"], roles: ["dip"] }
+  - { symbol: "JPM",   name: "JPMorgan Chase",            exchange: "NYSE",   asset_class: "stock", emoji: "🏦", sector: "Financials", session: "regular", roles: ["dip"] }
+  - { symbol: "V",     name: "Visa Inc.",                 exchange: "NYSE",   asset_class: "stock", emoji: "💳", sector: "Financials", session: "regular", roles: ["dip"] }
+  - { symbol: "MA",    name: "Mastercard Inc.",           exchange: "NYSE",   asset_class: "stock", emoji: "💳", sector: "Financials", session: "regular", roles: ["dip"] }
+  - { symbol: "AXP",   name: "American Express",          exchange: "NYSE",   asset_class: "stock", emoji: "🪙", sector: "Financials", session: "regular", roles: ["dip"] }
+
+  # ─── Healthcare / Pharma / Biotech ─────────────────────────
+  - { symbol: "LLY",   name: "Eli Lilly & Co.",           exchange: "NYSE",   asset_class: "stock", emoji: "💊", sector: "Healthcare", session: "regular", roles: ["dip"] }
+  - { symbol: "NVO",   name: "Novo Nordisk",              exchange: "NYSE",   asset_class: "stock", emoji: "💉", sector: "Healthcare", session: "regular", roles: ["intel","brief","dip"] }
+  - { symbol: "REGN",  name: "Regeneron Pharmaceuticals", exchange: "NASDAQ", asset_class: "stock", emoji: "🧬", sector: "Healthcare", session: "regular", roles: ["dip"] }
+  - { symbol: "WGRX",  name: "Wellgistics Health",        exchange: "NASDAQ", asset_class: "stock", emoji: "💊", sector: "Healthcare", session: "regular", roles: ["intel","brief"] }
+
+  # ─── Consumer / Retail / Other ─────────────────────────────
+  - { symbol: "SHOP",  name: "Shopify Inc.",              exchange: "NYSE",   asset_class: "stock", emoji: "🛍️", sector: "Consumer", session: "regular", roles: ["dip"] }
+  - { symbol: "UBER",  name: "Uber Technologies",         exchange: "NYSE",   asset_class: "stock", emoji: "🚗", sector: "Consumer", session: "regular", roles: ["dip"] }
+  - { symbol: "SPOT",  name: "Spotify Technology",        exchange: "NYSE",   asset_class: "stock", emoji: "🎵", sector: "Consumer", session: "regular", roles: ["dip"] }
+  - { symbol: "COST",  name: "Costco Wholesale",          exchange: "NASDAQ", asset_class: "stock", emoji: "🏪", sector: "Consumer", session: "regular", roles: ["dip"] }
+  - { symbol: "CAVA",  name: "CAVA Group",                exchange: "NYSE",   asset_class: "stock", emoji: "🫒", sector: "Consumer", session: "regular", roles: ["dip"] }
+
+  # ─── Materials ─────────────────────────────────────────────
+  - { symbol: "UAMY",  name: "United States Antimony",    exchange: "NYSE",   asset_class: "stock", emoji: "⚒️", sector: "Materials", session: "regular", roles: ["intel","brief"] }
+
+
+# ═══════════════════════════════════════════════════════════════
+# CANONICAL SECTOR LIST — loader rejects anything not in here.
+# Keep this minimal so bleed/leadership math has ≥2 stocks/sector.
+# ═══════════════════════════════════════════════════════════════
+sectors_canonical:
+  - "Crypto"
+  - "Crypto Mining"
+  - "Safe Haven"
+  - "Mega Tech"
+  - "AI / Semis"
+  - "AI Software"
+  - "Quantum"
+  - "Nuclear / Energy"
+  - "Fintech"
+  - "Financials"
+  - "Healthcare"
+  - "EV / Auto"
+  - "Streaming"
+  - "Consumer"
+  - "Materials"
+
+
+# ═══════════════════════════════════════════════════════════════
+# SCANNER SETTINGS — applied at startup by the loader.
+# Any value not present falls back to the dataclass default in code.
+# ═══════════════════════════════════════════════════════════════
 settings:
-  scanner:
-    sqs_min_for_alert: 75
-    grade_filter: "A+ and A"
-  dip_scanner:
-    rsi_min: 28
-    rsi_max: 45
-    max_from_ath_pct: -25.0
   intel:
-    big_drop_warn: -5.0
-    big_drop_critical: -10.0
-    big_gain_alert: 8.0
+    big_drop_warn:        -5.0
+    big_drop_critical:   -10.0
+    big_gain_alert:        8.0
+    cooldown_hours:        4
+    sector_bleed_cooldown: 4
+    leadership_cooldown:   3
+
+  brief:
+    morning_window:  ["08:45", "12:00"]
+    evening_window:  ["16:15", "20:00"]
+    fetch_workers:   5
+
+  dip_scanner:
+    rsi_min:        25
+    rsi_max:        48
+    drop_1d_max:    -1.5
+    drop_5d_max:    -4.0
+    ath_min:        -30.0
+    vol_ratio_min:   0.6
+    cooldown_hours:  4
+    fetch_workers:   5
+    max_loss_pct:    8.0
