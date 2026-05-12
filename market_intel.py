@@ -10,6 +10,8 @@ v3.1 vs v3.0
   • Exposes YAML_SETTINGS for downstream Config overrides
   • Sector taxonomy validation against `sectors_canonical:` list
   • Backward compatible with legacy bucket schema
+  • FIX: loader now correctly returns a dict matching the unpack code
+  • FIX: settings.intel block applied at import via Config replace()
 
 v3.0 vs v2.2 — fixes & hardening
 ────────────────────────────────
@@ -30,17 +32,14 @@ P0
 P1
   • Parallel ticker fetch (ThreadPoolExecutor, bounded)
   • Verdict engine accepts earnings_days param (no redundant fetch)
-  • Verdict + alert format use snapshot of `current` (no live drift)
   • 52W window uses date filter, not 252-row slice
   • SECTORS deduplicated (PRIMARY sector wins, secondary tags retained)
   • Auto-split on blank-line boundaries (no mid-section cuts)
 
 P2
   • Logging: TimedRotatingFileHandler in __main__ (not at import)
-  • Consistent `H_RULE` / `SUB_RULE` separators across all alerts
+  • Consistent H_RULE / SUB_RULE separators across all alerts
   • Telemetry: scan duration, fetch failures, AI calls in summary
-  • format_earnings_warning's unused `symbol` param removed (kept arg
-    for backward-compat; param is ignored, _UNUSED suppresses warnings)
 """
 
 from __future__ import annotations
@@ -53,12 +52,12 @@ import re
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, time as dtime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from threading import Lock
-from typing import Any, Optional
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -71,26 +70,30 @@ from urllib3.util.retry import Retry
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ════════════════════════════════════════════════════════════
-# CONFIG
+# CONSTANTS
 # ════════════════════════════════════════════════════════════
 
-EST        = ZoneInfo("America/New_York")    # legacy alias used elsewhere
-MARKET_TZ  = EST                              # market clock — DO NOT change
-DISPLAY_TZ = ZoneInfo("America/Toronto")      # same offset, user-facing
+EST        = ZoneInfo("America/New_York")     # legacy alias
+MARKET_TZ  = EST                               # market clock — DO NOT change
+DISPLAY_TZ = ZoneInfo("America/Toronto")       # same offset, user-facing label
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = os.environ.get("CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-STATE_FILE   = "scanner_state.json"
-SYMBOLS_YAML = "symbols.yaml"
-LOGS_DIR     = Path("logs"); LOGS_DIR.mkdir(exist_ok=True)
+STATE_FILE          = "scanner_state.json"
+SYMBOLS_YAML        = "symbols.yaml"
 EARNINGS_CACHE_FILE = "earnings_cache.json"
+LOGS_DIR            = Path("logs"); LOGS_DIR.mkdir(exist_ok=True)
 
 H_RULE   = "`━━━━━━━━━━━━━━━━━━━━━`"
 SUB_RULE = "`─────────────────`"
 TG_LIMIT = 4096
 
+
+# ════════════════════════════════════════════════════════════
+# CONFIG
+# ════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class Config:
@@ -109,20 +112,6 @@ class Config:
     fetch_workers: int = 5
     ai_timeout_s:  int = 20
 
-CFG = Config()
-
-# Backward-compat scalar names (used by brief.py / dip_scanner.py)
-BIG_DROP_WARN          = CFG.big_drop_warn
-BIG_DROP_CRITICAL      = CFG.big_drop_critical
-BIG_GAIN_ALERT         = CFG.big_gain_alert
-NEAR_52W_LOW_PCT       = CFG.near_52w_low_pct
-ATH_PULLBACK_ALERT     = CFG.ath_pullback_alert
-COOLDOWN_HOURS         = CFG.cooldown_hours
-SECTOR_BLEED_COOLDOWN  = CFG.sector_bleed_cooldown_h
-LEADERSHIP_COOLDOWN    = CFG.leadership_cooldown_h
-EARNINGS_WARNING_DAYS  = CFG.earnings_warning_days
-FETCH_DELAY            = 0.0   # serial sleep no longer needed
-
 
 # ════════════════════════════════════════════════════════════
 # HTTP SESSION (reused, with retry/backoff)
@@ -130,10 +119,12 @@ FETCH_DELAY            = 0.0   # serial sleep no longer needed
 
 def _build_session() -> requests.Session:
     s = requests.Session()
-    retry = Retry(total=3, backoff_factor=0.8,
-                  status_forcelist=(429, 500, 502, 503, 504),
-                  allowed_methods=frozenset(["GET", "POST"]),
-                  respect_retry_after_header=True)
+    retry = Retry(
+        total=3, backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        respect_retry_after_header=True,
+    )
     s.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8))
     return s
 
@@ -161,12 +152,12 @@ def load_json(path, default=None):
         return default if default is not None else {}
 
 def save_json(path, data):
-    """Non-atomic legacy writer, kept for backward compat (cache files)."""
+    """Non-atomic legacy writer — fine for cache files (single writer)."""
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
 
 def _state_update(mutator) -> None:
-    """Atomic read-modify-write on STATE_FILE."""
+    """Atomic, fcntl-locked read-modify-write on STATE_FILE."""
     Path(STATE_FILE).touch(exist_ok=True)
     with open(STATE_FILE, "r+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
@@ -193,7 +184,7 @@ def tg_escape(text: Any) -> str:
     if text is None: return "—"
     return _MD_SPECIALS.sub(r"\\\1", str(text))
 
-md = tg_escape  # shorter alias for internal use
+md = tg_escape  # internal alias
 
 _AI_STRIP = re.compile(r"[`*_\[\]()]")
 
@@ -205,43 +196,109 @@ def _sanitize_ai(text: str | None, max_lines: int = 4, max_line_len: int = 140) 
 
 
 # ════════════════════════════════════════════════════════════
-# SYMBOLS — yaml with hardcoded fallback
+# SYMBOLS LOADER — supports v3 universe schema + legacy buckets
 # ════════════════════════════════════════════════════════════
 
-def _load_from_yaml():
+def _load_from_yaml() -> dict | None:
+    """
+    Returns {symbols, sectors, emoji, meta, settings} or None on error.
+    Supports both v3 schema (top-level `universe:`) and legacy bucket schema.
+    """
     yaml_path = Path(SYMBOLS_YAML)
-    if not yaml_path.exists(): return None
+    if not yaml_path.exists():
+        return None
     try:
         import yaml
         with open(yaml_path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
-        emoji_map, sector_map, all_syms = {}, {}, []
-        for bucket in ("crypto", "extended_hours", "regular_hours"):
-            for item in (raw.get(bucket) or []):
-                sym = item["symbol"]
-                all_syms.append(sym)
-                emoji_map[sym]  = item.get("emoji", "📊")
-                sector_map[sym] = item.get("sector", "Other")
+
+        # ── Determine schema ─────────────────────────────
+        if "universe" in raw:
+            entries = raw["universe"] or []
+        else:
+            entries = []
+            for bucket in ("crypto", "extended_hours", "regular_hours", "dip_extras"):
+                entries.extend(raw.get(bucket) or [])
+
+        valid_sectors = set(raw.get("sectors_canonical") or [])
+        valid_roles   = {"intel", "brief", "dip", "scanner"}
+
+        seen: set[str] = set()
+        emoji_map: dict[str, str] = {}
+        sector_map: dict[str, str] = {}
+        meta: dict[str, dict] = {}
+        all_syms: list[str] = []
+        problems: list[str] = []
+
+        for item in entries:
+            sym = item.get("symbol")
+            if not sym:
+                problems.append(f"entry missing symbol: {item}"); continue
+            if sym in seen:
+                problems.append(f"duplicate symbol: {sym}"); continue
+            seen.add(sym)
+
+            sec = item.get("sector", "Other")
+            if valid_sectors and sec not in valid_sectors:
+                problems.append(f"{sym}: unknown sector '{sec}'")
+
+            emoji = item.get("emoji", "📊")
+            if not (1 <= len(emoji) <= 4):
+                problems.append(f"{sym}: emoji length suspicious ({emoji!r})")
+
+            ac = item.get("asset_class", "stock")
+            if ac not in {"stock", "crypto", "commodity"}:
+                problems.append(f"{sym}: invalid asset_class '{ac}'")
+
+            roles = set(item.get("roles") or ["intel", "brief"])
+            if not roles.issubset(valid_roles):
+                problems.append(f"{sym}: invalid roles {roles - valid_roles}")
+
+            all_syms.append(sym)
+            emoji_map[sym]  = emoji
+            sector_map[sym] = sec
+            meta[sym] = {
+                "name":        item.get("name", sym),
+                "exchange":    item.get("exchange", ""),
+                "asset_class": ac,
+                "session":     item.get("session", "regular"),
+                "tags":        list(item.get("tags") or []),
+                "roles":       sorted(roles),
+            }
+
+        for p in problems[:10]:
+            logging.warning(f"symbols.yaml: {p}")
+        if len(problems) > 10:
+            logging.warning(f"symbols.yaml: +{len(problems) - 10} more issues")
+
         sectors: dict[str, list[str]] = {}
         for sym, sec in sector_map.items():
             sectors.setdefault(sec, []).append(sym)
-        return all_syms, sectors, emoji_map
+
+        return {
+            "symbols":  all_syms,
+            "sectors":  sectors,
+            "emoji":    emoji_map,
+            "meta":     meta,
+            "settings": raw.get("settings") or {},
+        }
     except Exception as e:
         logging.warning(f"symbols.yaml load failed: {e} — using hardcoded fallback")
         return None
+
 
 _yaml = _load_from_yaml()
 if _yaml:
     MONITOR_LIST  = _yaml["symbols"]
     SECTORS       = _yaml["sectors"]
     SYMBOL_EMOJI  = _yaml["emoji"]
-    SYMBOL_META   = _yaml["meta"]            # NEW — exposed for brief headers
-    YAML_SETTINGS = _yaml["settings"]        # NEW — exposed for Config overrides
+    SYMBOL_META   = _yaml["meta"]
+    YAML_SETTINGS = _yaml["settings"]
     logging.info(f"market_intel: loaded {len(MONITOR_LIST)} symbols from yaml "
                  f"({len(SECTORS)} sectors)")
 else:
-    SYMBOL_META   = {}                        # NEW — empty fallback
-    YAML_SETTINGS = {}                        # NEW — empty fallback
+    SYMBOL_META   = {}
+    YAML_SETTINGS = {}
     SECTORS = {
         "AI / Semis":         ["NVDA", "AMD", "MU", "SNDK", "NBIS"],
         "Crypto":             ["BTC-USD", "ETH-USD", "XRP-USD"],
@@ -272,6 +329,36 @@ SYMBOL_TO_SECTOR: dict[str, str] = {}
 for _sec, _syms in SECTORS.items():
     for _s in _syms:
         SYMBOL_TO_SECTOR.setdefault(_s, _sec)
+
+
+# ════════════════════════════════════════════════════════════
+# CONFIG (with optional yaml overrides)
+# ════════════════════════════════════════════════════════════
+
+def _apply_yaml_overrides(cfg: Config) -> Config:
+    overrides = (YAML_SETTINGS or {}).get("intel") or {}
+    if not overrides:
+        return cfg
+    valid = {f.name for f in cfg.__dataclass_fields__.values()}
+    safe  = {k: v for k, v in overrides.items() if k in valid}
+    if safe:
+        logging.info(f"market_intel: applied yaml overrides: {sorted(safe)}")
+    return replace(cfg, **safe)
+
+CFG = _apply_yaml_overrides(Config())
+
+# Backward-compat scalar names (used by older callers)
+BIG_DROP_WARN          = CFG.big_drop_warn
+BIG_DROP_CRITICAL      = CFG.big_drop_critical
+BIG_GAIN_ALERT         = CFG.big_gain_alert
+NEAR_52W_LOW_PCT       = CFG.near_52w_low_pct
+ATH_PULLBACK_ALERT     = CFG.ath_pullback_alert
+COOLDOWN_HOURS         = CFG.cooldown_hours
+SECTOR_BLEED_COOLDOWN  = CFG.sector_bleed_cooldown_h
+LEADERSHIP_COOLDOWN    = CFG.leadership_cooldown_h
+EARNINGS_WARNING_DAYS  = CFG.earnings_warning_days
+FETCH_DELAY            = 0.0
+
 
 # ════════════════════════════════════════════════════════════
 # PER-SCAN CACHES (in-memory, cleared per scan)
@@ -330,22 +417,16 @@ def pine_rsi(src: pd.Series, length: int = 14) -> pd.Series:
     rs = rma(gain, length) / rma(loss, length).replace(0, np.nan)
     return (100 - 100 / (1 + rs)).fillna(50)
 
-
 def _last_completed_index(daily: pd.DataFrame) -> int:
-    """
-    Returns the iloc index of the last *completed* daily bar.
-    During market hours yfinance often appends today's partial bar; drop it.
-    """
+    """Returns iloc index of the last *completed* daily bar (drops today's partial)."""
     if daily.empty:
         return -1
     last_dt = daily.index[-1]
     last_date = last_dt.date() if hasattr(last_dt, "date") else last_dt
     today = market_now().date()
     if last_date == today:
-        # During RTH the last bar is partial; treat -2 as last completed.
         return len(daily) - 2 if len(daily) >= 2 else -1
     return len(daily) - 1
-
 
 def ath_recency_label(ath_date_str: str) -> str:
     try:
@@ -392,7 +473,6 @@ def _earnings_put(symbol, ed, days):
     }
     save_json(EARNINGS_CACHE_FILE, cache)
 
-
 def get_earnings_date(symbol: str):
     """Returns (date, days_until) or (None, None). 12h-cached."""
     if symbol.endswith("-USD") or symbol == "GC=F":
@@ -434,19 +514,18 @@ def get_earnings_date(symbol: str):
         logging.debug(f"Earnings {symbol}: {e}")
         return None, None
 
-
-def format_earnings_warning(symbol_unused, earnings_date, days_until):
-    """`symbol_unused` retained for backward compat — not referenced."""
+def format_earnings_warning(_symbol_unused, earnings_date, days_until):
+    """First arg retained for backward compat — not referenced."""
     if earnings_date is None: return None
-    if days_until <= 0:                       return "🚨 *Earnings TODAY* — extreme volatility risk"
-    if days_until == 1:                       return f"⚠️ *Earnings TOMORROW* ({earnings_date}) — SKIP new longs"
-    if days_until <= CFG.earnings_warning_days: return f"⚠️ *Earnings in {days_until} days* ({earnings_date}) — consider waiting"
-    if days_until <= 7:                       return f"📅 Earnings in {days_until} days ({earnings_date})"
+    if days_until <= 0:                          return "🚨 *Earnings TODAY* — extreme volatility risk"
+    if days_until == 1:                          return f"⚠️ *Earnings TOMORROW* ({earnings_date}) — SKIP new longs"
+    if days_until <= CFG.earnings_warning_days:  return f"⚠️ *Earnings in {days_until} days* ({earnings_date}) — consider waiting"
+    if days_until <= 7:                          return f"📅 Earnings in {days_until} days ({earnings_date})"
     return None
 
 
 # ════════════════════════════════════════════════════════════
-# MARKET CONTEXT (SPY / QQQ / VIX) — fetched once per scan
+# MARKET CONTEXT (SPY / QQQ / VIX) — once per scan
 # ════════════════════════════════════════════════════════════
 
 def get_market_ctx():
@@ -469,7 +548,7 @@ def get_market_ctx():
 
 
 # ════════════════════════════════════════════════════════════
-# RELATIVE STRENGTH (SPY pre-fetched once)
+# RELATIVE STRENGTH (uses cached SPY)
 # ════════════════════════════════════════════════════════════
 
 def calc_relative_strength(ctx, benchmark: str = "SPY", lookback_days: int = 5):
@@ -509,7 +588,7 @@ def get_full_context(symbol: str) -> dict | None:
         current = float(intraday["Close"].iloc[-1])
 
         li = _last_completed_index(daily)
-        if li < 1:  # need at least 2 completed daily bars
+        if li < 1:
             return None
         prev_close = float(daily["Close"].iloc[li - 1])
         last_completed_close = float(daily["Close"].iloc[li])
@@ -525,7 +604,6 @@ def get_full_context(symbol: str) -> dict | None:
             idx_tz = intraday
 
         if is_crypto:
-            # Last 24h rolling — crypto has no calendar day
             cutoff = idx_tz.index[-1] - pd.Timedelta(hours=24)
             today_bars = idx_tz[idx_tz.index >= cutoff]
         else:
@@ -541,7 +619,7 @@ def get_full_context(symbol: str) -> dict | None:
         day_change_pct = (current - prev_close) / prev_close * 100 if prev_close else 0.0
         intraday_pct   = (current - today_open) / today_open * 100 if today_open else 0.0
 
-        # ── 52W / ATH (date-windowed, not row-sliced) ────
+        # ── 52W / ATH (date-windowed) ────────────────────
         cutoff_52w = daily.index[-1] - pd.Timedelta(days=365)
         win = daily[daily.index >= cutoff_52w]
         if len(win) < 20:
@@ -551,7 +629,7 @@ def get_full_context(symbol: str) -> dict | None:
         ath      = float(daily["High"].max())
         ath_idx  = daily["High"].idxmax()
 
-        ath_pct          = (current - ath) / ath * 100
+        ath_pct           = (current - ath) / ath * 100
         pct_from_52w_low  = (current - low_52w)  / low_52w  * 100 if low_52w  > 0 else 0
         pct_from_52w_high = (current - high_52w) / high_52w * 100 if high_52w > 0 else 0
         range_pos = ((current - low_52w) / (high_52w - low_52w) * 100) if high_52w > low_52w else 50
@@ -566,10 +644,9 @@ def get_full_context(symbol: str) -> dict | None:
         rsi = float(rsi_series.iloc[-1])
         if np.isnan(rsi): rsi = 50.0
 
-        # Volume avg uses prior 20 *completed* days
-        vol_window = closed["Volume"].iloc[-20:]
+        vol_window  = closed["Volume"].iloc[-20:]
         vol_avg_20d = float(vol_window.mean()) if len(vol_window) else 0
-        vol_ratio = vol_today / vol_avg_20d if vol_avg_20d > 0 else 1.0
+        vol_ratio   = vol_today / vol_avg_20d if vol_avg_20d > 0 else 1.0
 
         # ── Trend ────────────────────────────────────────
         ema200_for_trend = ema200 if ema200 is not None else ema50
@@ -581,33 +658,33 @@ def get_full_context(symbol: str) -> dict | None:
         elif current < ema200_for_trend and current > ema50:    trend = "🔀 RECOVERING"
         else:                                                   trend = "⚖️ MIXED"
         if ema200 is None:
-            trend += " ⓘ"   # marker: EMA200 unavailable
+            trend += " ⓘ"
 
         return {
-            "symbol":          symbol,
-            "current":         current,
-            "prev_close":      prev_close,
-            "last_close":      last_completed_close,
-            "today_open":      today_open,
-            "today_high":      today_high,
-            "today_low":       today_low,
-            "day_change_pct":  day_change_pct,
-            "intraday_pct":    intraday_pct,
-            "ath":             ath,
-            "ath_date":        ath_idx.strftime("%Y-%m-%d") if hasattr(ath_idx, "strftime") else str(ath_idx)[:10],
-            "ath_pct":         ath_pct,
-            "low_52w":         low_52w,
-            "high_52w":        high_52w,
+            "symbol":            symbol,
+            "current":           current,
+            "prev_close":        prev_close,
+            "last_close":        last_completed_close,
+            "today_open":        today_open,
+            "today_high":        today_high,
+            "today_low":         today_low,
+            "day_change_pct":    day_change_pct,
+            "intraday_pct":      intraday_pct,
+            "ath":               ath,
+            "ath_date":          ath_idx.strftime("%Y-%m-%d") if hasattr(ath_idx, "strftime") else str(ath_idx)[:10],
+            "ath_pct":           ath_pct,
+            "low_52w":           low_52w,
+            "high_52w":          high_52w,
             "pct_from_52w_low":  pct_from_52w_low,
             "pct_from_52w_high": pct_from_52w_high,
-            "range_pos":       range_pos,
-            "ema20":           ema20,
-            "ema50":           ema50,
-            "ema200":          ema200 if ema200 is not None else ema50,  # legacy field always populated
-            "ema200_real":     ema200,   # None if insufficient history
-            "rsi":             rsi,
-            "vol_ratio":       vol_ratio,
-            "trend":           trend,
+            "range_pos":         range_pos,
+            "ema20":             ema20,
+            "ema50":             ema50,
+            "ema200":            ema200 if ema200 is not None else ema50,  # legacy field always populated
+            "ema200_real":       ema200,                                    # None if insufficient history
+            "rsi":               rsi,
+            "vol_ratio":         vol_ratio,
+            "trend":             trend,
         }
     except Exception as e:
         logging.error(f"Context {symbol}: {e}")
@@ -618,11 +695,8 @@ def get_full_context(symbol: str) -> dict | None:
 # VERDICT ENGINE
 # ════════════════════════════════════════════════════════════
 
-def get_verdict(ctx, market_ctx=None, *, earnings_days: int | None = "AUTO"):
-    """
-    Returns (verdict, zone, [reasons]).
-    Pass earnings_days to skip the network call (the brief/scanner already know).
-    """
+def get_verdict(ctx, market_ctx=None, *, earnings_days="AUTO"):
+    """Returns (verdict, zone, [reasons]). Pass earnings_days to skip refetch."""
     c = ctx
     rsi, trend = c["rsi"], c["trend"]
     drop, from_ath = c["day_change_pct"], c["ath_pct"]
@@ -641,7 +715,8 @@ def get_verdict(ctx, market_ctx=None, *, earnings_days: int | None = "AUTO"):
             reasons = [
                 f"+{drop:.1f}% single-day — likely news/catalyst driven",
                 "Parabolic moves mean-revert — high risk to chase",
-                f"Volume {vol_ratio:.1f}× avg — {'confirms activity' if vol_ratio > 1.5 else 'weak — possible pump'}",
+                f"Volume {vol_ratio:.1f}× avg — "
+                f"{'confirms activity' if vol_ratio > 1.5 else 'weak — possible pump'}",
             ]
         else:
             verdict, zone = "🚨 CRASH", f"Severe Drop {drop:.0f}%"
@@ -659,37 +734,30 @@ def get_verdict(ctx, market_ctx=None, *, earnings_days: int | None = "AUTO"):
             "EMA stack fully bullish",
             f"RSI {rsi:.0f} — not overbought, room to run",
         ]
-    # ── 2. UPTREND PULLBACK ──
     elif "UPTREND" in trend and rsi < 52 and above_200:
         verdict, zone = "🟢 BUY ZONE", "Pullback in Uptrend"
         reasons = ["Healthy pullback in confirmed uptrend", f"RSI {rsi:.0f} — room to run"]
         if from_ath > -20:
             reasons.append("Near ATH — strong stock pulling back")
-    # ── 3. EMA50 PULLBACK ──
     elif "PULLBACK" in trend and rsi < 55:
         verdict, zone = "🟢 BUY ZONE", "EMA50 Pullback"
         reasons = ["Above EMA200 — uptrend structure intact",
                    f"Pulling toward EMA50 ${c['ema50']:.2f}",
                    f"RSI {rsi:.0f} — watch for bounce"]
-    # ── 4. EXTENDED NEAR ATH ──
     elif from_ath > -8 and rsi > 75:
         verdict, zone = "🟠 EXTENDED", "Overbought Near ATH"
         reasons = [f"RSI {rsi:.0f} — overbought at highs", "Risk/reward not ideal for new entry"]
-    # ── 5. STRONG DOWNTREND ──
     elif "DOWNTREND" in trend and not above_200:
         verdict, zone = "🔴 AVOID", "Falling Knife"
         reasons = ["Below EMA50 & EMA200 — confirmed downtrend", "No base formed"]
         if rsi < 30:
             reasons.append(f"RSI {rsi:.0f} oversold but no reversal signal")
-    # ── 6. NEAR 52W LOW ──
     elif c["pct_from_52w_low"] < 8 and drop < -3:
         verdict, zone = "⚠️ CAUTION", "Breaking Down"
         reasons = ["Near 52W low — key support at risk", "Wait for base formation"]
-    # ── 7. OVERBOUGHT NON-ATH ──
     elif rsi > 75 and drop > 2:
         verdict, zone = "🟠 TAKE PROFITS", "Extended"
         reasons = [f"RSI overbought ({rsi:.0f})", "Consider trimming, not entering"]
-    # ── 8. RECOVERING ──
     elif "RECOVERING" in trend:
         if rsi > 55 and drop > 0:
             verdict, zone = "🟡 WATCH", "Recovery Attempt"
@@ -698,7 +766,6 @@ def get_verdict(ctx, market_ctx=None, *, earnings_days: int | None = "AUTO"):
         else:
             verdict, zone = "⏸️ HOLD", "Below EMA200"
             reasons = ["Below EMA200 — no structural confirmation"]
-    # ── 9. MIXED ──
     elif "MIXED" in trend:
         if range_pos < 30 and rsi < 45:
             verdict, zone = "🟡 WATCH", "Potential Accumulation"
@@ -709,7 +776,6 @@ def get_verdict(ctx, market_ctx=None, *, earnings_days: int | None = "AUTO"):
         else:
             verdict, zone = "⏸️ HOLD", "No Edge"
             reasons = ["Mixed signals — wait for clarity"]
-    # ── 10. DEFAULT ──
     else:
         if above_50 and above_200 and rsi > 55:
             verdict, zone = "🟡 WATCH", "Building Momentum"
@@ -730,7 +796,7 @@ def get_verdict(ctx, market_ctx=None, *, earnings_days: int | None = "AUTO"):
             verdict = "⚠️ WAIT"
             reasons.insert(0, f"Market bleeding — VIX {vix:.0f}, SPY {spy_pct:.1f}%")
 
-    # ── Earnings override (uses passed-in days if provided) ──
+    # ── Earnings override (uses passed-in days when provided) ──
     if any(x in verdict for x in ["BUY", "MOMENTUM", "WATCH"]):
         days = earnings_days
         if days == "AUTO":
@@ -795,8 +861,18 @@ Respond EXACTLY:
 
 
 # ════════════════════════════════════════════════════════════
-# ALERT FORMATTER
+# ALERT FORMATTER (with company-name header from SYMBOL_META)
 # ════════════════════════════════════════════════════════════
+
+def name_label(sym: str, *, bold_ticker: bool = True) -> str:
+    """Returns 'AAPL — Apple Inc. (NASDAQ)' if metadata available."""
+    meta = SYMBOL_META.get(sym, {})
+    name = meta.get("name", "")
+    exch = meta.get("exchange", "")
+    ticker = f"*{md(sym)}*" if bold_ticker else md(sym)
+    if name and exch: return f"{ticker} — {md(name)} ({md(exch)})"
+    if name:          return f"{ticker} — {md(name)}"
+    return ticker
 
 def _vol_descriptor(vol_ratio: float) -> str:
     base = f"{vol_ratio:.1f}× average"
@@ -818,9 +894,9 @@ def _rsi_tag(rsi: float) -> str:
     return " _(neutral)_"
 
 def _ma_status(above_50: bool, above_200: bool) -> str:
-    if above_50 and above_200:        return "✅ Above EMA50 & EMA200 (bullish structure)"
-    if above_200 and not above_50:    return "⚠️ Below EMA50, above EMA200 (pullback)"
-    if not above_200 and above_50:    return "🔀 Above EMA50, below EMA200 (recovery)"
+    if above_50 and above_200:      return "✅ Above EMA50 & EMA200 (bullish structure)"
+    if above_200 and not above_50:  return "⚠️ Below EMA50, above EMA200 (pullback)"
+    if not above_200 and above_50:  return "🔀 Above EMA50, below EMA200 (recovery)"
     return "🔴 Below EMA50 & EMA200 (bearish)"
 
 
@@ -839,7 +915,7 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx,
     sign    = "+" if drop >= 0 else ""
     drop_em = "🔴" if drop < 0 else "🟢"
 
-    msg  = f"{head} *{sev}* — {em} *{md(c['symbol'])}*\n"
+    msg  = f"{head} *{sev}* — {em} {name_label(c['symbol'])}\n"
     msg += f"🕒 {ts}\n{H_RULE}\n"
     msg += f"💵 *Price:* `${c['current']:.2f}` ({drop_em} {sign}{drop:.2f}% today)\n"
     msg += f"📊 *Range:* L `${c['today_low']:.2f}` → H `${c['today_high']:.2f}`\n"
@@ -847,18 +923,15 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx,
     if drop >= CFG.big_gain_alert and c["vol_ratio"] < 1.3:
         msg += "⚠️ _Low volume on big gain — thin/news-driven, less reliable_\n"
 
-    # Verdict block
     msg += f"\n*🎯 VERDICT: {md(verdict)}*\n_Zone: {md(zone)}_\n"
     for r in reasons[:3]:
         msg += f"  • {md(r)}\n"
 
-    # Top-line AI bias if present
     if ai_text:
         bias_line = next((l for l in ai_text.splitlines() if "💡" in l), None)
         if bias_line:
             msg += f"\n{md(bias_line)}\n"
 
-    # Positional context
     msg += f"\n*📏 POSITIONAL CONTEXT*\n{SUB_RULE}\n"
     msg += (f"🏔️ *ATH:* `${c['ath']:.2f}` ({c['ath_pct']:+.1f}%) "
             f"{_ath_tag(c['ath_pct'])} — {ath_recency_label(c['ath_date'])}\n")
@@ -872,7 +945,6 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx,
     if c["pct_from_52w_low"] > 1000:
         msg += "   ⚠️ _Extreme range — likely corporate action / spin-off_\n"
 
-    # Trend & technicals
     msg += f"\n*📈 TREND & TECHNICALS*\n{SUB_RULE}\n"
     msg += f"Trend: {md(c['trend'])}\n"
     msg += f"RSI (Daily, closed): `{c['rsi']:.0f}`{_rsi_tag(c['rsi'])}\n"
@@ -882,21 +954,18 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx,
     above_200 = c.get("ema200_real") is not None and c["current"] > c["ema200_real"]
     msg += f"{_ma_status(above_50, above_200)}\n"
 
-    # Earnings (use passed-in if available — no extra fetch)
     if earnings_date is None and days_until is None:
         earnings_date, days_until = get_earnings_date(c["symbol"])
     warn = format_earnings_warning(c["symbol"], earnings_date, days_until)
     if warn:
         msg += f"\n*📅 EARNINGS*\n{SUB_RULE}\n{warn}\n"
 
-    # Relative strength (cached SPY)
     rs_score, rs_label = calc_relative_strength(c)
     if rs_score is not None:
         sign_rs = "+" if rs_score >= 0 else ""
         msg += f"\n*💪 RELATIVE STRENGTH (5d vs SPY)*\n{SUB_RULE}\n"
         msg += f"{md(rs_label)}: `{sign_rs}{rs_score}%` vs SPY\n"
 
-    # Market
     if market_ctx:
         spy = market_ctx.get("SPY", {}).get("pct", 0)
         vix = market_ctx.get("^VIX", {}).get("price", 15)
@@ -911,7 +980,6 @@ def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx,
     if ai_text:
         msg += f"\n*🤖 AI ANALYSIS*\n{SUB_RULE}\n{md(ai_text)}\n"
 
-    # Entry guidance
     msg += f"\n*💡 ENTRY GUIDANCE*\n{SUB_RULE}\n"
     ema200_safe = c["ema200_real"] if c.get("ema200_real") is not None else c["ema50"]
     if "BUY" in verdict:
@@ -1007,7 +1075,7 @@ def format_leadership_alert(leaders, laggards):
         msg += f"\n🏆 *LEADERS* — holding while sector bleeds\n{SUB_RULE}\n"
         for l in sorted(leaders, key=lambda x: -x["divergence"]):
             em = SYMBOL_EMOJI.get(l["symbol"], "📊")
-            msg += f"  {em} *{md(l['symbol'])}* ({md(l['sector'])})\n"
+            msg += f"  {em} {name_label(l['symbol'])} ({md(l['sector'])})\n"
             msg += (f"     Stock `{l['ctx']['day_change_pct']:+.2f}%` • "
                     f"Sector `{l['sector_avg']:+.2f}%`\n")
             msg += f"     💪 Outperforming by *{l['divergence']:+.2f}%*\n"
@@ -1016,7 +1084,7 @@ def format_leadership_alert(leaders, laggards):
         msg += f"\n🔻 *LAGGARDS* — weak vs strong sector\n{SUB_RULE}\n"
         for l in sorted(laggards, key=lambda x: x["divergence"]):
             em = SYMBOL_EMOJI.get(l["symbol"], "📊")
-            msg += f"  {em} *{md(l['symbol'])}* ({md(l['sector'])})\n"
+            msg += f"  {em} {name_label(l['symbol'])} ({md(l['sector'])})\n"
             msg += (f"     Stock `{l['ctx']['day_change_pct']:+.2f}%` • "
                     f"Sector `{l['sector_avg']:+.2f}%`\n")
             msg += f"     📉 Underperforming by *{l['divergence']:+.2f}%*\n"
@@ -1129,7 +1197,7 @@ def run_intel_scan() -> None:
             all_contexts[sym] = ctx
             print(f"  → {sym:10s} {ctx['day_change_pct']:+.2f}%")
 
-    # Big-move alerts (sequential — they're per-symbol and few)
+    # Big-move alerts
     for sym, ctx in all_contexts.items():
         drop = ctx["day_change_pct"]
         if not (drop <= CFG.big_drop_warn or drop >= CFG.big_gain_alert):
@@ -1144,7 +1212,7 @@ def run_intel_scan() -> None:
         msg = format_big_move_alert(ctx, verdict, zone, reasons, ai, market_ctx,
                                     earnings_date=ed, days_until=days)
         if msg and send_telegram(msg, silent=False):
-            mark_alert(cool_key)            # ← only after confirmed send
+            mark_alert(cool_key)
             alerts_fired += 1
             print(f"  🚨 {sym} alert sent")
 
