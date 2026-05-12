@@ -408,4 +408,306 @@ def format_alert(candidates, market_ctx, scan_stats):
     tz = now.tzname() or "EDT"
     ts = now.strftime(f'%a %b %d • %I:%M %p {tz}')
 
-    msg = "
+    # Use variable to avoid triple-backtick conflict with Python strings
+    code_block = "\u0060\u0060\u0060"
+
+    msg = f"{code_block}\n"
+    msg += "╔══════════════════════════════════╗\n"
+    msg += "║   🎯 ALPHAEDGE DIP SCANNER v3   ║\n"
+    msg += "╚══════════════════════════════════╝\n"
+    msg += f"{code_block}\n"
+    msg += f"🕒 *{ts}*\n"
+    msg += f"📊 Scanned `{scan_stats['total']}` | Qualified `{len(candidates)}`\n"
+
+    # Market context
+    if market_ctx:
+        spy_data = market_ctx.get('SPY', {})
+        vix_data = market_ctx.get('^VIX', {})
+        spy_pct = spy_data.get('pct', 0)
+        vix_price = vix_data.get('price', 15)
+
+        spy_icon = "🟢" if spy_pct >= 0 else "🔴"
+        vix_icon = "🟡" if vix_price > 20 else "🟢"
+
+        msg += f"\n*Market:* {spy_icon} SPY `{spy_pct:+.2f}%` | {vix_icon} VIX `{vix_price:.1f}`"
+        if vix_price > 25:
+            msg += "\n⚠️ _High VIX — reduce position sizes_"
+        elif vix_price > 20:
+            msg += "\n⚡ _Elevated VIX — be selective_"
+        msg += "\n"
+
+    msg += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+
+    # Group by tier
+    elite = [c for c in candidates if c['score'] >= 12]
+    strong = [c for c in candidates if 8 <= c['score'] < 12]
+    good = [c for c in candidates if c['score'] < 8]
+
+    def format_candidate(c, rank):
+        ctx = c['ctx']
+        sym = ctx['symbol']
+        em = FULL_EMOJI.get(sym, '📊')
+        sector = SYMBOL_SECTOR.get(sym, '📊 Other')
+
+        # Tier badge
+        if c['score'] >= 12:
+            badge = "🏆"
+        elif c['score'] >= 8:
+            badge = "⭐"
+        else:
+            badge = "✅"
+
+        block = f"\n{badge} *#{rank} — {em} {sym}* `${ctx['current']:.2f}`\n"
+        block += f"   {sector}\n"
+        block += f"   📉 1D: `{ctx['day_change_pct']:+.2f}%` | 5D: `{c['drop_5d']:+.2f}%`\n"
+        block += f"   📏 ATH: `{ctx['ath_pct']:+.1f}%` | RSI: `{ctx['rsi']:.0f}` | Vol: `{ctx['vol_ratio']:.1f}x`\n"
+        block += f"   🎯 Score: *{c['score']}/16*"
+
+        if c['rs_score'] is not None:
+            rs_icon = "💪" if c['rs_score'] > 0 else "📉"
+            block += f" | RS: {rs_icon} `{c['rs_score']:+.1f}%`"
+        block += "\n"
+
+        # Top 2 reasons only for brevity
+        for r in c['reasons'][:2]:
+            block += f"      • {r}\n"
+
+        # Buy zone
+        buy_low = min(ctx['ema50'], ctx['current'])
+        buy_high = max(ctx['ema50'], ctx['current'])
+        block += f"   🟢 Buy: `${buy_low:.2f}` - `${buy_high:.2f}`\n"
+        block += f"   🛡️ Stop: `${ctx['ema200']:.2f}` (EMA200)\n"
+
+        return block
+
+    rank = 1
+    top_shown = candidates[:10]
+
+    if elite:
+        msg += "\n*🏆 ELITE SETUPS (Score 12+):*\n"
+        for c in [x for x in top_shown if x['score'] >= 12]:
+            msg += format_candidate(c, rank)
+            rank += 1
+
+    if strong:
+        msg += "\n*⭐ STRONG SETUPS (Score 8-11):*\n"
+        for c in [x for x in top_shown if 8 <= x['score'] < 12]:
+            msg += format_candidate(c, rank)
+            rank += 1
+
+    if good:
+        msg += "\n*✅ WATCHLIST (Score <8):*\n"
+        for c in [x for x in top_shown if x['score'] < 8]:
+            msg += format_candidate(c, rank)
+            rank += 1
+
+    if len(candidates) > 10:
+        msg += f"\n_...+{len(candidates) - 10} more (showing top 10)_\n"
+
+    msg += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "💡 *Rules:*\n"
+    msg += "  • Pick 1-3 best setups, not all\n"
+    msg += "  • Size: 2-5% of portfolio per trade\n"
+    msg += "  • Stop below EMA200 or -8% max\n"
+    msg += "  • Scale in - don't full-send\n"
+
+    return msg
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN SCAN
+# ═══════════════════════════════════════════════════════════════
+
+def run_dip_scan():
+    now = now_est()
+    print(f"\n{'=' * 50}")
+    print(f"🎯 ALPHAEDGE DIP SCANNER v3.0")
+    print(f"🕒 {now.strftime('%Y-%m-%d %H:%M %Z')}")
+    print(f"📊 Universe: {len(DIP_UNIVERSE)} stocks across {len(SECTOR_MAP)} sectors")
+    print(f"{'=' * 50}")
+    logging.info(f"Dip scan start | Universe: {len(DIP_UNIVERSE)} stocks")
+
+    # ─── Session check ───
+    if now.weekday() >= 5:
+        print("⚠️  Weekend — skipping (stale data)")
+        logging.info("Skipped: weekend")
+        return
+
+    hour_dec = now.hour + now.minute / 60
+    if hour_dec < 7.5 or hour_dec > 20.5:
+        print("⚠️  Outside market-aware hours (7:30 AM - 8:30 PM ET)")
+        logging.info("Skipped: outside hours")
+        return
+
+    # ─── Fetch market context ───
+    market_ctx = get_market_ctx()
+
+    # ─── Scan loop ───
+    candidates = []
+    scanned = 0
+    failed = 0
+    skipped_cooldown = 0
+    disqualified_reasons = {}
+
+    for i, symbol in enumerate(DIP_UNIVERSE):
+        try:
+            progress = f"[{i + 1}/{len(DIP_UNIVERSE)}]"
+            print(f"  {progress} {symbol:6s}", end=" ", flush=True)
+
+            # Check cooldown FIRST (saves API calls)
+            is_cooled, hours_left = check_cooldown(symbol)
+            if is_cooled:
+                print(f"🔕 cooldown ({hours_left:.1f}h left)")
+                skipped_cooldown += 1
+                continue
+
+            ctx = get_full_context(symbol)
+            time.sleep(FETCH_DELAY)
+            scanned += 1
+
+            if not ctx:
+                print("— no data")
+                failed += 1
+                continue
+
+            # Validate required fields exist
+            required_fields = [
+                'current', 'ema200', 'ema50', 'rsi',
+                'day_change_pct', 'ath_pct', 'vol_ratio'
+            ]
+            missing = [f for f in required_fields if f not in ctx or ctx[f] is None]
+            if missing:
+                print(f"— missing: {missing}")
+                failed += 1
+                continue
+
+            result = qualify_dip(ctx)
+
+            if not result['qualified']:
+                # Track failure reasons for diagnostics
+                reason_key = result['reason'].split('(')[0].strip()
+                disqualified_reasons[reason_key] = disqualified_reasons.get(reason_key, 0) + 1
+                print(f"✗ {result['reason'][:60]}")
+                continue
+
+            # Record cooldown
+            record_alert_fired(symbol)
+
+            candidates.append({
+                'ctx': ctx,
+                'score': result['score'],
+                'reasons': result['reasons'],
+                'drop_5d': result['drop_5d'],
+                'rs_score': result['rs_score'],
+                'rs_label': result['rs_label'],
+                'trend_note': result['trend_note'],
+            })
+            print(f"🎯 QUALIFIED (score={result['score']}/16)")
+
+        except Exception as e:
+            print(f"💥 ERROR: {e}")
+            failed += 1
+            logging.error(f"Scan error {symbol}: {e}", exc_info=True)
+
+    # ─── Summary ───
+    print(f"\n{'-' * 50}")
+    print(f"📊 SCAN COMPLETE:")
+    print(f"   Scanned: {scanned} | Failed: {failed} | Cooldown: {skipped_cooldown}")
+    print(f"   Qualified: {len(candidates)}")
+
+    if disqualified_reasons:
+        print(f"\n📋 Top disqualification reasons:")
+        sorted_reasons = sorted(disqualified_reasons.items(), key=lambda x: -x[1])[:5]
+        for reason, count in sorted_reasons:
+            print(f"   • {reason}: {count}")
+
+    logging.info(
+        f"Scan complete | Scanned:{scanned} Failed:{failed} "
+        f"Cooldown:{skipped_cooldown} Qualified:{len(candidates)}"
+    )
+
+    if not candidates:
+        print("\n✅ No qualifying dip setups right now")
+        logging.info("No candidates")
+        return
+
+    # ─── Sort by score ───
+    candidates.sort(key=lambda c: (-c['score'], c['drop_5d']))
+
+    # ─── Build & send alert ───
+    scan_stats = {'total': scanned, 'failed': failed, 'cooldown': skipped_cooldown}
+    msg = format_alert(candidates, market_ctx, scan_stats)
+
+    # Split long messages (Telegram limit ~4096 chars)
+    if len(msg) > 4000:
+        parts = []
+        current_part = ""
+        for line in msg.split('\n'):
+            if len(current_part) + len(line) + 1 > 3900:
+                parts.append(current_part)
+                current_part = line + '\n'
+            else:
+                current_part += line + '\n'
+        if current_part:
+            parts.append(current_part)
+
+        success = True
+        for i, part in enumerate(parts):
+            if not send_telegram(part, silent=(i > 0)):
+                success = False
+            time.sleep(0.5)
+    else:
+        success = send_telegram(msg, silent=False)
+
+    if success:
+        print(f"\n✅ Alert sent! ({len(candidates)} candidates, top {min(10, len(candidates))} shown)")
+    else:
+        print("\n❌ Failed to send Telegram alert")
+        logging.error("Telegram send failed")
+
+
+# ═══════════════════════════════════════════════════════════════
+# DIAGNOSTICS MODE — run with --debug to see why stocks fail
+# ═══════════════════════════════════════════════════════════════
+
+def run_diagnostics():
+    """Run scan with verbose output showing exactly why each stock passes/fails."""
+    print("\n🔍 DIAGNOSTIC MODE — showing all qualification details\n")
+
+    for symbol in DIP_UNIVERSE[:20]:
+        print(f"\n{'-' * 40}")
+        print(f"📊 {symbol}")
+
+        ctx = get_full_context(symbol)
+        if not ctx:
+            print("   ❌ No data returned from get_full_context")
+            continue
+
+        print(f"   Price: ${ctx.get('current', 'N/A')}")
+        print(f"   EMA50: ${ctx.get('ema50', 'N/A')}")
+        print(f"   EMA200: ${ctx.get('ema200', 'N/A')}")
+        print(f"   RSI: {ctx.get('rsi', 'N/A')}")
+        print(f"   Day Change: {ctx.get('day_change_pct', 'N/A')}%")
+        print(f"   ATH%: {ctx.get('ath_pct', 'N/A')}%")
+        print(f"   Vol Ratio: {ctx.get('vol_ratio', 'N/A')}x")
+
+        above_200 = ctx['current'] > ctx['ema200'] if ctx.get('ema200') else None
+        print(f"   Above EMA200: {above_200}")
+
+        result = qualify_dip(ctx)
+        if result['qualified']:
+            print(f"   ✅ QUALIFIED — Score: {result['score']}/16")
+            for r in result['reasons']:
+                print(f"      • {r}")
+        else:
+            print(f"   ❌ FAILED — {result['reason']}")
+
+        time.sleep(FETCH_DELAY)
+
+
+if __name__ == "__main__":
+    import sys
+    if '--debug' in sys.argv or '--diagnostics' in sys.argv:
+        run_diagnostics()
+    else:
+        run_dip_scan()
