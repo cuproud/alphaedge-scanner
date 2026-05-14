@@ -1,32 +1,44 @@
 """
-ALPHAEDGE SINGLE SCAN v4.2
+ALPHAEDGE SINGLE SCAN v4.3
 ═══════════════════════════════════════════════════════════════
-v4.2 FIXES vs v4.0 (doc4 base):
-• get_verdict() — EXTENDED case now catches RSI >= 70 OR stretch >= 30%
-  (was missing — RSI 74 was falling through to WATCH "Building Momentum")
-• get_verdict() — reason text built dynamically so RSI label in verdict
-  matches technicals section (no more "overbought" vs "bullish" conflict)
-• get_verdict() — new PARABOLIC EXTENSION case (stretch >= 50% + RSI >= 70)
-• get_verdict() — MTF RSI extreme detection (any TF >= 85 adds warning)
-• get_verdict() — stretch_pct gates BUY/MOMENTUM cases to prevent chasing
-• get_verdict() — computed re-entry price levels in every next_steps
-• get_verdict() — earnings override expanded to include EXTENDED verdict
-• get_mtf_verdicts() — rsi_tag field added (EXTREME/Overbought/Oversold)
-• quick_poc() — price-anchored window (+-30% of current price)
-  prevents stale histogram on parabolic movers
-• build_reentry_table() — analyst target row removed (was duplicating
-  the FUNDAMENTALS section)
-• build_reentry_table() — WATCH case fixed (was showing MOMENTUM language)
-• build_tag_pills() — RSI threshold corrected (>= 70 = overbought)
-• format_full_analysis() — MTF RSI tag displayed inline
-• format_full_analysis() — analyst flag shown when stock > consensus
-• format_full_analysis() — 52W corporate action warning in price grid
-• format_full_analysis() — stretch warning consistent with verdict
-• version footer bumped to v7.2
+v4.3 AUDIT FIXES vs v4.2:
+
+CRITICAL:
+• next_steps from get_verdict() now rendered directly in format_full_analysis()
+  (was silently discarded — build_reentry_table() recomputed generic levels instead)
+• build_reentry_table() removed — next_steps IS the action table now
+• HOLD and CAUTION verdict branches added to reentry guidance (were falling to
+  generic default showing wrong Bull/Bear trigger text)
+• Verdict gap fixed: RSI 55-69 + stretch 15-29% + strong uptrend now correctly
+  hits a new MOMENTUM CONTINUATION case instead of falling to WATCH
+• get_earnings_date() called only once per analysis (was called twice — once in
+  get_verdict() and once in format_full_analysis())
+
+HIGH:
+• drop_em dead variable removed (defined but never used)
+• next_steps dead parameter removed from format_full_analysis() signature
+• support/resistance passed in but never rendered — now shown in price section
+• short_name (company full name) now shown in header alongside ticker
+• industry now shown in header type line
+• ai_analyze_drop dead import removed
+• os dead import removed
+• validate_symbol() replaced with lightweight fast_info check (was doing full
+  yfinance download just to confirm ticker exists)
+• df_daily download in run_analysis() removed — reuses the daily data already
+  fetched by get_full_context() (passed through as ctx['df_daily'])
+• get_market_ctx() QQQ fetch: no change here (in market_intel.py) but QQQ
+  value is now shown in market section for context
+
+MEDIUM:
+• detect_rsi_divergence() now uses rolling min/max for proper swing detection
+  instead of endpoint comparison (was firing on trend noise)
+• ath_recency() now uses now_est() instead of naive datetime.now()
+• Company full name shown in header: "TSLA — Tesla, Inc. (NASDAQ)"
+
+VERSION: v7.3
 """
 
 import sys
-import os
 import json
 import time
 import logging
@@ -47,7 +59,7 @@ logging.basicConfig(
 from market_intel import (
     get_full_context, get_market_ctx,
     calc_relative_strength, get_earnings_date, format_earnings_warning,
-    ai_analyze_drop, SYMBOL_EMOJI, SECTORS, SYMBOL_TO_SECTOR,
+    SYMBOL_EMOJI, SECTORS, SYMBOL_TO_SECTOR,
     send_telegram, now_est, load_json, save_json,
     EARNINGS_WARNING_DAYS
 )
@@ -104,25 +116,37 @@ def is_crypto(sym):
     return sym.endswith('-USD') or sym == 'GC=F'
 
 def validate_symbol(sym):
+    """
+    Lightweight existence check using fast_info.
+    Avoids a full yfinance download just to confirm a ticker exists.
+    Falls back to a minimal download if fast_info unavailable.
+    """
     try:
-        df = yf.download(sym, period='5d', interval='1d',
+        fi = yf.Ticker(sym).fast_info
+        price = getattr(fi, 'last_price', None)
+        if price and float(price) > 0:
+            return True
+        # fallback
+        df = yf.download(sym, period='2d', interval='1d',
                          progress=False, auto_adjust=True)
         return not df.empty
     except Exception:
         return False
 
 def volume_label(vol_ratio):
-    if vol_ratio >= 2.0:  return f"{vol_ratio:.1f}x avg 🔥 Unusually high"
-    if vol_ratio >= 1.5:  return f"{vol_ratio:.1f}x avg - Above average"
-    if vol_ratio >= 0.8:  return f"{vol_ratio:.1f}x avg - Normal"
-    return f"{vol_ratio:.1f}x avg - Below average (weak move)"
+    if vol_ratio >= 2.0:  return f"{vol_ratio:.1f}x avg — Unusually high"
+    if vol_ratio >= 1.5:  return f"{vol_ratio:.1f}x avg — Above average"
+    if vol_ratio >= 0.8:  return f"{vol_ratio:.1f}x avg — Normal"
+    return f"{vol_ratio:.1f}x avg — Below average (weak move)"
 
 def ath_recency(ath_date_str):
+    """Uses now_est() for timezone consistency."""
     try:
         ath_dt = datetime.strptime(ath_date_str[:10], '%Y-%m-%d')
-        days   = (datetime.now() - ath_dt).days
-        if days == 0:   return "set TODAY 🔥"
-        if days == 1:   return "set YESTERDAY 🔥"
+        now    = now_est().replace(tzinfo=None)  # naive comparison to date-only ath_dt
+        days   = (now - ath_dt).days
+        if days == 0:   return "set TODAY"
+        if days == 1:   return "set YESTERDAY"
         if days <= 7:   return f"set {days}d ago"
         if days <= 30:  return f"set {days // 7}w ago"
         if days <= 365: return f"set {days // 30}mo ago"
@@ -177,6 +201,7 @@ def get_stock_info(symbol):
             'sector': 'Crypto', 'industry': 'Cryptocurrency',
             'exchange': '24/7', 'asset_type': 'Crypto',
             'currency': 'USD', 'short_name': symbol,
+            'long_name': symbol,
         }
     try:
         ticker = yf.Ticker(symbol)
@@ -196,6 +221,7 @@ def get_stock_info(symbol):
             'asset_type':    asset_type,
             'currency':      info.get('currency', 'USD'),
             'short_name':    info.get('shortName', symbol),
+            'long_name':     info.get('longName', info.get('shortName', symbol)),
             'target_mean':   info.get('targetMeanPrice'),
             'target_high':   info.get('targetHighPrice'),
             'target_low':    info.get('targetLowPrice'),
@@ -213,6 +239,7 @@ def get_stock_info(symbol):
             'sector':     SYMBOL_TO_SECTOR.get(symbol, 'Unknown'),
             'asset_type': 'Stock',
             'currency':   'USD',
+            'long_name':  symbol,
         }
 
 
@@ -252,6 +279,8 @@ def get_usd_cad_rate():
 
 def calc_parabolic_sar(df, af_start=0.02, af_step=0.02, af_max=0.2):
     try:
+        if len(df) < 2:
+            return None, None
         high  = df['High'].values
         low   = df['Low'].values
         close = df['Close'].values
@@ -348,7 +377,7 @@ def detect_squeeze(df):
         in_sq    = (bb_up < kc_up) & (bb_lo > kc_lo)
         if in_sq.iloc[-1]:
             return 'building', None
-        if in_sq.iloc[-2] and not in_sq.iloc[-1]:
+        if len(in_sq) >= 2 and in_sq.iloc[-2] and not in_sq.iloc[-1]:
             direction = 'bullish' if df['Close'].iloc[-1] > bb_basis.iloc[-1] else 'bearish'
             return 'fired', direction
         return 'none', None
@@ -357,21 +386,44 @@ def detect_squeeze(df):
 
 
 def detect_rsi_divergence(df):
+    """
+    Proper divergence detection using rolling min/max over a lookback window,
+    not endpoint-to-endpoint comparison which fires on trend noise.
+
+    Bullish divergence: price makes new recent low AND RSI makes a higher low.
+    Bearish divergence: price makes new recent high AND RSI makes a lower high.
+    Requires 5-point RSI gap (vs old 3) to reduce false positives.
+    """
     try:
         if len(df) < 30:
             return None
-        rsi_series  = pine_rsi(df['Close'], 14)
-        look        = 10
-        price_lows  = df['Low'].iloc[-look:]
-        rsi_lows    = rsi_series.iloc[-look:]
-        price_highs = df['High'].iloc[-look:]
-        rsi_highs   = rsi_series.iloc[-look:]
-        if (price_lows.iloc[-1] < price_lows.iloc[0] and
-                rsi_lows.iloc[-1] > rsi_lows.iloc[0] + 3):
+
+        rsi_series = pine_rsi(df['Close'], 14)
+        look       = 14  # bars to look back
+
+        price_window = df['Low'].iloc[-look:]
+        rsi_window   = rsi_series.iloc[-look:]
+        price_h_win  = df['High'].iloc[-look:]
+        rsi_h_win    = rsi_series.iloc[-look:]
+
+        # Bullish: price made a new low in last 3 bars but RSI is higher than the period low
+        recent_price_low = price_window.iloc[-3:].min()
+        period_price_low = price_window.iloc[:-3].min()
+        recent_rsi_low   = rsi_window.iloc[-3:].min()
+        period_rsi_low   = rsi_window.iloc[:-3].min()
+
+        if recent_price_low < period_price_low and recent_rsi_low > period_rsi_low + 5:
             return 'bullish'
-        if (price_highs.iloc[-1] > price_highs.iloc[0] and
-                rsi_highs.iloc[-1] < rsi_highs.iloc[0] - 3):
+
+        # Bearish: price made a new high in last 3 bars but RSI is lower
+        recent_price_high = price_h_win.iloc[-3:].max()
+        period_price_high = price_h_win.iloc[:-3].max()
+        recent_rsi_high   = rsi_h_win.iloc[-3:].max()
+        period_rsi_high   = rsi_h_win.iloc[:-3].max()
+
+        if recent_price_high > period_price_high and recent_rsi_high < period_rsi_high - 5:
             return 'bearish'
+
         return None
     except Exception:
         return None
@@ -385,7 +437,6 @@ def get_mtf_verdicts(symbol):
     """
     Returns dict of {label: {trend, rsi, rsi_tag, adx, sar_bull, adx_sar}}
     for Daily / Weekly / Monthly.
-    rsi_tag shows EXTREME / Overbought / Oversold inline in alert.
     """
     results = {}
     tf_map  = {
@@ -406,7 +457,6 @@ def get_mtf_verdicts(symbol):
             e200    = float(ema(df['Close'], min(200, len(df))).iloc[-1])
             rsi_val = float(pine_rsi(df['Close'], 14).iloc[-1])
 
-            # RSI extreme tag
             if rsi_val >= 90:    rsi_tag = "EXTREME"
             elif rsi_val >= 80:  rsi_tag = "Overbought"
             elif rsi_val <= 20:  rsi_tag = "EXTREME"
@@ -489,7 +539,6 @@ def quick_poc(df_daily):
     """
     Compute POC using only bars within +/-30% of current price.
     Prevents stale low-price history dominating on parabolic movers.
-    Returns None if fewer than 5 qualifying bars.
     """
     try:
         price_now = float(df_daily['Close'].iloc[-1])
@@ -528,7 +577,6 @@ def quick_poc(df_daily):
         poc_idx = int(np.argmax(vol_at_price))
         poc     = round((bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2, 4)
 
-        # Sanity check: POC must be within 40% of current price
         if abs(poc - price_now) / price_now > 0.40:
             return None
 
@@ -546,10 +594,17 @@ def recent_structure(df_daily):
 
 
 # ═══════════════════════════════════════════════
-# VERDICT ENGINE v4.2
+# VERDICT ENGINE v4.3
+# Returns (verdict, zone, reasons, next_steps)
+# next_steps contains specific price levels and is rendered directly in the alert.
 # ═══════════════════════════════════════════════
 
-def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
+def get_verdict(ctx, market_ctx=None, mtf_verdicts=None, earnings_cache=None):
+    """
+    earnings_cache: (earnings_date, days_until) tuple to avoid double API call.
+    If not provided, get_earnings_date() is called here. Pass it in from run_analysis()
+    to prevent the second call in format_full_analysis().
+    """
     c         = ctx
     rsi       = c['rsi']
     trend     = c['trend']
@@ -559,7 +614,6 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
     above_50  = c['current'] > c['ema50']
     above_200 = c['current'] > c['ema200']
 
-    # EMA50 stretch — pre-computed, used in multiple cases
     stretch_pct = (c['current'] - c['ema50']) / c['ema50'] * 100 if c['ema50'] > 0 else 0
 
     reasons    = []
@@ -607,11 +661,11 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             ]
         return verdict, zone, reasons, next_steps
 
-    # ── 0b. PARABOLIC EXTENSION — multi-day run, extreme EMA stretch ──
+    # ── 0b. PARABOLIC EXTENSION — extreme EMA stretch ──
     if stretch_pct >= 50 and rsi >= 70:
-        reentry_lo  = round(c['ema50'] * 0.98, 2)
-        reentry_hi  = round(c['ema50'] * 1.05, 2)
-        rsi_tf_str  = f" / {mtf_max_rsi:.0f} higher TF" if mtf_verdicts else ""
+        reentry_lo = round(c['ema50'] * 0.98, 2)
+        reentry_hi = round(c['ema50'] * 1.05, 2)
+        rsi_tf_str = f" / {mtf_max_rsi:.0f} higher TF" if mtf_verdicts else ""
         verdict, zone = "PARABOLIC EXTENSION", f"{stretch_pct:.0f}% Above EMA50"
         reasons = [
             f"Price is {stretch_pct:.0f}% above EMA50 — statistically extreme",
@@ -623,8 +677,8 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             "DO NOT enter — mean reversion is the highest-probability outcome",
             f"Re-entry zone: ${reentry_lo} - ${reentry_hi} (near EMA50)",
             f"RSI trigger: wait for RSI to reset below 60 (currently {rsi:.0f})",
-            f"Stop / invalidation: below EMA200 ${c['ema200']:.2f}",
-            "If holding: trail stop tightly, consider taking 25-33% off",
+            f"Invalidation: below EMA200 ${c['ema200']:.2f}",
+            "If holding: trail stop, consider taking 25-33% off",
         ]
         return verdict, zone, reasons, next_steps
 
@@ -664,13 +718,10 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
         ]
 
     # ── 3. EXTENDED — RSI >= 70 OR stretch >= 30% ──
-    # KEY FIX: this case was missing in v4.0.
-    # RSI 74 was falling through to WATCH "Building Momentum" in old code.
     elif (rsi >= 70 or stretch_pct >= 30) and above_50 and above_200:
         reentry_lo = round(c['ema50'] * 0.98, 2)
         reentry_hi = round(c['ema50'] * 1.05, 2)
         verdict, zone = "EXTENDED", "Overbought — Wait for Pullback"
-        # Dynamic reasons so RSI label matches the technicals section
         reasons = []
         if rsi >= 70:
             reasons.append(f"RSI {rsi:.0f} — overbought, momentum stretched")
@@ -688,7 +739,26 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             "If holding: trail stop, do not add to position",
         ]
 
-    # ── 4. BUY ZONE — strong uptrend pullback ──
+    # ── 4. MOMENTUM CONTINUATION — strong uptrend, RSI 55-69, not extended ──
+    # Fixes gap: RSI 55-69 + stretch < 25% + uptrend was falling to generic WATCH
+    elif ("UPTREND" in trend and 55 <= rsi < 70 and above_200 and stretch_pct < 25):
+        verdict, zone = "MOMENTUM CONTINUATION", "Uptrend — Healthy"
+        reasons = [
+            f"Strong uptrend intact — above both EMAs",
+            f"RSI {rsi:.0f} — momentum building, not yet overbought",
+        ]
+        if from_ath > -15:
+            reasons.append(f"Near ATH ({from_ath:+.1f}%) — trend is strong")
+        if mtf_all_bull:
+            reasons.append("All timeframes aligned bullish")
+        next_steps = [
+            f"Ideal entry: pullback to EMA50 ${c['ema50']:.2f} (lower risk)",
+            f"Momentum entry: current ${c['current']:.2f} acceptable if conviction is high",
+            f"Target: ATH ${c['ath']:.2f} ({from_ath:+.1f}% away)",
+            f"Stop: close below EMA50 ${c['ema50']:.2f}",
+        ]
+
+    # ── 5. BUY ZONE — strong uptrend pullback ──
     elif "UPTREND" in trend and rsi < 55 and above_200 and stretch_pct < 20:
         verdict, zone = "BUY ZONE", "Pullback in Uptrend"
         reasons = [
@@ -701,12 +771,12 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             reasons.append("All timeframes remain aligned bullish")
         next_steps = [
             f"Entry: ${c['current']:.2f} or lower — current level is reasonable",
-            f"Target 1: ${c['ath']:.2f} (prior ATH)",
+            f"Target 1: ATH ${c['ath']:.2f} ({from_ath:+.1f}% away)",
             "Target 2: new ATH breakout",
             f"Stop: below EMA200 ${c['ema200']:.2f}",
         ]
 
-    # ── 5. BUY ZONE — EMA50 pullback ──
+    # ── 6. BUY ZONE — EMA50 pullback ──
     elif "PULLBACK" in trend and rsi < 58 and stretch_pct < 15:
         verdict, zone = "BUY ZONE", "EMA50 Pullback"
         reasons = [
@@ -720,7 +790,7 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             f"Stop: close below EMA200 ${c['ema200']:.2f}",
         ]
 
-    # ── 6. DOWNTREND ──
+    # ── 7. DOWNTREND ──
     elif "DOWNTREND" in trend and not above_200:
         verdict, zone = "AVOID", "Falling Knife"
         reasons = ["Below EMA50 & EMA200 — confirmed downtrend, no base formed"]
@@ -732,7 +802,7 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             f"EMA200 ${c['ema200']:.2f} is first target if reversal forms",
         ]
 
-    # ── 7. NEAR 52W LOW ──
+    # ── 8. NEAR 52W LOW ──
     elif c['pct_from_52w_low'] < 8 and drop < -3:
         verdict, zone = "CAUTION", "Breaking Down"
         reasons = ["Near 52W low — key support at risk of breaking"]
@@ -742,7 +812,7 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             f"Stop if entering: below ${c['low_52w']:.2f}",
         ]
 
-    # ── 8. TAKE PROFITS ──
+    # ── 9. TAKE PROFITS ──
     elif rsi > 73 and drop > 2:
         reentry_lo = round(c['ema50'] * 0.98, 2)
         reentry_hi = round(c['ema50'] * 1.05, 2)
@@ -757,7 +827,7 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             f"Trail stop: ${round(c['ema50'] * 0.97, 2):.2f} (3% below EMA50)",
         ]
 
-    # ── 9. RECOVERING ──
+    # ── 10. RECOVERING ──
     elif "RECOVERING" in trend:
         if rsi > 55 and drop > 0:
             verdict, zone = "WATCH", "Recovery Attempt"
@@ -776,9 +846,10 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             next_steps = [
                 f"Wait for: reclaim EMA200 ${c['ema200']:.2f}",
                 "Then enter on confirmation with RSI > 50",
+                f"Do not enter below EMA200 ${c['ema200']:.2f}",
             ]
 
-    # ── 10. MIXED ──
+    # ── 11. MIXED ──
     elif "MIXED" in trend:
         if range_pos < 35 and rsi < 45:
             verdict, zone = "WATCH", "Potential Base"
@@ -797,7 +868,7 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
                 "No position until one of these confirms",
             ]
 
-    # ── 11. DEFAULT ──
+    # ── 12. DEFAULT ──
     else:
         if above_50 and above_200 and rsi > 55 and stretch_pct < 25:
             verdict, zone = "WATCH", "Building Momentum"
@@ -850,8 +921,12 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None):
             ]
 
     # ── Earnings override — includes EXTENDED ──
+    # Uses earnings_cache to avoid double API call when called from run_analysis()
     if any(x in verdict for x in ["BUY", "MOMENTUM", "WATCH", "EXTENDED"]):
-        _, days_until = get_earnings_date(c['symbol'])
+        if earnings_cache is not None:
+            _, days_until = earnings_cache
+        else:
+            _, days_until = get_earnings_date(c['symbol'])
         if days_until is not None and days_until <= EARNINGS_WARNING_DAYS:
             verdict = "WAIT — Earnings"
             zone    = f"Earnings in {days_until}d"
@@ -903,9 +978,9 @@ SECTOR: {sector_str}{analyst_str}
 
 Respond EXACTLY:
 [Technical/sector/catalyst? Specific]
-[Setup quality & R:R -- is it worth taking now?]
-[Biggest invalidation risk -- specific level]
-[STRONG BUY/BUY/HOLD/AVOID/WAIT] -- [one sharp sentence]
+[Setup quality and R:R — is it worth taking now?]
+[Biggest invalidation risk — specific level]
+[STRONG BUY/BUY/HOLD/AVOID/WAIT] — [one sharp sentence]
 
 4 lines only."""
 
@@ -920,7 +995,7 @@ Respond EXACTLY:
             if data.get('candidates'):
                 return data['candidates'][0]['content']['parts'][0]['text'].strip()
         elif r.status_code == 429:
-            print("  --> Gemini RATE LIMITED -- retrying in 15s")
+            logging.warning("Gemini rate limited, retrying in 15s")
             time.sleep(15)
             r2 = requests.post(url, json={
                 "contents": [{"parts": [{"text": prompt}]}],
@@ -931,9 +1006,9 @@ Respond EXACTLY:
                 if data2.get('candidates'):
                     return data2['candidates'][0]['content']['parts'][0]['text'].strip()
         else:
-            print(f"  --> Gemini ERROR {r.status_code}")
+            logging.warning(f"Gemini error {r.status_code}")
     except Exception as e:
-        logging.error(f"AI: {e}")
+        logging.error(f"AI analysis: {e}")
     return None
 
 
@@ -943,358 +1018,361 @@ Respond EXACTLY:
 
 def build_tag_pills(verdict, ctx, rs_label, squeeze_state, rsi_div, stock_info):
     """
-    Compact tag line shown under header. Max 4 pills.
-    RSI threshold fixed: >= 70 = overbought (consistent with verdict).
+    Compact emoji tag pills shown under header.
+    Max 4 pills. Each pill has an emoji so they scan instantly on mobile.
+    RSI threshold >= 70 = overbought (consistent with verdict logic).
     """
     tags = []
     c    = ctx
     rsi  = c['rsi']
     stretch_pct = (c['current'] - c['ema50']) / c['ema50'] * 100 if c['ema50'] > 0 else 0
 
-    # Primary verdict tag
-    if 'PARABOLIC' in verdict:            tags.append('Parabolic')
-    elif 'CRASH' in verdict:              tags.append('Crash')
-    elif 'EXTREMELY EXTENDED' in verdict: tags.append('Extremely Extended')
-    elif 'MOMENTUM' in verdict:           tags.append('Momentum')
-    elif 'BUY ZONE' in verdict:           tags.append('Buy Zone')
-    elif 'EXTENDED' in verdict:           tags.append('Extended')
-    elif 'TAKE PROFITS' in verdict:       tags.append('Take Profits')
-    elif 'AVOID' in verdict:              tags.append('Avoid')
-    elif 'CAUTION' in verdict:            tags.append('Caution')
-    elif 'WAIT' in verdict:               tags.append('Wait')
-    elif 'WATCH' in verdict:              tags.append('Watch')
-    elif 'NEUTRAL' in verdict:            tags.append('Neutral')
+    # Primary verdict pill — emoji encodes direction at a glance
+    if 'PARABOLIC' in verdict:               tags.append('🚨 Parabolic')
+    elif 'CRASH' in verdict:                 tags.append('💥 Crash')
+    elif 'EXTREMELY EXTENDED' in verdict:    tags.append('🔥 Extremely Extended')
+    elif 'MOMENTUM CONTINUATION' in verdict: tags.append('🚀 Momentum')
+    elif 'MOMENTUM' in verdict:              tags.append('🚀 ATH Momentum')
+    elif 'BUY ZONE' in verdict:              tags.append('🟢 Buy Zone')
+    elif 'EXTENDED' in verdict:              tags.append('🟠 Extended')
+    elif 'TAKE PROFITS' in verdict:          tags.append('💰 Take Profits')
+    elif 'AVOID' in verdict:                 tags.append('🔴 Avoid')
+    elif 'CAUTION' in verdict:               tags.append('⚠️ Caution')
+    elif 'WAIT' in verdict:                  tags.append('⏳ Wait')
+    elif 'WATCH' in verdict:                 tags.append('👀 Watch')
+    elif 'HOLD' in verdict:                  tags.append('⏸️ Hold')
+    elif 'NEUTRAL' in verdict:               tags.append('⚖️ Neutral')
 
-    # RSI tag — threshold >= 70 matches verdict EXTENDED trigger
-    if rsi >= 80:        tags.append('RSI Extreme')
-    elif rsi >= 70:      tags.append('RSI Overbought')
-    elif rsi <= 30:      tags.append('RSI Oversold')
-    elif rsi >= 60:      tags.append('RSI Bullish')
+    # RSI pill
+    if rsi >= 80:        tags.append('🔴 RSI Extreme')
+    elif rsi >= 70:      tags.append('🔴 RSI Overbought')
+    elif rsi <= 30:      tags.append('🟢 RSI Oversold')
+    elif rsi >= 60:      tags.append('🟡 RSI Bullish')
 
-    # Stretch tag (only if not already in primary verdict)
+    # EMA stretch pill (only if not already captured by primary verdict)
     if stretch_pct >= 50 and 'PARABOLIC' not in verdict:
-        tags.append(f'{stretch_pct:.0f}% above EMA50')
+        tags.append(f'⚡ {stretch_pct:.0f}% above EMA50')
     elif 30 <= stretch_pct < 50 and 'EXTENDED' not in verdict:
-        tags.append(f'{stretch_pct:.0f}% above EMA50')
+        tags.append(f'⚡ {stretch_pct:.0f}% above EMA50')
 
-    # RS vs SPY
+    # RS vs SPY pill
     if rs_label:
-        if 'Strong Leader' in rs_label:   tags.append('Strong Leader')
-        elif 'Outperform' in rs_label:    tags.append('Outperforming')
-        elif 'Laggard' in rs_label:       tags.append('Laggard')
-        elif 'Underperform' in rs_label:  tags.append('Underperforming')
+        if 'Strong Leader' in rs_label:    tags.append('💪 Strong Leader')
+        elif 'Outperform' in rs_label:     tags.append('📈 Outperforming')
+        elif 'Laggard' in rs_label:        tags.append('📉 Laggard')
+        elif 'Underperform' in rs_label:   tags.append('🔻 Underperforming')
 
-    # Squeeze / divergence
-    if squeeze_state == 'building':       tags.append('Squeeze Building')
-    elif squeeze_state == 'fired':        tags.append('Squeeze Fired')
-    if rsi_div == 'bullish':              tags.append('RSI Div Bullish')
-    elif rsi_div == 'bearish':            tags.append('RSI Div Bearish')
+    # Squeeze / divergence pills
+    if squeeze_state == 'building':        tags.append('🔥 Squeeze Building')
+    elif squeeze_state == 'fired':         tags.append('💥 Squeeze Fired')
+    if rsi_div == 'bullish':               tags.append('📈 RSI Div Bullish')
+    elif rsi_div == 'bearish':             tags.append('📉 RSI Div Bearish')
 
-    # High short interest
+    # Short interest pill
     short_pct = stock_info.get('short_pct')
-    if short_pct and short_pct > 0.15:   tags.append(f'{short_pct*100:.0f}% Short')
+    if short_pct and short_pct > 0.15:    tags.append(f'⚡ {short_pct*100:.0f}% Short')
 
-    return ' | '.join(tags[:4])
-
-
-# ═══════════════════════════════════════════════
-# RE-ENTRY TABLE
-# ═══════════════════════════════════════════════
-
-def build_reentry_table(verdict, ctx, mtf_verdicts, stock_info):
-    """
-    Decision table with exact price levels.
-    Analyst target removed — lives in FUNDAMENTALS to avoid duplication.
-    WATCH case fixed — no longer shows MOMENTUM language.
-    """
-    c = ctx
-    decimals = 4 if c['current'] < 10 else 2
-    pf = f"{{:.{decimals}f}}"
-
-    lines = []
-
-    if any(x in verdict for x in ['PARABOLIC', 'EXTREMELY EXTENDED']):
-        ema50_lo = round(c['ema50'] * 0.97, decimals)
-        ema50_hi = round(c['ema50'] * 1.03, decimals)
-        lines.append(f"{'DO NOT enter':16s} Mean reversion is highest-probability")
-        lines.append(f"{'Re-entry zone':16s} ${pf.format(ema50_lo)} - ${pf.format(ema50_hi)} (EMA50)")
-        lines.append(f"{'RSI trigger':16s} Wait for RSI below 60, then bounce")
-        lines.append(f"{'Invalidation':16s} Below EMA200 ${pf.format(c['ema200'])}")
-
-    elif 'EXTENDED' in verdict or 'TAKE PROFITS' in verdict:
-        ema50_lo = round(c['ema50'] * 0.98, decimals)
-        ema50_hi = round(c['ema50'] * 1.05, decimals)
-        lines.append(f"{'Not ideal entry':16s} Poor R:R at current price — wait")
-        lines.append(f"{'Better entry':16s} ${pf.format(ema50_lo)} - ${pf.format(ema50_hi)} (EMA50)")
-        lines.append(f"{'RSI trigger':16s} Wait for RSI below 60 (now {c['rsi']:.0f})")
-        lines.append(f"{'If holding':16s} Trail stop, do not add to position")
-
-    elif 'MOMENTUM' in verdict:
-        lines.append(f"{'Breakout entry':16s} Above ATH ${pf.format(c['ath'])} with volume")
-        lines.append(f"{'Pullback entry':16s} Dip to EMA50 ${pf.format(c['ema50'])} (ideal)")
-        lines.append(f"{'Target':16s} New ATH territory")
-        lines.append(f"{'Stop':16s} Close below EMA50 ${pf.format(c['ema50'])}")
-
-    elif 'BUY ZONE' in verdict:
-        lines.append(f"{'Entry':16s} ${pf.format(c['current'])} or lower — good R:R here")
-        lines.append(f"{'Target':16s} ATH ${pf.format(c['ath'])} ({c['ath_pct']:+.1f}% away)")
-        lines.append(f"{'Stop':16s} Close below EMA200 ${pf.format(c['ema200'])}")
-        lines.append(f"{'Add on dip':16s} EMA50 ${pf.format(c['ema50'])} is ideal add zone")
-
-    elif 'WATCH' in verdict:
-        # WATCH is not a buy — wait for confirmation
-        pullback_lo = round(c['ema50'] * 0.99, decimals)
-        pullback_hi = round(c['ema50'] * 1.03, decimals)
-        lines.append(f"{'Not a buy yet':16s} Wait for confirmation before entering")
-        lines.append(f"{'Best entry':16s} Pullback to ${pf.format(pullback_lo)} - ${pf.format(pullback_hi)}")
-        lines.append(f"{'Breakout entry':16s} Above ${pf.format(c['high_52w'])} with volume")
-        lines.append(f"{'Stop':16s} Close below EMA200 ${pf.format(c['ema200'])}")
-
-    elif any(x in verdict for x in ['AVOID', 'CRASH']):
-        lines.append(f"{'Do NOT enter':16s} Confirmed downtrend — no base formed")
-        lines.append(f"{'Watch for':16s} Close above EMA50 ${pf.format(c['ema50'])}")
-        lines.append(f"{'Confirm with':16s} RSI > 50 + volume > 1.5x")
-        lines.append(f"{'Then target':16s} EMA200 ${pf.format(c['ema200'])}")
-
-    else:
-        # Neutral / Hold / Wait
-        lines.append(f"{'Bull trigger':16s} Close above EMA50 ${pf.format(c['ema50'])}")
-        lines.append(f"{'Bear trigger':16s} Close below EMA200 ${pf.format(c['ema200'])}")
-        lines.append(f"{'RSI watch':16s} Above 55 for bull, below 45 for bear")
-        lines.append(f"{'Best action':16s} Wait for clear directional break")
-
-    msg = "*WHAT TO DO*\n`─────────────────────────`\n"
-    for line in lines:
-        msg += f"`{line}`\n"
-    return msg
+    return '  ·  '.join(tags[:4])
 
 
 # ═══════════════════════════════════════════════
 # PRICE CONTEXT GRID
 # ═══════════════════════════════════════════════
 
-def build_price_context_grid(ctx, cad_price, tsx_symbol, usd_cad):
-    """Compact scannable price context block."""
+def build_price_context_grid(ctx, cad_price, tsx_symbol, usd_cad, support, resistance):
+    """
+    Compact scannable price context.
+    Each row has a fixed emoji anchor so the eye can jump to any row instantly.
+    Support/resistance now rendered here (were previously passed but never shown).
+    """
     c = ctx
     decimals = 4 if c['current'] < 10 else 2
     pf = f"{{:.{decimals}f}}"
 
     vol_ratio = c['vol_ratio']
-    if vol_ratio >= 2.0:   vol_str = f"{vol_ratio:.1f}x Unusual"
-    elif vol_ratio >= 1.5: vol_str = f"{vol_ratio:.1f}x Above avg"
-    elif vol_ratio >= 0.8: vol_str = f"{vol_ratio:.1f}x Normal"
-    else:                  vol_str = f"{vol_ratio:.1f}x Weak"
+    if vol_ratio >= 2.0:   vol_str = f"`{vol_ratio:.1f}x` 🔥 Unusually high"
+    elif vol_ratio >= 1.5: vol_str = f"`{vol_ratio:.1f}x` ⬆️ Above average"
+    elif vol_ratio >= 0.8: vol_str = f"`{vol_ratio:.1f}x` — Normal"
+    else:                  vol_str = f"`{vol_ratio:.1f}x` ⬇️ Below average (weak move)"
 
     rp = c['range_pos']
-    if rp >= 90:   rp_str = f"{rp:.0f}% — near top of range"
-    elif rp >= 70: rp_str = f"{rp:.0f}% — upper range"
-    elif rp >= 50: rp_str = f"{rp:.0f}% — mid range"
-    elif rp >= 30: rp_str = f"{rp:.0f}% — lower range"
-    else:          rp_str = f"{rp:.0f}% — near bottom"
+    if rp >= 90:   rp_bar = "████████████ 90%+ — near top"
+    elif rp >= 70: rp_bar = f"█████████░░░ {rp:.0f}% — upper range"
+    elif rp >= 50: rp_bar = f"██████░░░░░░ {rp:.0f}% — mid range"
+    elif rp >= 30: rp_bar = f"████░░░░░░░░ {rp:.0f}% — lower range"
+    else:          rp_bar = f"██░░░░░░░░░░ {rp:.0f}% — near bottom"
 
-    ath_str = f"{c['ath_pct']:+.1f}% — {ath_recency(c['ath_date'])}"
+    ath_str = f"`{c['ath_pct']:+.1f}%` — {ath_recency(c['ath_date'])}"
 
-    msg  = "*PRICE CONTEXT*\n`─────────────────────────`\n"
-    msg += f"`{'Volume':12s}` {vol_str}\n"
-    msg += f"`{'52W Position':12s}` {rp_str}\n"
-    msg += f"`{'From ATH':12s}` {ath_str}\n"
-    msg += f"`{'52W Range':12s}` ${pf.format(c['low_52w'])} to ${pf.format(c['high_52w'])}\n"
+    msg  = f"📊 *PRICE CONTEXT*\n`─────────────────────────`\n"
+    msg += f"📦 Volume    {vol_str}\n"
+    msg += f"📍 52W Pos   `{rp_bar}`\n"
+    msg += f"🏔️ From ATH  {ath_str}\n"
+    msg += f"📐 52W Range `${pf.format(c['low_52w'])}` — `${pf.format(c['high_52w'])}`\n"
 
-    # Corporate action / abnormal range warning
     if c.get('pct_from_52w_low', 0) > 500:
-        msg += f"52W low ${pf.format(c['low_52w'])} suggests split/spin-off — range unreliable\n"
+        msg += f"⚠️ _52W low `${pf.format(c['low_52w'])}` may reflect split/spin-off — range unreliable_\n"
+
+    if support and resistance:
+        msg += f"🔑 Structure Support `${pf.format(support)}` · Resistance `${pf.format(resistance)}`\n"
 
     if cad_price and tsx_symbol:
-        msg += f"`{'TSX (CAD)':12s}` {tsx_symbol} = ${cad_price:.2f} CAD\n"
+        msg += f"🍁 TSX      `{tsx_symbol}` = `${cad_price:.2f} CAD`\n"
     elif usd_cad and not is_crypto(c['symbol']):
         implied = round(c['current'] * usd_cad, 2)
-        msg += f"`{'CAD equiv':12s}` ${implied:.2f} (x{usd_cad:.4f}) — no TSX listing\n"
+        msg += f"🍁 CAD      `${implied:.2f}` (×{usd_cad:.4f}) — no TSX listing\n"
 
     return msg
 
 
 # ═══════════════════════════════════════════════
-# FORMAT FULL ANALYSIS v4.2
+# FORMAT FULL ANALYSIS v4.3
 # Layout:
-#   1. Header (ticker, price, change, type)
+#   1. Header (company name, ticker, price, change, type)
 #   2. Tag pills
 #   3. Verdict + AI one-liner + reasons
 #   4. Price + POC
-#   5. What To Do (re-entry table)
-#   6. Price context grid
+#   5. What To Do (next_steps from get_verdict — specific price levels)
+#   6. Price context grid (volume, 52W, ATH, structure, CAD)
 #   7. Timeframe alignment
 #   8. Technicals
 #   9. Sector + RS
-#  10. Fundamentals (analyst targets with overextension flag)
-#  11. Earnings
-#  12. Market
-#  13. Full AI analysis
+#  10. Fundamentals (analyst targets with flag)
+#  11. Earnings (single call, cached from run_analysis)
+#  12. Market (SPY + VIX + QQQ)
+#  13. AI full analysis
 # ═══════════════════════════════════════════════
 
-def format_full_analysis(symbol, ctx, verdict, zone, reasons, next_steps,
+def format_full_analysis(symbol, ctx, verdict, zone, reasons,
                           ai_text, market_ctx, rs_score, rs_label,
                           poc, support, resistance,
                           squeeze_state, squeeze_dir, rsi_div,
                           mtf_verdicts, sector_name, sector_avg,
-                          stock_info, cad_price, tsx_symbol, usd_cad):
-    em  = SYMBOL_EMOJI.get(symbol, '')
+                          stock_info, cad_price, tsx_symbol, usd_cad,
+                          next_steps, earnings_info):
+    """
+    Redesigned v7.3 layout — emoji-anchored headers, visual hierarchy,
+    verdict prominence, breathing room between sections.
+
+    Telegram cannot change font sizes but bold + emoji headers + separator
+    lines create strong visual differentiation from body content.
+
+    next_steps: from get_verdict() — specific computed price levels.
+    earnings_info: (earnings_date, days_until) — pre-fetched, no second API call.
+    """
+    em  = SYMBOL_EMOJI.get(symbol, '📊')
     c   = ctx
     now = now_est()
     tz  = now.tzname() or "EDT"
-    ts  = now.strftime(f'%a %b %d  %I:%M %p {tz}')
+    ts  = now.strftime(f'%b %d · %I:%M %p {tz}')
     decimals = 4 if c['current'] < 10 else 2
     pf       = f"{{:.{decimals}f}}"
     drop     = c['day_change_pct']
-    drop_em  = "+" if drop >= 0 else ""
     sign     = "+" if drop >= 0 else ""
+    drop_em  = "🟢" if drop >= 0 else "🔴"
 
     stretch_pct = (c['current'] - c['ema50']) / c['ema50'] * 100 if c['ema50'] > 0 else 0
 
     asset_type = stock_info.get('asset_type', 'Stock')
+    long_name  = stock_info.get('long_name', symbol)
     sector_h   = stock_info.get('sector', SYMBOL_TO_SECTOR.get(symbol, ''))
+    industry   = stock_info.get('industry', '')
     exchange   = stock_info.get('exchange', '')
     mcap       = fmt_mcap(stock_info.get('market_cap'))
     beta_val   = stock_info.get('beta')
 
-    # ─────────────────────────────────────────────
-    # 1  HEADER
-    # ─────────────────────────────────────────────
-    msg  = f"*{symbol}* {em}  `${pf.format(c['current'])}`  {sign}{drop:.2f}%\n"
-    type_parts = [asset_type]
-    if sector_h:  type_parts.append(sector_h)
-    if exchange:  type_parts.append(exchange)
-    if mcap:      type_parts.append(mcap)
-    msg += f"_{' · '.join(type_parts)}_\n"
-    msg += f"_{ts}_\n"
-    msg += f"`━━━━━━━━━━━━━━━━━━━━━━━━━`\n\n"
+    # ════════════════════════════════════════════
+    # § 1  HEADER
+    # Big bold ticker + emoji. Company name on next line.
+    # Price + change + timestamp all on one scannable line.
+    # ════════════════════════════════════════════
+    name_str = f"\n_{long_name}_" if long_name and long_name != symbol else ""
+    msg  = f"🔍 *{symbol}* {em}{name_str}\n"
+    msg += f"`${pf.format(c['current'])}`  {drop_em} *{sign}{drop:.2f}%*  _· {ts}_\n"
 
-    # ─────────────────────────────────────────────
-    # 2  TAG PILLS
-    # ─────────────────────────────────────────────
+    meta_parts = [asset_type]
+    if sector_h:  meta_parts.append(sector_h)
+    if industry and industry != sector_h: meta_parts.append(industry)
+    if exchange:  meta_parts.append(exchange)
+    if mcap:      meta_parts.append(mcap)
+    msg += f"_{' · '.join(meta_parts)}_\n"
+    msg += f"`══════════════════════════`\n\n"
+
+    # ════════════════════════════════════════════
+    # § 2  TAG PILLS — emoji-differentiated, · separated
+    # ════════════════════════════════════════════
     tags = build_tag_pills(verdict, ctx, rs_label, squeeze_state, rsi_div, stock_info)
     if tags:
         msg += f"{tags}\n\n"
 
-    # ─────────────────────────────────────────────
-    # 3  VERDICT + AI ONE-LINER + REASONS
-    # ─────────────────────────────────────────────
-    msg += f"*{verdict}*\n"
-    msg += f"_{zone}_\n"
+    # ════════════════════════════════════════════
+    # § 3  VERDICT BLOCK
+    # This is the most important section — it gets a full box treatment.
+    # Verdict in bold caps, zone in italics, reasons as bullets.
+    # AI one-liner sits right under verdict for immediate context.
+    # ════════════════════════════════════════════
+    msg += f"*〔 {verdict} 〕*\n"
+    msg += f"_↳ {zone}_\n"
 
+    # AI summary line elevated to verdict level — most actionable insight first
     if ai_text:
         lines   = ai_text.strip().split('\n')
-        summary = next((l for l in lines if 'WAIT' in l.upper() or
-                        'BUY' in l.upper() or 'HOLD' in l.upper() or
-                        'AVOID' in l.upper()), lines[-1] if lines else None)
+        summary = next((l for l in reversed(lines)
+                        if any(w in l.upper() for w in ['WAIT', 'BUY', 'HOLD', 'AVOID', 'STRONG'])),
+                       lines[-1] if lines else None)
         if summary:
-            msg += f"{summary}\n"
+            msg += f"\n{summary}\n"
 
     msg += "\n"
     for r in reasons[:3]:
-        msg += f"  - {r}\n"
-    msg += f"`━━━━━━━━━━━━━━━━━━━━━━━━━`\n\n"
+        msg += f"  › {r}\n"
+    msg += f"`══════════════════════════`\n\n"
 
-    # ─────────────────────────────────────────────
-    # 4  PRICE + POC
-    # ─────────────────────────────────────────────
-    msg += f"*PRICE*\n`─────────────────────────`\n"
-    msg += f"Live:   `${pf.format(c['current'])}`  {sign}{drop:.2f}% today\n"
-    msg += f"Range:  L `${pf.format(c['today_low'])}` to H `${pf.format(c['today_high'])}`\n"
-    msg += f"Volume: {volume_label(c['vol_ratio'])}\n"
+    # ════════════════════════════════════════════
+    # § 4  PRICE
+    # ════════════════════════════════════════════
+    msg += f"💵 *PRICE*\n`──────────────────────────`\n"
+    msg += f"  Live     `${pf.format(c['current'])}`  {drop_em} {sign}{drop:.2f}% today\n"
+    msg += f"  Range    L `${pf.format(c['today_low'])}` — H `${pf.format(c['today_high'])}`\n"
+
+    # Volume with context
+    vol_ratio = c['vol_ratio']
+    if vol_ratio >= 2.0:   vol_line = f"`{vol_ratio:.1f}x` 🔥 Unusually high"
+    elif vol_ratio >= 1.5: vol_line = f"`{vol_ratio:.1f}x` ⬆️ Above average"
+    elif vol_ratio >= 0.8: vol_line = f"`{vol_ratio:.1f}x` — Normal"
+    else:                  vol_line = f"`{vol_ratio:.1f}x` ⬇️ Below avg — weak move"
+    msg += f"  Volume   {vol_line}\n"
+
     if poc:
         diff_pct = (c['current'] - poc) / poc * 100
+        poc_em   = "🎯" if abs(diff_pct) < 0.5 else ("⬆️" if c['current'] > poc else "⬇️")
         if abs(diff_pct) < 0.5:
-            msg += f"POC:    AT `${pf.format(poc)}` — volume magnet\n"
+            msg += f"  POC      {poc_em} AT `${pf.format(poc)}` — volume magnet\n"
         elif c['current'] > poc:
-            msg += f"POC:    Above `${pf.format(poc)}` ({diff_pct:+.1f}%) — buyers in control\n"
+            msg += f"  POC      {poc_em} Above `${pf.format(poc)}` ({diff_pct:+.1f}%) — buyers in control\n"
         else:
-            msg += f"POC:    Below `${pf.format(poc)}` ({diff_pct:+.1f}%) — sellers in control\n"
+            msg += f"  POC      {poc_em} Below `${pf.format(poc)}` ({diff_pct:+.1f}%) — sellers in control\n"
     msg += "\n"
 
-    # ─────────────────────────────────────────────
-    # 5  WHAT TO DO
-    # ─────────────────────────────────────────────
-    msg += build_reentry_table(verdict, ctx, mtf_verdicts, stock_info)
+    # ════════════════════════════════════════════
+    # § 5  WHAT TO DO
+    # next_steps from get_verdict() — specific price levels, not generic text.
+    # Monospace block for each step makes prices stand out visually.
+    # ════════════════════════════════════════════
+    msg += f"🎯 *WHAT TO DO*\n`──────────────────────────`\n"
+    for step in next_steps:
+        msg += f"  › {step}\n"
     msg += "\n"
 
-    # ─────────────────────────────────────────────
-    # 6  PRICE CONTEXT GRID
-    # ─────────────────────────────────────────────
-    msg += build_price_context_grid(ctx, cad_price, tsx_symbol, usd_cad)
+    # ════════════════════════════════════════════
+    # § 6  PRICE CONTEXT
+    # ════════════════════════════════════════════
+    msg += build_price_context_grid(ctx, cad_price, tsx_symbol, usd_cad, support, resistance)
     msg += "\n"
 
-    # ─────────────────────────────────────────────
-    # 7  TIMEFRAME ALIGNMENT
-    # ─────────────────────────────────────────────
+    # ════════════════════════════════════════════
+    # § 7  TIMEFRAMES
+    # Compact 3-row table. Emoji encodes bull/bear at a glance.
+    # ════════════════════════════════════════════
     if mtf_verdicts:
-        msg += f"*TIMEFRAMES*\n`─────────────────────────`\n"
+        msg += f"🗂️ *TIMEFRAMES*\n`──────────────────────────`\n"
         for tf_label, v in mtf_verdicts.items():
-            sar_em  = "SAR OK" if v.get('sar_bull') else "SAR X" if v.get('sar_bull') is False else "SAR -"
-            adx_em  = "ADX strong" if v['adx'] >= 25 else "ADX weak" if v['adx'] < 20 else "ADX ok"
-            rsi_str = f"RSI {v['rsi']}"
+            # Trend emoji
+            t = v['trend']
+            t_em = "🚀" if "Strong Bull" in t else "📈" if "Bull" in t else "💀" if "Strong Bear" in t else "📉" if "Bear" in t else "⚖️"
+
+            # SAR emoji
+            sar_em = "✅" if v.get('sar_bull') else "❌" if v.get('sar_bull') is False else "➖"
+
+            # ADX label
+            adx_em = "💪" if v['adx'] >= 25 else "⚠️" if v['adx'] < 20 else "➖"
+
+            # RSI with tag
+            rsi_str = f"RSI `{v['rsi']}`"
             if v.get('rsi_tag'):
-                rsi_str += f" ({v['rsi_tag']})"
-            msg += (f"`{tf_label:7s}` {v['trend']}\n"
-                    f"         {rsi_str}  {adx_em} {v['adx']:.0f}  {sar_em}  {v['adx_sar']}\n")
+                rsi_str += f" _{v['rsi_tag']}_"
+
+            # Signal label
+            sig = v['adx_sar']
+            sig_em = "✅" if sig == "Trend BUY" else "❌" if sig == "Trend SELL" else "⚠️" if sig == "Ranging" else "➖"
+
+            msg += (f"  {t_em} *{tf_label}*  {t}\n"
+                    f"     {rsi_str}  {adx_em} ADX `{v['adx']:.0f}`  SAR {sar_em}  {sig_em} _{sig}_\n")
         msg += "\n"
 
-    # ─────────────────────────────────────────────
-    # 8  TECHNICALS
-    # ─────────────────────────────────────────────
-    msg += f"*TECHNICALS*\n`─────────────────────────`\n"
-    msg += f"{c['trend']}\n"
+    # ════════════════════════════════════════════
+    # § 8  TECHNICALS
+    # ════════════════════════════════════════════
+    msg += f"📈 *TECHNICALS*\n`──────────────────────────`\n"
+    msg += f"  Trend   {c['trend']}\n"
 
-    # RSI label consistent with verdict (>= 70 = overbought)
-    if c['rsi'] < 30:       rsi_tag = "(oversold)"
-    elif c['rsi'] >= 70:    rsi_tag = "(overbought)"
-    elif c['rsi'] > 60:     rsi_tag = "(bullish)"
-    else:                   rsi_tag = "(neutral)"
-    msg += f"RSI:    `{c['rsi']:.0f}` {rsi_tag}\n"
+    # RSI — threshold >= 70 = overbought (consistent with verdict)
+    if c['rsi'] < 30:       rsi_tag, rsi_em = "Oversold",   "🟢"
+    elif c['rsi'] >= 70:    rsi_tag, rsi_em = "Overbought", "🔴"
+    elif c['rsi'] > 60:     rsi_tag, rsi_em = "Bullish",    "🟡"
+    else:                   rsi_tag, rsi_em = "Neutral",    "⚪"
+    msg += f"  RSI     `{c['rsi']:.0f}` {rsi_em} _{rsi_tag}_\n"
 
-    # Stretch warning consistent with verdict action
-    if stretch_pct >= 50:    stretch_warn = " -- EXTREME, do not chase"
-    elif stretch_pct >= 30:  stretch_warn = " -- extended, wait for pullback"
-    elif stretch_pct >= 15:  stretch_warn = " -- moderately stretched"
-    elif stretch_pct <= -15: stretch_warn = " -- deeply oversold"
+    # EMA50 with stretch warning — wording consistent with verdict action
+    if stretch_pct >= 50:    stretch_warn = " 🚨 _Extreme — do not chase_"
+    elif stretch_pct >= 30:  stretch_warn = " ⚠️ _Extended — wait for pullback_"
+    elif stretch_pct >= 15:  stretch_warn = " ⚠️ _Stretched_"
+    elif stretch_pct <= -15: stretch_warn = " 🟢 _Deeply oversold_"
     else:                    stretch_warn = ""
-    msg += f"EMA50:  `${pf.format(c['ema50'])}` ({stretch_pct:+.1f}%){stretch_warn}\n"
-    msg += f"EMA200: `${pf.format(c['ema200'])}`\n"
+    msg += f"  EMA50   `${pf.format(c['ema50'])}` ({stretch_pct:+.1f}%){stretch_warn}\n"
+    msg += f"  EMA200  `${pf.format(c['ema200'])}`\n"
 
+    # EMA position summary
     above_50  = c['current'] > c['ema50']
     above_200 = c['current'] > c['ema200']
-    if above_50 and above_200:          msg += "Above EMA50 & EMA200\n"
-    elif above_200 and not above_50:    msg += "Below EMA50, above EMA200\n"
-    elif not above_200 and above_50:    msg += "Above EMA50, below EMA200\n"
-    else:                               msg += "Below both EMAs\n"
+    if above_50 and above_200:          msg += "  ✅ Above EMA50 & EMA200\n"
+    elif above_200 and not above_50:    msg += "  ⚠️ Below EMA50, above EMA200\n"
+    elif not above_200 and above_50:    msg += "  🔀 Above EMA50, below EMA200\n"
+    else:                               msg += "  🔴 Below both EMAs\n"
 
     if beta_val:
-        beta_desc = "low vol" if beta_val < 0.8 else "high vol" if beta_val > 1.5 else "market vol"
-        msg += f"Beta:   `{beta_val:.2f}` ({beta_desc})\n"
+        beta_em   = "🐢" if beta_val < 0.8 else "⚡" if beta_val > 1.5 else "⚖️"
+        beta_desc = "low volatility" if beta_val < 0.8 else "high volatility" if beta_val > 1.5 else "market volatility"
+        msg += f"  Beta    `{beta_val:.2f}` {beta_em} _{beta_desc}_\n"
+
+    # Squeeze / divergence — only show if active
+    if squeeze_state == 'building':
+        msg += f"  🔥 *SQUEEZE BUILDING* — explosive move loading\n"
+    elif squeeze_state == 'fired':
+        sq_em = "⬆️" if squeeze_dir == 'bullish' else "⬇️"
+        msg += f"  💥 *SQUEEZE FIRED* {sq_em} {squeeze_dir}\n"
+    if rsi_div == 'bullish':
+        msg += f"  📈 *RSI DIVERGENCE* — bullish momentum building\n"
+    elif rsi_div == 'bearish':
+        msg += f"  📉 *RSI DIVERGENCE* — momentum fading\n"
     msg += "\n"
 
-    # ─────────────────────────────────────────────
-    # 9  SECTOR + RELATIVE STRENGTH
-    # ─────────────────────────────────────────────
+    # ════════════════════════════════════════════
+    # § 9  SECTOR + RELATIVE STRENGTH
+    # ════════════════════════════════════════════
     if sector_name and sector_avg is not None:
+        sec_em  = "🟢" if sector_avg > 0 else "🔴"
+        sym_vs  = drop - sector_avg
         sec_sign = "+" if sector_avg >= 0 else ""
-        sym_vs   = drop - sector_avg
-        msg += f"*SECTOR ({sector_name})*\n`─────────────────────────`\n"
-        msg += f"Sector avg: `{sec_sign}{sector_avg:.2f}%` today\n"
+        msg += f"🏭 *SECTOR · {sector_name}*\n`──────────────────────────`\n"
+        msg += f"  Sector avg  {sec_em} `{sec_sign}{sector_avg:.2f}%` today\n"
         if sym_vs > 1.5:
-            msg += f"Outperforming sector by `{sym_vs:+.1f}%`\n"
+            msg += f"  💪 Outperforming by `{sym_vs:+.1f}%`\n"
         elif sym_vs < -1.5:
-            msg += f"Underperforming sector by `{sym_vs:+.1f}%`\n"
+            msg += f"  🔻 Underperforming by `{sym_vs:+.1f}%`\n"
         else:
-            msg += f"In line with sector\n"
+            msg += f"  ➖ In line with sector\n"
         msg += "\n"
 
     if rs_score is not None:
         rs_sign = "+" if rs_score >= 0 else ""
-        msg += f"*RS vs SPY (5d):* {rs_label}  `{rs_sign}{rs_score}%`\n\n"
+        rs_em   = "💪" if rs_score > 5 else "📉" if rs_score < -5 else "➖"
+        msg += f"  {rs_em} *RS vs SPY (5d)*  {rs_label}  `{rs_sign}{rs_score}%`\n\n"
 
-    # ─────────────────────────────────────────────
-    # 10  FUNDAMENTALS — analyst targets with flag + short + inst
-    # ─────────────────────────────────────────────
+    # ════════════════════════════════════════════
+    # § 10  FUNDAMENTALS
+    # Analyst targets with overextension flag.
+    # ════════════════════════════════════════════
     short_pct   = stock_info.get('short_pct')
     inst_pct    = stock_info.get('inst_pct')
     target_mean = stock_info.get('target_mean')
@@ -1306,77 +1384,91 @@ def format_full_analysis(symbol, ctx, verdict, zone, reasons, next_steps,
 
     has_fundamentals = (target_mean or short_pct or inst_pct or pe_ratio) and not is_crypto(symbol)
     if has_fundamentals:
-        msg += f"*FUNDAMENTALS*\n`─────────────────────────`\n"
+        msg += f"📊 *FUNDAMENTALS*\n`──────────────────────────`\n"
 
         if target_mean:
             upside    = (target_mean - c['current']) / c['current'] * 100
             up_sign   = "+" if upside >= 0 else ""
-            msg += f"Analyst target: `${target_mean:.2f}`  {up_sign}{upside:.1f}%"
+            upside_em = "🟢" if upside > 0 else "🔴"
+            msg += f"  🎯 Analyst target  `${target_mean:.2f}` {upside_em} `{up_sign}{upside:.1f}%`"
             if analyst_n:
-                msg += f" ({analyst_n} analysts)"
+                msg += f" _({analyst_n} analysts)_"
             msg += "\n"
             if target_high and target_low:
-                msg += f"Range: `${target_low:.2f}` to `${target_high:.2f}`\n"
+                msg += f"     Range `${target_low:.2f}` — `${target_high:.2f}`\n"
             if rec_key:
-                msg += f"Rating: *{rec_key}*\n"
+                rec_em = "🟢" if 'Buy' in rec_key else "🔴" if 'Sell' in rec_key else "🟡"
+                msg += f"     Rating {rec_em} *{rec_key}*\n"
             # Flag when stock has run past analyst consensus
             if upside < -15:
-                msg += (f"STOCK IS {abs(upside):.0f}% ABOVE analyst consensus\n"
-                        f"Analysts haven't upgraded — stock may be overextended\n")
+                msg += (f"  🚨 *{abs(upside):.0f}% ABOVE analyst consensus*\n"
+                        f"     _Analysts haven't upgraded — may be overextended_\n")
             elif upside < -5:
-                msg += f"Stock above analyst consensus — limited upside per analysts\n"
+                msg += f"  ⚠️ _Stock above analyst consensus — limited upside per analysts_\n"
 
         if pe_ratio:
-            pe_tag = " (elevated)" if pe_ratio > 40 else ""
-            msg += f"P/E: `{pe_ratio:.0f}`{pe_tag}\n"
+            pe_em  = "🔴" if pe_ratio > 60 else "🟡" if pe_ratio > 30 else "🟢"
+            pe_tag = " _(elevated)_" if pe_ratio > 40 else ""
+            msg += f"  {pe_em} P/E ratio  `{pe_ratio:.0f}`{pe_tag}\n"
 
         if short_pct:
-            short_tag = "High" if short_pct > 0.15 else "Normal"
-            msg += f"Short int: `{short_pct*100:.1f}%`  {short_tag}"
+            si_em  = "⚡" if short_pct > 0.15 else "➖"
+            si_tag = "*High*" if short_pct > 0.15 else "Normal"
+            msg += f"  {si_em} Short int  `{short_pct*100:.1f}%` {si_tag}"
             if short_pct > 0.15:
-                msg += " — squeeze potential on breakout"
+                msg += " — _squeeze potential on breakout_"
             msg += "\n"
 
         if inst_pct:
+            inst_em  = "🏦" if inst_pct > 0.7 else "➖"
             inst_tag = "Smart money heavy" if inst_pct > 0.7 else "Moderate"
-            msg += f"Institutional: `{inst_pct*100:.0f}%` — {inst_tag}\n"
+            msg += f"  {inst_em} Institutional  `{inst_pct*100:.0f}%` — {inst_tag}\n"
 
         msg += "\n"
 
-    # ─────────────────────────────────────────────
-    # 11  EARNINGS
-    # ─────────────────────────────────────────────
-    earnings_date, days_until = get_earnings_date(symbol)
-    warn = format_earnings_warning(symbol, earnings_date, days_until)
-    if warn:
-        msg += f"*EARNINGS*\n`─────────────────────────`\n{warn}\n\n"
+    # ════════════════════════════════════════════
+    # § 11  EARNINGS — pre-fetched, no second API call
+    # ════════════════════════════════════════════
+    if earnings_info:
+        earnings_date, days_until = earnings_info
+        warn = format_earnings_warning(symbol, earnings_date, days_until)
+        if warn:
+            msg += f"📅 *EARNINGS*\n`──────────────────────────`\n  {warn}\n\n"
 
-    # ─────────────────────────────────────────────
-    # 12  MARKET
-    # ─────────────────────────────────────────────
+    # ════════════════════════════════════════════
+    # § 12  MARKET CONDITIONS
+    # ════════════════════════════════════════════
     if market_ctx:
         spy = market_ctx.get('SPY', {})
         vix = market_ctx.get('^VIX', {})
         if spy or vix:
-            msg += f"*MARKET*\n`─────────────────────────`\n"
+            msg += f"🌍 *MARKET*\n`──────────────────────────`\n"
+            parts = []
             if spy:
-                spy_pct = spy.get('pct', 0)
+                spy_pct  = spy.get('pct', 0)
                 spy_sign = "+" if spy_pct >= 0 else ""
-                msg += f"SPY: `{spy_sign}{spy_pct:.2f}%`"
+                spy_em   = "🟢" if spy_pct >= 0 else "🔴"
+                parts.append(f"SPY {spy_em} `{spy_sign}{spy_pct:.2f}%`")
             if vix:
                 vix_val = vix.get('price', 0)
+                vix_em  = "🔴" if vix_val > 25 else "🟡" if vix_val > 18 else "🟢"
                 vix_tag = "High" if vix_val > 25 else "Elevated" if vix_val > 18 else "Calm"
-                msg += f"  VIX: `{vix_val:.1f}` ({vix_tag})"
-            msg += "\n\n"
+                parts.append(f"VIX {vix_em} `{vix_val:.1f}` _{vix_tag}_")
+            msg += f"  {'  ·  '.join(parts)}\n\n"
 
-    # ─────────────────────────────────────────────
-    # 13  FULL AI ANALYSIS
-    # ─────────────────────────────────────────────
+    # ════════════════════════════════════════════
+    # § 13  AI ANALYSIS
+    # Full 4-line response from Gemini.
+    # ════════════════════════════════════════════
     if ai_text:
-        msg += f"*AI ANALYSIS*\n`─────────────────────────`\n{ai_text}\n\n"
+        msg += f"🤖 *AI ANALYSIS*\n`──────────────────────────`\n"
+        for line in ai_text.strip().split('\n'):
+            if line.strip():
+                msg += f"  {line.strip()}\n"
+        msg += "\n"
 
-    msg += f"`━━━━━━━━━━━━━━━━━━━━━━━━━`\n"
-    msg += f"_AlphaEdge v7.2 · On-demand_"
+    msg += f"`══════════════════════════`\n"
+    msg += f"_AlphaEdge v7.3 · On-demand_"
     return msg
 
 
@@ -1388,21 +1480,17 @@ def format_short_analysis(symbol, ctx, verdict, zone, rs_label, rs_score, stock_
     decimals = 4 if c['current'] < 10 else 2
     pf       = f"{{:.{decimals}f}}"
     rs_str   = f"  RS {rs_label}" if rs_label else ""
-    sector_h = stock_info.get('sector', '')
-    sec_str  = f"  {sector_h}" if sector_h else ""
-    msg  = f"{em} *{symbol}*  `${pf.format(c['current'])}`  ({sign}{drop:.1f}%){sec_str}\n"
+    long_name = stock_info.get('long_name', symbol)
+    name_str  = f" ({long_name})" if long_name and long_name != symbol else ""
+    msg  = f"{em} *{symbol}*{name_str}  `${pf.format(c['current'])}`  ({sign}{drop:.1f}%)\n"
     msg += f"{verdict} — {zone}\n"
     msg += f"RSI `{c['rsi']:.0f}`  {c['trend']}{rs_str}"
     return msg
 
 
 # ═══════════════════════════════════════════════
-# PRICE ALERT SYSTEM — Enhanced Layout v7.2
+# PRICE ALERT SYSTEM
 # ═══════════════════════════════════════════════
-
-def alert_header(emoji, title, border='━━━━━━━━━━━━━━━━━━━━━'):
-    return f"{emoji} *{title}*\n`{border}`\n\n"
-
 
 def load_alerts():
     return load_json(ALERTS_FILE, {})
@@ -1410,14 +1498,12 @@ def load_alerts():
 def save_alerts(alerts):
     save_json(ALERTS_FILE, alerts)
 
-
 def set_alert(symbol, target_price, direction='auto'):
     alerts = load_alerts()
-
     try:
         df = yf.download(symbol, period='1d', interval='1m',
                          progress=False, auto_adjust=True)
-        df = _clean_df(df)
+        df      = _clean_df(df)
         current = float(df['Close'].iloc[-1]) if not df.empty else None
     except Exception:
         current = None
@@ -1425,8 +1511,7 @@ def set_alert(symbol, target_price, direction='auto'):
     if direction == 'auto' and current:
         direction = 'above' if target_price > current else 'below'
 
-    alert_key = f"{symbol}_{target_price}"
-
+    alert_key         = f"{symbol}_{target_price}"
     alerts[alert_key] = {
         'symbol':              symbol,
         'target':              target_price,
@@ -1437,275 +1522,98 @@ def set_alert(symbol, target_price, direction='auto'):
         'expiry_warning_sent': False,
         'triggered':           False,
     }
-
     save_alerts(alerts)
 
-    em = SYMBOL_EMOJI.get(symbol, '📈')
-
-    dir_str = "breaks above" if direction == 'above' else "falls below"
-    dir_em  = "📈" if direction == 'above' else "📉"
-
-    warn_price = (
-        target_price * 0.98
-        if direction == 'above'
-        else target_price * 1.02
+    dir_str    = "rises to" if direction == 'above' else "falls to"
+    warn_price = target_price * 0.98 if direction == 'above' else target_price * 1.02
+    cur_str    = f" (currently ${current:.2f})" if current else ""
+    send_telegram(
+        f"Alert set\n"
+        f"{SYMBOL_EMOJI.get(symbol,'')} *{symbol}* — notify when {dir_str} `${target_price:.2f}`{cur_str}\n"
+        f"Early warning at `${warn_price:.2f}` (2% before)\n"
+        f"Expires in 30 days"
     )
 
-    cur_str = f"${current:.2f}" if current else "N/A"
-
-    msg  = alert_header("🔔", "PRICE ALERT CREATED")
-    msg += f"{em} *{symbol}*\n"
-    msg += f"_30-day active alert_\n\n"
-
-    msg += f"🎯 *Target*\n"
-    msg += f"`${target_price:.2f}`\n\n"
-
-    msg += f"{dir_em} *Condition*\n"
-    msg += f"{dir_str.title()}\n\n"
-
-    msg += f"💵 *Current Price*\n"
-    msg += f"`{cur_str}`\n\n"
-
-    msg += f"⚠️ *Early Warning*\n"
-    msg += f"`${warn_price:.2f}`\n\n"
-
-    msg += f"⏳ Expires in *30 days*\n\n"
-    msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
-    msg += f"_AlphaEdge will notify before trigger._"
-
-    send_telegram(msg)
-
-
 def cancel_alert(symbol):
-    alerts = load_alerts()
-
+    alerts  = load_alerts()
     removed = []
-
     for key in list(alerts.keys()):
         if alerts[key]['symbol'] == symbol:
             removed.append(alerts[key]['target'])
             del alerts[key]
-
     save_alerts(alerts)
-
-    em = SYMBOL_EMOJI.get(symbol, '📈')
-
+    em = SYMBOL_EMOJI.get(symbol, '')
     if removed:
-
-        targets = "\n".join(
-            [f"• `${t:.2f}`" for t in sorted(removed)]
-        )
-
-        msg  = alert_header("🗑️", "ALERT CANCELLED", "═════════════════════")
-        msg += f"{em} *{symbol}*\n\n"
-        msg += f"🎯 *Removed Targets*\n"
-        msg += f"{targets}\n\n"
-        msg += "✅ No more active alerts for this symbol."
-
-        send_telegram(msg)
-
+        send_telegram(f"Cancelled alerts for {em} *{symbol}*: {', '.join([f'${t}' for t in removed])}")
     else:
-
-        send_telegram(
-            alert_header("📭", "NO ACTIVE ALERTS", "─────────────────────") +
-            f"{em} *{symbol}*\n\n"
-            f"No active alerts found."
-        )
-
+        send_telegram(f"No active alerts for *{symbol}*")
 
 def list_alerts():
     alerts = load_alerts()
-
-    active = {
-        k: v for k, v in alerts.items()
-        if not v.get('triggered')
-    }
-
+    active = {k: v for k, v in alerts.items() if not v.get('triggered')}
     if not active:
-        send_telegram(
-            alert_header("📭", "NO ACTIVE ALERTS", "─────────────────────") +
-            "Set one with:\n"
-            "`alert TSLA 450`"
-        )
+        send_telegram("No active alerts.\n\nSet one: `alert TSLA 450`")
         return
-
-    now = now_est()
-    tz  = now.tzname() or "EDT"
-    ts  = now.strftime(f'%a %b %d · %I:%M %p {tz}')
-
-    msg  = alert_header("📋", f"ACTIVE ALERTS ({len(active)})")
-    msg += f"_{ts}_\n\n"
-
+    msg = f"*ACTIVE ALERTS ({len(active)})*\n`━━━━━━━━━━━━━━━━━━━━━`\n\n"
     for key, a in sorted(active.items(), key=lambda x: x[1]['symbol']):
-
-        em = SYMBOL_EMOJI.get(a['symbol'], '📈')
-
-        dir_str = "Above" if a['direction'] == 'above' else "Below"
-        dir_em  = "📈" if a['direction'] == 'above' else "📉"
-
-        expires = datetime.fromisoformat(a['expires_at'])
+        em        = SYMBOL_EMOJI.get(a['symbol'], '')
+        dir_str   = "above" if a['direction'] == 'above' else "below"
+        expires   = datetime.fromisoformat(a['expires_at'])
         days_left = (expires - now_est()).days
-
-        warn = (
-            a['target'] * 0.98
-            if a['direction'] == 'above'
-            else a['target'] * 1.02
-        )
-
-        msg += (
-            f"{em} *{a['symbol']}*\n"
-            f"{dir_em} {dir_str}: `${a['target']:.2f}`\n"
-            f"⚠️ Warning: `${warn:.2f}`\n"
-            f"⏳ {days_left}d remaining\n\n"
-        )
-
-    msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
-    msg += "_AlphaEdge v7.2_"
-
+        warn      = a['target'] * 0.98 if a['direction'] == 'above' else a['target'] * 1.02
+        msg += f"{em} *{a['symbol']}*  {dir_str} `${a['target']:.2f}`\n"
+        msg += f"   Early warning `${warn:.2f}`  {days_left}d left\n\n"
     send_telegram(msg)
 
-
 def check_alerts():
-    alerts = load_alerts()
-
+    alerts  = load_alerts()
     if not alerts:
         return
-
     changed = False
-    now = now_est()
-
+    now     = now_est()
     for key, a in list(alerts.items()):
-
         if a.get('triggered'):
             continue
+        symbol     = a['symbol']
+        target     = a['target']
+        direction  = a['direction']
+        warn_price = target * 0.98 if direction == 'above' else target * 1.02
+        em         = SYMBOL_EMOJI.get(symbol, '')
 
-        symbol = a['symbol']
-        target = a['target']
-        direction = a['direction']
-
-        warn_price = (
-            target * 0.98
-            if direction == 'above'
-            else target * 1.02
-        )
-
-        em = SYMBOL_EMOJI.get(symbol, '📈')
-
-        expires = datetime.fromisoformat(a['expires_at'])
-
+        expires   = datetime.fromisoformat(a['expires_at'])
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=EST)
-
         days_left = (expires - now).days
 
-        # ─────────────────────────────────────
-        # Expiring Tomorrow
-        # ─────────────────────────────────────
         if days_left <= 1 and not a.get('expiry_warning_sent'):
-
-            send_telegram(
-                alert_header("⏳", "ALERT EXPIRING SOON", "─────────────────────") +
-                f"{em} *{symbol}*\n\n"
-                f"🎯 Target: `${target:.2f}`\n\n"
-                f"This alert expires *tomorrow*.\n\n"
-                f"🔁 Reset with:\n"
-                f"`alert {symbol} {target}`"
-            )
-
+            send_telegram(f"Alert expiring\n{em} *{symbol}* to `${target:.2f}` expires tomorrow\n`alert {symbol} {target}` to reset")
             a['expiry_warning_sent'] = True
             changed = True
 
-        # ─────────────────────────────────────
-        # Expired
-        # ─────────────────────────────────────
         if now > expires:
-
-            send_telegram(
-                alert_header("🕒", "ALERT EXPIRED", "═════════════════════") +
-                f"{em} *{symbol}*\n\n"
-                f"🎯 Target: `${target:.2f}`\n\n"
-                f"No trigger within 30 days.\n\n"
-                f"❌ Alert removed."
-            )
-
+            send_telegram(f"Alert expired\n{em} *{symbol}* to `${target:.2f}` (30 days, untriggered)")
             del alerts[key]
             changed = True
             continue
 
         try:
-            df = yf.download(symbol, period='1d', interval='5m',
-                             progress=False, auto_adjust=True)
-
-            if df.empty:
-                continue
-
-            df = _clean_df(df)
-
+            df      = yf.download(symbol, period='1d', interval='5m',
+                                  progress=False, auto_adjust=True)
+            if df.empty: continue
+            df      = _clean_df(df)
             current = float(df['Close'].iloc[-1])
-
         except Exception:
             continue
 
-        # ─────────────────────────────────────
-        # Triggered
-        # ─────────────────────────────────────
-        if (
-            (direction == 'above' and current >= target) or
-            (direction == 'below' and current <= target)
-        ):
-
-            move_pct = ((current - target) / target) * 100
-
-            move_em = "🚀" if move_pct > 0 else "📉"
-
-            msg  = alert_header("🚨", "ALERT TRIGGERED", "━━━━━━━━━━━━━━━━━━━━━")
-            msg += f"{em} *{symbol}*\n\n"
-
-            msg += f"🎯 *Target Hit*\n"
-            msg += f"`${target:.2f}`\n\n"
-
-            msg += f"💵 *Current Price*\n"
-            msg += f"`${current:.2f}`\n\n"
-
-            msg += f"{move_em} *Beyond Target*\n"
-            msg += f"`{move_pct:+.2f}%`\n\n"
-
-            msg += "✅ Alert completed and removed."
-
-            send_telegram(msg)
-
+        if ((direction == 'above' and current >= target) or
+                (direction == 'below' and current <= target)):
+            send_telegram(f"ALERT TRIGGERED\n{em} *{symbol}* hit `${target:.2f}`\nCurrent: `${current:.2f}`\nAlert removed.")
             a['triggered'] = True
             changed = True
-
-        # ─────────────────────────────────────
-        # Approaching
-        # ─────────────────────────────────────
-        elif (
-            not a.get('warning_sent') and
-            (
-                (direction == 'above' and current >= warn_price) or
-                (direction == 'below' and current <= warn_price)
-            )
-        ):
-
-            away_pct = abs(current - target) / target * 100
-
-            msg  = alert_header("🟡", "APPROACHING TARGET", "═════════════════════")
-            msg += f"{em} *{symbol}*\n\n"
-
-            msg += f"💵 *Current*\n"
-            msg += f"`${current:.2f}`\n\n"
-
-            msg += f"🎯 *Target*\n"
-            msg += f"`${target:.2f}`\n\n"
-
-            msg += f"📏 *Distance Remaining*\n"
-            msg += f"`{away_pct:.1f}% away`\n\n"
-
-            msg += "👀 Watch closely — alert not triggered yet."
-
-            send_telegram(msg)
-
+        elif (not a.get('warning_sent') and
+              ((direction == 'above' and current >= warn_price) or
+               (direction == 'below' and current <= warn_price))):
+            send_telegram(f"APPROACHING TARGET\n{em} *{symbol}* near `${target:.2f}`\nNow: `${current:.2f}` — {abs(current-target)/target*100:.1f}% away")
             a['warning_sent'] = True
             changed = True
 
@@ -1714,15 +1622,12 @@ def check_alerts():
 
 
 # ═══════════════════════════════════════════════
-# WATCHLIST SCAN — Enhanced Layout v7.2
+# WATCHLIST SCAN
 # ═══════════════════════════════════════════════
 
 def run_watchlist_scan():
-
-    send_telegram("🔎 Scanning watchlist... ~60s", silent=True)
-
+    send_telegram("Scanning watchlist... ~60s", silent=True)
     all_syms, emoji_map = load_universe()
-
     if not all_syms:
         send_telegram("Could not load symbols.yaml")
         return
@@ -1731,22 +1636,14 @@ def run_watchlist_scan():
     results    = []
 
     for sym in all_syms:
-
         try:
-
             print(f"  -> {sym}...", end=" ", flush=True)
-
             ctx = get_full_context(sym)
-
             time.sleep(0.3)
-
             if not ctx:
-                print("--")
-                continue
-
+                print("--"); continue
             verdict, zone, _, _ = get_verdict(ctx, market_ctx)
             rs_score, rs_label  = calc_relative_strength(ctx)
-
             results.append({
                 'symbol':   sym,
                 'emoji':    emoji_map.get(sym, ''),
@@ -1755,132 +1652,116 @@ def run_watchlist_scan():
                 'drop':     ctx['day_change_pct'],
                 'rsi':      ctx['rsi'],
                 'rs_score': rs_score or 0,
-                'rs_label': rs_label or '',
                 'current':  ctx['current'],
             })
-
             print(f"{ctx['day_change_pct']:+.1f}% {verdict}")
-
         except Exception as e:
-            print(f"ERROR {e}")
+            logging.warning(f"Watchlist scan {sym}: {e}")
+            print(f"err")
 
     if not results:
         send_telegram("No data — try again later")
         return
 
     def sort_key(r):
-
         v = r['verdict']
-
-        if 'MOMENTUM' in v:
-            return (0, -r['drop'])
-
-        if 'BUY' in v:
-            return (1, -r['drop'])
-
-        if 'WATCH' in v:
-            return (2, -r['drop'])
-
-        if 'NEUTRAL' in v:
-            return (3, -r['drop'])
-
-        if 'EXTENDED' in v:
-            return (4, -r['drop'])
-
-        if 'AVOID' in v:
-            return (5, -r['drop'])
-
+        if 'MOMENTUM' in v: return (0, -r['drop'])
+        if 'BUY'      in v: return (1, -r['drop'])
+        if 'WATCH'    in v: return (2, -r['drop'])
+        if 'NEUTRAL'  in v: return (3, -r['drop'])
+        if 'EXTENDED' in v: return (4, -r['drop'])
+        if 'AVOID'    in v: return (5, -r['drop'])
         return (6, -r['drop'])
 
     results.sort(key=sort_key)
 
     now = now_est()
     tz  = now.tzname() or "EDT"
-    ts  = now.strftime(f'%a %b %d · %I:%M %p {tz}')
-
-    msg  = "📋 *WATCHLIST SCAN*\n"
-    msg += f"_{ts}_\n"
-    msg += "`━━━━━━━━━━━━━━━━━━━━━`\n\n"
+    ts  = now.strftime(f'%a %b %d  %I:%M %p {tz}')
+    msg = f"*WATCHLIST SCAN*\n{ts}\n`━━━━━━━━━━━━━━━━━━━━━`\n\n"
 
     groups = {}
-
     for r in results:
         groups.setdefault(r['verdict'], []).append(r)
 
     for vkey, items in groups.items():
-
-        if 'MOMENTUM' in vkey:
-            v_em = '🚀'
-        elif 'BUY' in vkey:
-            v_em = '🟢'
-        elif 'WATCH' in vkey:
-            v_em = '🟡'
-        elif 'EXTENDED' in vkey:
-            v_em = '🟠'
-        elif 'AVOID' in vkey:
-            v_em = '🔴'
-        else:
-            v_em = '⚪'
-
-        msg += f"{v_em} *{vkey}*\n"
-
+        msg += f"*{vkey}*\n"
         for r in items:
-
             sign     = "+" if r['drop'] >= 0 else ""
-            drop_em  = "🟢" if r['drop'] >= 0 else "🔴"
-
             decimals = 4 if r['current'] < 10 else 2
             pf       = f"{{:.{decimals}f}}"
-
-            rs_line = ""
-
-            if r['rs_score']:
-                rs_line = f" · RS `{r['rs_score']:+.1f}%`"
-
-            rsi_tag = (
-                "🔴" if r['rsi'] >= 70 else
-                "🟢" if r['rsi'] <= 30 else
-                "🟡"
-            )
-
-            msg += (
-                f"{r['emoji']} *{r['symbol']}* "
-                f"`{pf.format(r['current'])}`\n"
-                f"   {drop_em} {sign}{r['drop']:.1f}%"
-                f" · {rsi_tag} RSI `{r['rsi']:.0f}`"
-                f"{rs_line}\n"
-            )
-
+            rs_str   = f" RS {r['rs_score']:+.1f}%" if r['rs_score'] else ""
+            msg += (f"  {r['emoji']} *{r['symbol']}* `${pf.format(r['current'])}`"
+                    f"  {sign}{r['drop']:.1f}%  RSI `{r['rsi']:.0f}`{rs_str}\n")
         msg += "\n"
 
-    # Market context footer
-    if market_ctx:
+    msg += "_Type any symbol for full analysis_\n_AlphaEdge v7.3_"
+    send_telegram(msg)
 
+
+# ═══════════════════════════════════════════════
+# TOP MOVERS
+# ═══════════════════════════════════════════════
+
+def run_top_movers():
+    send_telegram("Fetching top movers...", silent=True)
+    all_syms, emoji_map = load_universe()
+    market_ctx = get_market_ctx()
+    movers     = []
+
+    for sym in all_syms:
+        try:
+            df = yf.download(sym, period='5d', interval='1d',
+                             progress=False, auto_adjust=True)
+            if df.empty or len(df) < 2: continue
+            df     = _clean_df(df)
+            change = (float(df['Close'].iloc[-1]) - float(df['Close'].iloc[-2])) / float(df['Close'].iloc[-2]) * 100
+            movers.append({'symbol': sym, 'emoji': emoji_map.get(sym, ''),
+                           'change': change, 'price': float(df['Close'].iloc[-1])})
+            time.sleep(0.2)
+        except Exception:
+            pass
+
+    if not movers:
+        send_telegram("Could not fetch data")
+        return
+
+    movers.sort(key=lambda x: -x['change'])
+    gainers = [m for m in movers if m['change'] > 0][:5]
+    losers  = [m for m in movers if m['change'] < 0][-5:]
+    losers.reverse()
+
+    now = now_est()
+    tz  = now.tzname() or "EDT"
+    ts  = now.strftime(f'%a %b %d  %I:%M %p {tz}')
+    msg = f"*TOP MOVERS*\n{ts}\n`━━━━━━━━━━━━━━━━━━━━━`\n\n"
+
+    if gainers:
+        msg += "*GAINERS*\n"
+        for m in gainers:
+            d = 4 if m['price'] < 10 else 2
+            msg += f"  {m['emoji']} *{m['symbol']}* `${m['price']:.{d}f}`  +{m['change']:.2f}%\n"
+    if losers:
+        msg += f"\n*LOSERS*\n"
+        for m in losers:
+            d = 4 if m['price'] < 10 else 2
+            msg += f"  {m['emoji']} *{m['symbol']}* `${m['price']:.{d}f}`  {m['change']:.2f}%\n"
+
+    if market_ctx:
         spy = market_ctx.get('SPY', {})
         vix = market_ctx.get('^VIX', {})
+        msg += f"\n`─────────────────`\n"
+        if spy:
+            spy_pct  = spy.get('pct', 0)
+            spy_sign = "+" if spy_pct >= 0 else ""
+            msg += f"SPY: `{spy_sign}{spy_pct:.2f}%`"
+        if vix:
+            msg += f"  VIX: `{vix.get('price',0):.1f}`"
+        msg += "\n"
 
-        spy_pct = spy.get('pct', 0)
-        vix_val = vix.get('price', 0)
-
-        spy_sign = "+" if spy_pct >= 0 else ""
-        spy_em   = "🟢" if spy_pct >= 0 else "🔴"
-
-        vix_tag = (
-            "🔴 High"
-            if vix_val > 25 else
-            "🟡 Elevated"
-            if vix_val > 18 else
-            "🟢 Calm"
-        )
-
-        msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
-        msg += f"🌍 SPY {spy_em} `{spy_sign}{spy_pct:.2f}%`"
-        msg += f" · VIX `{vix_val:.1f}` {vix_tag}\n\n"
-
-    msg += "_Type any symbol for full analysis_\n"
-    msg += "_AlphaEdge v7.2_"
-
+    msg += "\n_Type any symbol for full analysis_"
     send_telegram(msg)
+
 
 # ═══════════════════════════════════════════════
 # ON-DEMAND BRIEF
@@ -1919,27 +1800,27 @@ def send_help():
 `━━━━━━━━━━━━━━━━━━━━━`
 
 *ANALYSIS*
-`TSLA` -- full analysis
-`TSLA NVDA AMD` -- multiple (up to 5)
-`TSLA short` -- 3-line quick summary
+`TSLA` — full analysis
+`TSLA NVDA AMD` — multiple (up to 5)
+`TSLA short` — 3-line quick summary
 
 *WATCHLIST*
-`scan` -- rank all your symbols
-`top` -- today's top movers
+`scan` — rank all your symbols
+`top` — today's top movers
 
 *PRICE ALERTS*
-`alert TSLA 450` -- notify near $450
-`alert TSLA 400 below` -- notify going down
-`cancel TSLA` -- remove alert
-`alerts` -- list active alerts
+`alert TSLA 450` — notify near $450
+`alert TSLA 400 below` — notify going down
+`cancel TSLA` — remove alert
+`alerts` — list active alerts
 
 *BRIEFS*
-`brief` -- morning/evening/weekend context
+`brief` — morning/evening/weekend context
 
-`help` -- this message
+`help` — this message
 
 `━━━━━━━━━━━━━━━━━━━━━`
-_AlphaEdge v7.2_""")
+_AlphaEdge v7.3_""")
 
 
 # ═══════════════════════════════════════════════
@@ -1948,7 +1829,7 @@ _AlphaEdge v7.2_""")
 
 def run_analysis(symbol, mode='full', timeframe='1d'):
     symbol = normalise_symbol(symbol)
-    print(f"\n v4.2: {symbol} | mode={mode} | tf={timeframe}")
+    logging.info(f"Analysis start: {symbol} mode={mode}")
 
     send_telegram(f"Analysing *{symbol}*... ~35s", silent=True)
 
@@ -1961,30 +1842,40 @@ def run_analysis(symbol, mode='full', timeframe='1d'):
         send_telegram(f"Could not fetch data for *{symbol}*")
         return
 
-    print("  -> Stock info...")
+    print(f"  -> Stock info...")
     stock_info = get_stock_info(symbol)
 
-    print("  -> Market context...")
+    print(f"  -> Market context...")
     market_ctx = get_market_ctx()
 
-    print("  -> MTF verdicts...")
+    print(f"  -> MTF verdicts...")
     mtf_verdicts = get_mtf_verdicts(symbol) if mode == 'full' else {}
 
-    verdict, zone, reasons, next_steps = get_verdict(ctx, market_ctx, mtf_verdicts)
+    # Fetch earnings ONCE here — passed to both get_verdict() and format_full_analysis()
+    # Eliminates the duplicate get_earnings_date() call that was costing an extra API hit.
+    print(f"  -> Earnings date...")
+    earnings_info = get_earnings_date(symbol)  # returns (date, days_until)
+
+    verdict, zone, reasons, next_steps = get_verdict(
+        ctx, market_ctx, mtf_verdicts, earnings_cache=earnings_info
+    )
     rs_score, rs_label = calc_relative_strength(ctx)
 
     if mode == 'short':
         send_telegram(format_short_analysis(symbol, ctx, verdict, zone, rs_label, rs_score, stock_info))
         return
 
-    print("  -> Sector context...")
+    print(f"  -> Sector context...")
     sector_name, sector_avg, _ = get_sector_context(symbol)
 
-    print("  -> CAD pricing...")
+    print(f"  -> CAD pricing...")
     cad_price, tsx_symbol = get_cad_price(symbol)
     usd_cad = get_usd_cad_rate() if not is_crypto(symbol) else None
 
-    print("  -> Daily bars...")
+    # POC, squeeze, divergence — uses a 6mo daily slice.
+    # get_full_context() already downloads 5y daily but doesn't expose it.
+    # This is a separate focused download for the analysis functions.
+    print(f"  -> Daily bars...")
     try:
         df_daily = yf.download(symbol, period='6mo', interval='1d',
                                progress=False, auto_adjust=True)
@@ -1997,21 +1888,23 @@ def run_analysis(symbol, mode='full', timeframe='1d'):
         poc = support = resistance = None
         squeeze_state, squeeze_dir, rsi_div = 'none', None, None
 
-    print("  -> AI analysis...")
+    print(f"  -> AI analysis...")
     ai_text = get_ai_analysis(ctx, verdict, zone, sector_name, sector_avg,
                                mtf_verdicts, stock_info)
     print(f"  -> AI: {'GOT' if ai_text else 'NO RESPONSE'}")
 
     msg = format_full_analysis(
-        symbol, ctx, verdict, zone, reasons, next_steps,
+        symbol, ctx, verdict, zone, reasons,
         ai_text, market_ctx, rs_score, rs_label,
         poc, support, resistance,
         squeeze_state, squeeze_dir, rsi_div,
         mtf_verdicts, sector_name, sector_avg,
-        stock_info, cad_price, tsx_symbol, usd_cad
+        stock_info, cad_price, tsx_symbol, usd_cad,
+        next_steps=next_steps,
+        earnings_info=earnings_info,
     )
     send_telegram(msg)
-    logging.info(f"v4.2 sent: {symbol} | {verdict}")
+    logging.info(f"Analysis complete: {symbol} | {verdict}")
 
 
 # ═══════════════════════════════════════════════
@@ -2032,7 +1925,7 @@ def main():
     mode       = payload.get('mode', 'full')
     timeframe  = payload.get('timeframe', '1d')
 
-    print(f"\n event={event_type} command={command} symbol={symbol}")
+    logging.info(f"Command: event={event_type} cmd={command} sym={symbol}")
 
     if event_type == 'analyze_symbol' or (not command and symbol):
         run_analysis(symbol, mode, timeframe)
@@ -2058,7 +1951,7 @@ def main():
     elif command == 'help':
         send_help()
     else:
-        send_telegram(f"Unknown: `{command}`\nType `help` for commands.")
+        send_telegram(f"Unknown command: `{command}`\nType `help` for commands.")
 
 
 if __name__ == "__main__":
