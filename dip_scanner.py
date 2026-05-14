@@ -340,31 +340,64 @@ def qualify_dip(ctx: dict, stats: PriceStats) -> QualifyResult:
 
 
 # ════════════════════════════════════════════════════════════
-# ALERT FORMATTING — uses SYMBOL_META for company name + exchange
+# ALERT FORMATTING — VISUAL TELEGRAM ALERTS ONLY
 # ════════════════════════════════════════════════════════════
 
+def dip_header(emoji: str, title: str, subtitle: str | None = None,
+               border: str = "━━━━━━━━━━━━━━━━━━━━━") -> str:
+    msg = f"{emoji} *{title}*\n`{border}`\n"
+    if subtitle:
+        msg += f"_{md(subtitle)}_\n"
+    msg += "\n"
+    return msg
+
+
 def _tier(score: int) -> tuple[str, str]:
-    if score >= 13: return ("🏆", "ELITE")
-    if score >= 9:  return ("⭐", "STRONG")
+    if score >= 13:
+        return ("🏆", "ELITE")
+    if score >= 9:
+        return ("⭐", "STRONG")
     return ("✅", "WATCHLIST")
+
 
 def _name_label(sym: str) -> str:
     """e.g. 'NVDA — NVIDIA Corp. (NASDAQ)' if metadata available."""
     meta = SYMBOL_META.get(sym, {})
     name = meta.get("name", "")
     exch = meta.get("exchange", "")
+
     if name and exch:
         return f"{md(sym)} — {md(name)} ({md(exch)})"
     if name:
         return f"{md(sym)} — {md(name)}"
     return md(sym)
 
+
+def _rsi_mood(rsi: float) -> str:
+    if rsi <= 30:
+        return "🔥 Deep oversold"
+    if rsi <= 35:
+        return "🟢 Oversold"
+    if rsi <= 42:
+        return "🟡 Cooling"
+    return "⚪ Mild dip"
+
+
+def _risk_label(stop_pct: float) -> str:
+    if stop_pct >= -3:
+        return "Low risk"
+    if stop_pct >= -6:
+        return "Medium risk"
+    return "Higher risk"
+
+
 def format_candidate(c: dict, rank: int) -> str:
     ctx, q = c["ctx"], c["q"]
-    sym    = ctx["symbol"]
-    em     = SYMBOL_EMOJI.get(sym, "📊")
+
+    sym = ctx["symbol"]
+    em = SYMBOL_EMOJI.get(sym, "📊")
     sector = SYMBOL_SECTOR.get(sym, "Other")
-    badge, _ = _tier(q.score)
+    badge, tier_name = _tier(q.score)
 
     rs_part = ""
     if q.rs_score is not None:
@@ -372,79 +405,166 @@ def format_candidate(c: dict, rank: int) -> str:
         rs_part = f" • RS {rs_icon} `{q.rs_score:+.1f}%`"
 
     stop_pct = (q.stop / ctx["current"] - 1) * 100 if q.stop else 0
+    risk = _risk_label(stop_pct)
 
-    block  = f"\n{badge} *#{rank}* {em} {_name_label(sym)}\n"
-    block += f"   `${ctx['current']:.2f}` • Score *{q.score}/16* • {md(sector)}\n"
-    block += f"   1D `{ctx['day_change_pct']:+.2f}%` • 5D `{q.drop_5d:+.2f}%` • RSI `{ctx['rsi']:.0f}`\n"
-    block += f"   ATH `{ctx['ath_pct']:+.1f}%` • Vol `{ctx['vol_ratio']:.1f}×`{rs_part}\n"
-    for r in q.reasons[:2]:
-        block += f"   • {md(r)}\n"
-    block += f"   🟢 Buy `${q.buy_low:.2f}` → `${q.buy_high:.2f}`\n"
-    block += f"   🛡️ Stop `${q.stop:.2f}` (`{stop_pct:+.1f}%`)\n"
+    block = ""
+    block += f"\n{badge} *#{rank} — {tier_name} SETUP*\n"
+    block += f"`─────────────────`\n"
+    block += f"{em} *{_name_label(sym)}*\n"
+    block += f"Sector: _{md(sector)}_\n\n"
+
+    block += f"*PRICE SNAPSHOT*\n"
+    block += f"💵 Current: `${ctx['current']:.2f}`\n"
+    block += f"📉 1D: `{ctx['day_change_pct']:+.2f}%` • 5D: `{q.drop_5d:+.2f}%`\n"
+    block += f"📊 RSI: `{ctx['rsi']:.0f}` — {_rsi_mood(ctx['rsi'])}\n"
+    block += f"🏔️ From ATH: `{ctx['ath_pct']:+.1f}%`\n"
+    block += f"🔊 Volume: `{ctx['vol_ratio']:.1f}×`{rs_part}\n\n"
+
+    block += f"*WHY IT QUALIFIED*\n"
+    for r in q.reasons[:3]:
+        block += f"• {md(r)}\n"
+
+    block += f"\n*TRADE PLAN*\n"
+    block += f"🟢 Buy zone: `${q.buy_low:.2f}` → `${q.buy_high:.2f}`\n"
+    block += f"🛡️ Stop: `${q.stop:.2f}` (`{stop_pct:+.1f}%`) — {risk}\n"
+    block += f"🎯 Setup score: *{q.score}/16*\n"
+
     return block
 
 
 def format_alert(candidates: list[dict], market_ctx: dict, stats: dict) -> str:
     ts = display_now().strftime("%a %b %d • %I:%M %p ET")
 
-    msg  = f"🎯 *DIP SCANNER*\n"
-    msg += f"🕒 {ts}\n"
-    msg += f"`{H_RULE}`\n"
-    msg += f"📊 Scanned `{stats['scanned']}` • Qualified `{len(candidates)}`"
-    if stats["failed"]:   msg += f" • Failed `{stats['failed']}`"
-    if stats["cooldown"]: msg += f" • Cooldown `{stats['cooldown']}`"
-    msg += "\n"
+    msg = dip_header(
+        "🎯",
+        "DIP BUY SCANNER",
+        ts,
+        "━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    msg += f"*SCAN SUMMARY*\n"
+    msg += f"`─────────────────`\n"
+    msg += f"📊 Scanned: `{stats['scanned']}`\n"
+    msg += f"✅ Qualified: `{len(candidates)}`\n"
+
+    if stats["failed"]:
+        msg += f"⚠️ Failed: `{stats['failed']}`\n"
+
+    if stats["cooldown"]:
+        msg += f"🔕 Cooldown: `{stats['cooldown']}`\n"
 
     if market_ctx:
         spy = market_ctx.get("SPY", {})
+        qqq = market_ctx.get("QQQ", {})
         vix = market_ctx.get("^VIX", {})
-        spy_pct, vix_p = spy.get("pct", 0), vix.get("price", 15)
-        spy_em = "🟢" if spy_pct >= 0 else "🔴"
-        vix_em = "🩸" if vix_p >= 30 else ("🟡" if vix_p >= 20 else "🟢")
-        msg += f"🌍 SPY {spy_em} `{spy_pct:+.2f}%` • VIX {vix_em} `{vix_p:.1f}`\n"
-        if   vix_p >= 25: msg += "_⚠️ High VIX — reduce position sizes_\n"
-        elif vix_p >= 20: msg += "_⚡ Elevated VIX — be selective_\n"
 
-    tiers = {"ELITE": [], "STRONG": [], "WATCHLIST": []}
+        spy_pct = spy.get("pct", 0)
+        qqq_pct = qqq.get("pct", 0)
+        vix_p = vix.get("price", 15)
+
+        spy_em = "🟢" if spy_pct >= 0 else "🔴"
+        qqq_em = "🟢" if qqq_pct >= 0 else "🔴"
+        vix_em = "🩸" if vix_p >= 30 else "🟡" if vix_p >= 20 else "🟢"
+
+        msg += f"\n*MARKET BACKDROP*\n"
+        msg += f"`─────────────────`\n"
+        msg += f"SPY: {spy_em} `{spy_pct:+.2f}%`\n"
+        msg += f"QQQ: {qqq_em} `{qqq_pct:+.2f}%`\n"
+        msg += f"VIX: {vix_em} `{vix_p:.1f}`\n"
+
+        if vix_p >= 25:
+            msg += "⚠️ _High VIX — reduce size, be selective_\n"
+        elif vix_p >= 20:
+            msg += "⚡ _Elevated VIX — avoid weak setups_\n"
+        else:
+            msg += "✅ _Market volatility acceptable_\n"
+
+    tiers = {
+        "ELITE": [],
+        "STRONG": [],
+        "WATCHLIST": [],
+    }
+
     for c in candidates:
         _, name = _tier(c["q"].score)
         tiers[name].append(c)
 
-    rank, total_shown = 1, 0
-    headers = {
-        "ELITE":     "*🏆 ELITE (13–16)*",
-        "STRONG":    "*⭐ STRONG (9–12)*",
-        "WATCHLIST": "*✅ WATCHLIST (5–8)*",
+    rank = 1
+    total_shown = 0
+
+    tier_headers = {
+        "ELITE": {
+            "title": "🏆 ELITE SETUPS",
+            "desc": "Best risk/reward pullbacks",
+            "border": "━━━━━━━━━━━━━━━━━━━━━",
+        },
+        "STRONG": {
+            "title": "⭐ STRONG SETUPS",
+            "desc": "Good dips, still need confirmation",
+            "border": "═════════════════════",
+        },
+        "WATCHLIST": {
+            "title": "✅ WATCHLIST SETUPS",
+            "desc": "Interesting, but lower conviction",
+            "border": "─────────────────────",
+        },
     }
+
     for tier_name in ("ELITE", "STRONG", "WATCHLIST"):
         bucket = tiers[tier_name]
+
         if not bucket:
             continue
-        bucket.sort(key=lambda c: (SYMBOL_SECTOR.get(c["ctx"]["symbol"], ""), -c["q"].score))
-        shown = bucket[: CFG.top_per_tier]
-        msg += f"\n{headers[tier_name]}\n`{H_RULE}`\n"
+
+        bucket.sort(
+            key=lambda c: (
+                SYMBOL_SECTOR.get(c["ctx"]["symbol"], ""),
+                -c["q"].score,
+            )
+        )
+
+        shown = bucket[:CFG.top_per_tier]
+        h = tier_headers[tier_name]
+
+        msg += "\n"
+        msg += f"*{h['title']}*\n"
+        msg += f"_{h['desc']}_\n"
+        msg += f"`{h['border']}`\n"
+
         for c in shown:
             if total_shown >= CFG.max_total_shown:
                 break
+
             msg += format_candidate(c, rank)
-            rank += 1; total_shown += 1
+            rank += 1
+            total_shown += 1
+
         if len(bucket) > len(shown):
-            msg += f"   _+{len(bucket) - len(shown)} more in this tier_\n"
+            msg += f"\n_+{len(bucket) - len(shown)} more in this tier_\n"
 
     if stats.get("disqualified"):
-        msg += f"\n*📋 TOP DISQUALIFICATIONS*\n`{H_RULE}`\n"
-        top = sorted(stats["disqualified"].items(), key=lambda x: -x[1])[:4]
+        msg += f"\n*TOP DISQUALIFICATIONS*\n"
+        msg += f"`─────────────────`\n"
+
+        top = sorted(
+            stats["disqualified"].items(),
+            key=lambda x: -x[1],
+        )[:4]
+
         for code, cnt in top:
-            msg += f"  • {md(code)}: `{cnt}`\n"
+            msg += f"• {md(code)}: `{cnt}`\n"
 
-    msg += f"\n`{H_RULE}`\n"
-    msg += "💡 *Rules*\n"
-    msg += "  • Pick 1–3 best, not all\n"
-    msg += "  • Size 2–5% of portfolio per trade\n"
-    msg += "  • Stop respects EMA200 *and* −8% cap\n"
-    msg += "  • Scale in — don't full-send"
+    msg += f"\n*RULES*\n"
+    msg += f"`─────────────────`\n"
+    msg += "✅ Pick only 1–3 best setups\n"
+    msg += "📏 Size 2–5% per trade\n"
+    msg += "🛡️ Respect stop — EMA200 and max-loss protected\n"
+    msg += "🧱 Scale in, don’t full-send\n"
+
+    msg += f"\n`━━━━━━━━━━━━━━━━━━━━━`\n"
+    msg += "_AlphaEdge Dip Scanner_"
+
     return msg
-
 
 # ════════════════════════════════════════════════════════════
 # SCAN PIPELINE
