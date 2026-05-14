@@ -279,86 +279,153 @@ def earnings_label(days: int, session: str | None, brief_kind: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════
-# RENDER HELPERS — pure, snapshot-testable
+# RENDER HELPERS — VISUAL TELEGRAM BRIEFS ONLY
 # ════════════════════════════════════════════════════════════
 
+def brief_header(emoji: str, title: str, subtitle: str | None = None,
+                 border: str = "━━━━━━━━━━━━━━━━━━━━━") -> str:
+    ts = display_now().strftime("%A, %B %d • %I:%M %p ET")
+    msg = f"{emoji} *{title}*\n`{border}`\n"
+    msg += f"🕒 _{ts}_\n"
+    if subtitle:
+        msg += f"_{md(subtitle)}_\n"
+    msg += "\n"
+    return msg
+
+
+def section_header(emoji: str, title: str,
+                   border: str = "─────────────────") -> str:
+    return f"\n{emoji} *{title}*\n`{border}`\n"
+
+
 def sector_emoji(avg: float) -> str:
-    if avg > 2:    return "🚀"
-    if avg > 0.5:  return "🟢"
-    if avg > -0.5: return "⚖️"
-    if avg > -2:   return "🔴"
+    if avg > 2:
+        return "🚀"
+    if avg > 0.5:
+        return "🟢"
+    if avg > -0.5:
+        return "⚖️"
+    if avg > -2:
+        return "🔴"
     return "🩸"
+
 
 def render_market_row(label: str, d: dict | None) -> str:
     if not d:
         return f"{label}: —\n"
-    em = "🟢" if d.get("pct", 0) >= 0 else "🔴"
-    return f"{label}: {em} `${d.get('price', 0):.2f}` ({d.get('pct', 0):+.2f}%)\n"
+
+    pct = d.get("pct", 0)
+    price = d.get("price", 0)
+
+    em = "🟢" if pct >= 0 else "🔴"
+    return f"{label}: {em} `${price:.2f}`  `{pct:+.2f}%`\n"
+
 
 def render_market_snapshot(market_ctx: dict, title: str) -> str:
     if not market_ctx:
         return ""
+
     spy = market_ctx.get("SPY", {})
     qqq = market_ctx.get("QQQ", {})
     vix = market_ctx.get("^VIX", {})
-    out = f"*{title}*\n{SUB_RULE}\n"
+
+    out = section_header("🌍", title)
+
     out += render_market_row("SPY", spy)
     out += render_market_row("QQQ", qqq)
     out += render_market_row("VIX", vix)
 
-    vix_p   = vix.get("price", 15)
+    vix_p = vix.get("price", 15)
     spy_pct = spy.get("pct", 0)
+
     if vix_p >= 30:
         out += "\n🩸 _Stressed regime — defensive sizing only_\n"
     elif vix_p >= 20:
-        out += "\n⚠️ _Elevated VIX — expect chop & risk-off_\n"
+        out += "\n⚠️ _Elevated VIX — expect chop and risk-off moves_\n"
     elif vix_p < 14 and spy_pct > 0.3:
-        out += "\n✅ _Low vol + uptick — clean trend environment_\n"
+        out += "\n✅ _Low vol + green market — cleaner trend setup_\n"
+    else:
+        out += "\n⚖️ _Mixed backdrop — be selective_\n"
+
     return out
 
+
 def render_sectors(sectors, title: str) -> str:
-    out = f"\n*{title}*\n{SUB_RULE}\n"
+    if not sectors:
+        return ""
+
+    out = section_header("🌡️", title)
+
     for sector, avg in sectors:
         out += f"{sector_emoji(avg)} {md(sector)}: `{avg:+.2f}%`\n"
+
     return out
+
 
 def render_movers(gainers, losers, title: str) -> str:
     if not (gainers or losers):
         return ""
-    out = f"\n*{title}*\n{SUB_RULE}\n"
+
+    out = section_header("📊", title)
+
     if gainers:
-        out += "🚀 _Gainers:_\n"
+        out += "*🚀 GAINERS*\n"
         for g in gainers:
             em = SYMBOL_EMOJI.get(g["symbol"], "📊")
-            out += f"  {em} {md(g['symbol'])}: `{g['pct']:+.2f}%`\n"
+            out += f"  {em} *{md(g['symbol'])}* `{g['pct']:+.2f}%`\n"
+
     if losers:
-        out += "📉 _Losers:_\n"
+        out += "\n*📉 LOSERS*\n"
         for l in losers:
             em = SYMBOL_EMOJI.get(l["symbol"], "📊")
-            out += f"  {em} {md(l['symbol'])}: `{l['pct']:+.2f}%`\n"
+            out += f"  {em} *{md(l['symbol'])}* `{l['pct']:+.2f}%`\n"
+
     return out
+
 
 def render_earnings(earnings, brief_kind: str, title: str, footer: str) -> str:
     if not earnings:
         return ""
-    out = f"\n*{title}*\n{SUB_RULE}\n"
+
+    out = section_header("📅", title, "═════════════════")
+
     for sym, _ed, days, session in earnings:
         em = SYMBOL_EMOJI.get(sym, "📊")
-        out += f"  {em} {name_label(sym)} — {earnings_label(days, session, brief_kind)}\n"
-    out += f"_{footer}_\n"
+        out += f"  {em} {name_label(sym)}\n"
+        out += f"     ⚠️ *{earnings_label(days, session, brief_kind)}*\n"
+
+    out += f"\n_{footer}_\n"
     return out
+
 
 def render_header(emoji: str, title: str) -> str:
-    ts = display_now().strftime("%A, %B %d • %I:%M %p ET")
-    return f"{emoji} *{title}*\n🕒 {ts}\n{H_RULE}\n\n"
+    if "MORNING" in title.upper():
+        return brief_header(
+            emoji,
+            title,
+            "Pre-market setup, risk map, and watchlist",
+            "━━━━━━━━━━━━━━━━━━━━━",
+        )
+
+    if "EVENING" in title.upper():
+        return brief_header(
+            emoji,
+            title,
+            "Day recap, open risk, and after-hours watch",
+            "═════════════════════",
+        )
+
+    return brief_header(emoji, title)
+
 
 def render_footer(failed_count: int, total: int, tail: str) -> str:
-    out = f"\n{H_RULE}\n"
+    out = f"\n`━━━━━━━━━━━━━━━━━━━━━`\n"
+
     if failed_count:
-        out += f"_⚠️ {failed_count}/{total} tickers failed to fetch._\n"
+        out += f"⚠️ _{failed_count}/{total} tickers failed to fetch._\n"
+
     out += f"_{tail}_"
     return out
-
 
 # ════════════════════════════════════════════════════════════
 # MORNING BRIEF
@@ -405,7 +472,8 @@ def build_morning_brief() -> bool:
     msg += render_market_snapshot(data.market_ctx, "🌍 MARKET SNAPSHOT")
 
     if ai_outlook:
-        msg += f"\n*🤖 TODAY'S OUTLOOK*\n{SUB_RULE}\n{ai_outlook}\n"
+        msg += section_header("🤖", "TODAY'S OUTLOOK")
+        msg += f"{ai_outlook}\n"
 
     msg += render_earnings(
         data.earnings_soon, brief_kind="morning",
@@ -417,7 +485,7 @@ def build_morning_brief() -> bool:
     msg += render_movers(data.gainers, data.losers, "📊 TOP MOVERS")
 
     # Buy candidates — with company name + exchange
-    msg += f"\n*🎯 BUY ZONE CANDIDATES*\n{SUB_RULE}\n"
+    msg += section_header("🎯", "BUY ZONE CANDIDATES", "━━━━━━━━━━━━━━━━━")
     if buy_candidates:
         shown = min(CFG.max_buy_candidates, len(buy_candidates))
         for sym, ctx, _v, zone, reasons in buy_candidates[:shown]:
@@ -438,7 +506,7 @@ def build_morning_brief() -> bool:
 
     # Avoid
     if avoid_list:
-        msg += f"\n*🚫 AVOID / WAIT*\n{SUB_RULE}\n"
+        mmsg += section_header("🚫", "AVOID / WAIT", "═════════════════")
         shown = min(CFG.max_avoid_shown, len(avoid_list))
         for sym, _ctx, _v, zone in avoid_list[:shown]:
             em = SYMBOL_EMOJI.get(sym, "📊")
@@ -506,11 +574,12 @@ def build_evening_brief() -> bool:
     msg += render_market_snapshot(data.market_ctx, "🔔 DAY CLOSE")
 
     if ai_summary:
-        msg += f"\n*🤖 END-OF-DAY ANALYSIS*\n{SUB_RULE}\n{ai_summary}\n"
+        msg += section_header("🤖", "END-OF-DAY ANALYSIS")
+        msg += f"{ai_summary}\n"
 
     # Open trades — per-row try/except
     if open_trades:
-        msg += f"\n*📊 OPEN TRADES ({len(open_trades)})*\n{SUB_RULE}\n"
+        msg += section_header("📊", f"OPEN TRADES ({len(open_trades)})", "━━━━━━━━━━━━━━━━━")
         msg += "_Still active going into after-hours:_\n"
         for k, t in open_trades.items():
             try:
@@ -535,7 +604,7 @@ def build_evening_brief() -> bool:
         losses = [t for t in closed_today if (t.get("final_r") or 0) < 0]
         total_r = sum((t.get("final_r") or 0) for t in closed_today)
         r_em = "🟢" if total_r > 0 else ("⚪" if total_r == 0 else "🔴")
-        msg += f"\n*✅ TODAY'S CLOSED TRADES*\n{SUB_RULE}\n"
+        msg += section_header("✅", "TODAY'S CLOSED TRADES", "═════════════════")
         msg += f"Closed: *{len(closed_today)}* • Wins: *{len(wins)}* • Losses: *{len(losses)}*\n"
         msg += f"{r_em} Day P&L: *{total_r:+.1f}R*\n"
 
@@ -544,7 +613,7 @@ def build_evening_brief() -> bool:
 
     # AH movers
     if ah_movers:
-        msg += f"\n*🌙 AFTER-HOURS MOVERS*\n{SUB_RULE}\n"
+        msg += section_header("🌙", "AFTER-HOURS MOVERS")
         for m in ah_movers:
             em     = SYMBOL_EMOJI.get(m["symbol"], "📊")
             dir_em = "🟢" if m["pct"] > 0 else "🔴"
