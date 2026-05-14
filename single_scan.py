@@ -1400,18 +1400,24 @@ def format_short_analysis(symbol, ctx, verdict, zone, rs_label, rs_score, stock_
 # PRICE ALERT SYSTEM
 # ═══════════════════════════════════════════════
 
+def alert_header(emoji, title, border='━━━━━━━━━━━━━━━━━━━━━'):
+    return f"{emoji} *{title}*\n`{border}`\n\n"
+
+
 def load_alerts():
     return load_json(ALERTS_FILE, {})
 
 def save_alerts(alerts):
     save_json(ALERTS_FILE, alerts)
 
+
 def set_alert(symbol, target_price, direction='auto'):
     alerts = load_alerts()
+
     try:
         df = yf.download(symbol, period='1d', interval='1m',
                          progress=False, auto_adjust=True)
-        df      = _clean_df(df)
+        df = _clean_df(df)
         current = float(df['Close'].iloc[-1]) if not df.empty else None
     except Exception:
         current = None
@@ -1419,7 +1425,8 @@ def set_alert(symbol, target_price, direction='auto'):
     if direction == 'auto' and current:
         direction = 'above' if target_price > current else 'below'
 
-    alert_key         = f"{symbol}_{target_price}"
+    alert_key = f"{symbol}_{target_price}"
+
     alerts[alert_key] = {
         'symbol':              symbol,
         'target':              target_price,
@@ -1430,104 +1437,222 @@ def set_alert(symbol, target_price, direction='auto'):
         'expiry_warning_sent': False,
         'triggered':           False,
     }
+
     save_alerts(alerts)
 
-    dir_str    = "rises to" if direction == 'above' else "falls to"
+    em = SYMBOL_EMOJI.get(symbol, '📈')
+
+    dir_str = "breaks above" if direction == 'above' else "falls below"
     warn_price = target_price * 0.98 if direction == 'above' else target_price * 1.02
-    cur_str    = f" (currently ${current:.2f})" if current else ""
+    cur_str = f"${current:.2f}" if current else "N/A"
+
     send_telegram(
-        f"Alert set!\n"
-        f"{SYMBOL_EMOJI.get(symbol,'')} *{symbol}* — notify when {dir_str} `${target_price:.2f}`{cur_str}\n"
-        f"Early warning at `${warn_price:.2f}` (2% before)\n"
-        f"Expires in 30 days"
+        alert_header("🔔", "PRICE ALERT CREATED") +
+        f"{em} *{symbol}*\n\n"
+        f"🎯 Target: `${target_price:.2f}`\n"
+        f"📍 Direction: *{dir_str}*\n"
+        f"💵 Current: `{cur_str}`\n\n"
+        f"⚠️ Early warning at `${warn_price:.2f}`\n"
+        f"⏳ Expires in *30 days*\n\n"
+        f"_AlphaEdge will notify before trigger._"
     )
 
+
 def cancel_alert(symbol):
-    alerts  = load_alerts()
+    alerts = load_alerts()
+
     removed = []
+
     for key in list(alerts.keys()):
         if alerts[key]['symbol'] == symbol:
             removed.append(alerts[key]['target'])
             del alerts[key]
+
     save_alerts(alerts)
-    em = SYMBOL_EMOJI.get(symbol, '')
+
+    em = SYMBOL_EMOJI.get(symbol, '📈')
+
     if removed:
-        send_telegram(f"Cancelled alerts for {em} *{symbol}*: {', '.join([f'${t}' for t in removed])}")
+        targets = ", ".join([f'`${t:.2f}`' for t in removed])
+
+        send_telegram(
+            alert_header("🗑️", "ALERT CANCELLED", "═════════════════════") +
+            f"{em} *{symbol}*\n\n"
+            f"Removed targets:\n"
+            f"{targets}\n\n"
+            f"✅ No more active alerts for this symbol."
+        )
+
     else:
-        send_telegram(f"No active alerts for *{symbol}*")
+        send_telegram(
+            alert_header("📭", "NO ACTIVE ALERTS", "─────────────────────") +
+            f"{em} *{symbol}*\n\n"
+            f"No active alerts found."
+        )
+
 
 def list_alerts():
     alerts = load_alerts()
+
     active = {k: v for k, v in alerts.items() if not v.get('triggered')}
+
     if not active:
-        send_telegram("No active alerts.\n\nSet one: `alert TSLA 450`")
+        send_telegram(
+            alert_header("📭", "NO ACTIVE ALERTS", "─────────────────────") +
+            "Set one with:\n"
+            "`alert TSLA 450`"
+        )
         return
-    msg = f"*ACTIVE ALERTS ({len(active)})*\n`━━━━━━━━━━━━━━━━━━━━━`\n\n"
+
+    msg = alert_header("📋", f"ACTIVE ALERTS ({len(active)})")
+
     for key, a in sorted(active.items(), key=lambda x: x[1]['symbol']):
-        em        = SYMBOL_EMOJI.get(a['symbol'], '')
-        dir_str   = "above" if a['direction'] == 'above' else "below"
-        expires   = datetime.fromisoformat(a['expires_at'])
+
+        em = SYMBOL_EMOJI.get(a['symbol'], '📈')
+
+        dir_str = "Above" if a['direction'] == 'above' else "Below"
+
+        expires = datetime.fromisoformat(a['expires_at'])
         days_left = (expires - now_est()).days
-        warn      = a['target'] * 0.98 if a['direction'] == 'above' else a['target'] * 1.02
-        msg += f"{em} *{a['symbol']}*  {dir_str} `${a['target']:.2f}`\n"
-        msg += f"   Early warning at `${warn:.2f}`  {days_left}d left\n\n"
+
+        warn = a['target'] * 0.98 if a['direction'] == 'above' else a['target'] * 1.02
+
+        msg += (
+            f"{em} *{a['symbol']}*\n"
+            f"🎯 {dir_str}: `${a['target']:.2f}`\n"
+            f"⚠️ Early warning: `${warn:.2f}`\n"
+            f"⏳ {days_left}d remaining\n\n"
+        )
+
     send_telegram(msg)
 
+
 def check_alerts():
-    alerts  = load_alerts()
+    alerts = load_alerts()
+
     if not alerts:
         return
+
     changed = False
-    now     = now_est()
+    now = now_est()
+
     for key, a in list(alerts.items()):
+
         if a.get('triggered'):
             continue
-        symbol     = a['symbol']
-        target     = a['target']
-        direction  = a['direction']
-        warn_price = target * 0.98 if direction == 'above' else target * 1.02
-        em         = SYMBOL_EMOJI.get(symbol, '')
 
-        expires   = datetime.fromisoformat(a['expires_at'])
+        symbol = a['symbol']
+        target = a['target']
+        direction = a['direction']
+
+        warn_price = target * 0.98 if direction == 'above' else target * 1.02
+
+        em = SYMBOL_EMOJI.get(symbol, '📈')
+
+        expires = datetime.fromisoformat(a['expires_at'])
+
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=EST)
+
         days_left = (expires - now).days
 
+        # ─────────────────────────────────────
+        # Expiring Tomorrow
+        # ─────────────────────────────────────
         if days_left <= 1 and not a.get('expiry_warning_sent'):
-            send_telegram(f"Alert expiring!\n{em} *{symbol}* to `${target:.2f}` expires tomorrow\n`alert {symbol} {target}` to reset")
+
+            send_telegram(
+                alert_header("⏳", "ALERT EXPIRING SOON", "─────────────────────") +
+                f"{em} *{symbol}*\n\n"
+                f"🎯 Target: `${target:.2f}`\n\n"
+                f"This alert expires *tomorrow*.\n\n"
+                f"🔁 Reset with:\n"
+                f"`alert {symbol} {target}`"
+            )
+
             a['expiry_warning_sent'] = True
             changed = True
 
+        # ─────────────────────────────────────
+        # Expired
+        # ─────────────────────────────────────
         if now > expires:
-            send_telegram(f"Alert expired\n{em} *{symbol}* to `${target:.2f}` (30 days, untriggered)")
+
+            send_telegram(
+                alert_header("🕒", "ALERT EXPIRED", "═════════════════════") +
+                f"{em} *{symbol}*\n\n"
+                f"🎯 Target: `${target:.2f}`\n\n"
+                f"No trigger within 30 days.\n\n"
+                f"❌ Alert removed."
+            )
+
             del alerts[key]
             changed = True
             continue
 
         try:
-            df      = yf.download(symbol, period='1d', interval='5m',
-                                  progress=False, auto_adjust=True)
-            if df.empty: continue
-            df      = _clean_df(df)
+            df = yf.download(symbol, period='1d', interval='5m',
+                             progress=False, auto_adjust=True)
+
+            if df.empty:
+                continue
+
+            df = _clean_df(df)
+
             current = float(df['Close'].iloc[-1])
+
         except Exception:
             continue
 
-        if ((direction == 'above' and current >= target) or
-                (direction == 'below' and current <= target)):
-            send_telegram(f"ALERT TRIGGERED\n{em} *{symbol}* hit `${target:.2f}`\nCurrent: `${current:.2f}`\nAlert removed.")
+        # ─────────────────────────────────────
+        # Triggered
+        # ─────────────────────────────────────
+        if (
+            (direction == 'above' and current >= target) or
+            (direction == 'below' and current <= target)
+        ):
+
+            move_pct = ((current - target) / target) * 100
+
+            send_telegram(
+                alert_header("🚨", "ALERT TRIGGERED", "━━━━━━━━━━━━━━━━━━━━━") +
+                f"{em} *{symbol}*\n\n"
+                f"🎯 Target: `${target:.2f}`\n"
+                f"💵 Current: `${current:.2f}`\n"
+                f"📈 Move: `{move_pct:+.2f}%` beyond target\n\n"
+                f"✅ Alert completed and removed."
+            )
+
             a['triggered'] = True
             changed = True
-        elif (not a.get('warning_sent') and
-              ((direction == 'above' and current >= warn_price) or
-               (direction == 'below' and current <= warn_price))):
-            send_telegram(f"APPROACHING TARGET\n{em} *{symbol}* near `${target:.2f}`\nNow: `${current:.2f}` — {abs(current-target)/target*100:.1f}% away")
+
+        # ─────────────────────────────────────
+        # Approaching
+        # ─────────────────────────────────────
+        elif (
+            not a.get('warning_sent') and
+            (
+                (direction == 'above' and current >= warn_price) or
+                (direction == 'below' and current <= warn_price)
+            )
+        ):
+
+            away_pct = abs(current - target) / target * 100
+
+            send_telegram(
+                alert_header("🟡", "APPROACHING TARGET", "═════════════════════") +
+                f"{em} *{symbol}* is getting close\n\n"
+                f"💵 Current: `${current:.2f}`\n"
+                f"🎯 Target: `${target:.2f}`\n"
+                f"📏 Distance: `{away_pct:.1f}% away`\n\n"
+                f"👀 Watch closely — alert not triggered yet."
+            )
+
             a['warning_sent'] = True
             changed = True
 
     if changed:
         save_alerts(alerts)
-
 
 # ═══════════════════════════════════════════════
 # WATCHLIST SCAN
