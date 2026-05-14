@@ -1397,7 +1397,7 @@ def format_short_analysis(symbol, ctx, verdict, zone, rs_label, rs_score, stock_
 
 
 # ═══════════════════════════════════════════════
-# PRICE ALERT SYSTEM
+# PRICE ALERT SYSTEM — Enhanced Layout v7.2
 # ═══════════════════════════════════════════════
 
 def alert_header(emoji, title, border='━━━━━━━━━━━━━━━━━━━━━'):
@@ -1443,19 +1443,37 @@ def set_alert(symbol, target_price, direction='auto'):
     em = SYMBOL_EMOJI.get(symbol, '📈')
 
     dir_str = "breaks above" if direction == 'above' else "falls below"
-    warn_price = target_price * 0.98 if direction == 'above' else target_price * 1.02
+    dir_em  = "📈" if direction == 'above' else "📉"
+
+    warn_price = (
+        target_price * 0.98
+        if direction == 'above'
+        else target_price * 1.02
+    )
+
     cur_str = f"${current:.2f}" if current else "N/A"
 
-    send_telegram(
-        alert_header("🔔", "PRICE ALERT CREATED") +
-        f"{em} *{symbol}*\n\n"
-        f"🎯 Target: `${target_price:.2f}`\n"
-        f"📍 Direction: *{dir_str}*\n"
-        f"💵 Current: `{cur_str}`\n\n"
-        f"⚠️ Early warning at `${warn_price:.2f}`\n"
-        f"⏳ Expires in *30 days*\n\n"
-        f"_AlphaEdge will notify before trigger._"
-    )
+    msg  = alert_header("🔔", "PRICE ALERT CREATED")
+    msg += f"{em} *{symbol}*\n"
+    msg += f"_30-day active alert_\n\n"
+
+    msg += f"🎯 *Target*\n"
+    msg += f"`${target_price:.2f}`\n\n"
+
+    msg += f"{dir_em} *Condition*\n"
+    msg += f"{dir_str.title()}\n\n"
+
+    msg += f"💵 *Current Price*\n"
+    msg += f"`{cur_str}`\n\n"
+
+    msg += f"⚠️ *Early Warning*\n"
+    msg += f"`${warn_price:.2f}`\n\n"
+
+    msg += f"⏳ Expires in *30 days*\n\n"
+    msg += f"`━━━━━━━━━━━━━━━━━━━━━`\n"
+    msg += f"_AlphaEdge will notify before trigger._"
+
+    send_telegram(msg)
 
 
 def cancel_alert(symbol):
@@ -1473,17 +1491,21 @@ def cancel_alert(symbol):
     em = SYMBOL_EMOJI.get(symbol, '📈')
 
     if removed:
-        targets = ", ".join([f'`${t:.2f}`' for t in removed])
 
-        send_telegram(
-            alert_header("🗑️", "ALERT CANCELLED", "═════════════════════") +
-            f"{em} *{symbol}*\n\n"
-            f"Removed targets:\n"
-            f"{targets}\n\n"
-            f"✅ No more active alerts for this symbol."
+        targets = "\n".join(
+            [f"• `${t:.2f}`" for t in sorted(removed)]
         )
 
+        msg  = alert_header("🗑️", "ALERT CANCELLED", "═════════════════════")
+        msg += f"{em} *{symbol}*\n\n"
+        msg += f"🎯 *Removed Targets*\n"
+        msg += f"{targets}\n\n"
+        msg += "✅ No more active alerts for this symbol."
+
+        send_telegram(msg)
+
     else:
+
         send_telegram(
             alert_header("📭", "NO ACTIVE ALERTS", "─────────────────────") +
             f"{em} *{symbol}*\n\n"
@@ -1494,7 +1516,10 @@ def cancel_alert(symbol):
 def list_alerts():
     alerts = load_alerts()
 
-    active = {k: v for k, v in alerts.items() if not v.get('triggered')}
+    active = {
+        k: v for k, v in alerts.items()
+        if not v.get('triggered')
+    }
 
     if not active:
         send_telegram(
@@ -1504,25 +1529,38 @@ def list_alerts():
         )
         return
 
-    msg = alert_header("📋", f"ACTIVE ALERTS ({len(active)})")
+    now = now_est()
+    tz  = now.tzname() or "EDT"
+    ts  = now.strftime(f'%a %b %d · %I:%M %p {tz}')
+
+    msg  = alert_header("📋", f"ACTIVE ALERTS ({len(active)})")
+    msg += f"_{ts}_\n\n"
 
     for key, a in sorted(active.items(), key=lambda x: x[1]['symbol']):
 
         em = SYMBOL_EMOJI.get(a['symbol'], '📈')
 
         dir_str = "Above" if a['direction'] == 'above' else "Below"
+        dir_em  = "📈" if a['direction'] == 'above' else "📉"
 
         expires = datetime.fromisoformat(a['expires_at'])
         days_left = (expires - now_est()).days
 
-        warn = a['target'] * 0.98 if a['direction'] == 'above' else a['target'] * 1.02
+        warn = (
+            a['target'] * 0.98
+            if a['direction'] == 'above'
+            else a['target'] * 1.02
+        )
 
         msg += (
             f"{em} *{a['symbol']}*\n"
-            f"🎯 {dir_str}: `${a['target']:.2f}`\n"
-            f"⚠️ Early warning: `${warn:.2f}`\n"
+            f"{dir_em} {dir_str}: `${a['target']:.2f}`\n"
+            f"⚠️ Warning: `${warn:.2f}`\n"
             f"⏳ {days_left}d remaining\n\n"
         )
+
+    msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
+    msg += "_AlphaEdge v7.2_"
 
     send_telegram(msg)
 
@@ -1545,7 +1583,11 @@ def check_alerts():
         target = a['target']
         direction = a['direction']
 
-        warn_price = target * 0.98 if direction == 'above' else target * 1.02
+        warn_price = (
+            target * 0.98
+            if direction == 'above'
+            else target * 1.02
+        )
 
         em = SYMBOL_EMOJI.get(symbol, '📈')
 
@@ -1614,14 +1656,23 @@ def check_alerts():
 
             move_pct = ((current - target) / target) * 100
 
-            send_telegram(
-                alert_header("🚨", "ALERT TRIGGERED", "━━━━━━━━━━━━━━━━━━━━━") +
-                f"{em} *{symbol}*\n\n"
-                f"🎯 Target: `${target:.2f}`\n"
-                f"💵 Current: `${current:.2f}`\n"
-                f"📈 Move: `{move_pct:+.2f}%` beyond target\n\n"
-                f"✅ Alert completed and removed."
-            )
+            move_em = "🚀" if move_pct > 0 else "📉"
+
+            msg  = alert_header("🚨", "ALERT TRIGGERED", "━━━━━━━━━━━━━━━━━━━━━")
+            msg += f"{em} *{symbol}*\n\n"
+
+            msg += f"🎯 *Target Hit*\n"
+            msg += f"`${target:.2f}`\n\n"
+
+            msg += f"💵 *Current Price*\n"
+            msg += f"`${current:.2f}`\n\n"
+
+            msg += f"{move_em} *Beyond Target*\n"
+            msg += f"`{move_pct:+.2f}%`\n\n"
+
+            msg += "✅ Alert completed and removed."
+
+            send_telegram(msg)
 
             a['triggered'] = True
             changed = True
@@ -1639,14 +1690,21 @@ def check_alerts():
 
             away_pct = abs(current - target) / target * 100
 
-            send_telegram(
-                alert_header("🟡", "APPROACHING TARGET", "═════════════════════") +
-                f"{em} *{symbol}* is getting close\n\n"
-                f"💵 Current: `${current:.2f}`\n"
-                f"🎯 Target: `${target:.2f}`\n"
-                f"📏 Distance: `{away_pct:.1f}% away`\n\n"
-                f"👀 Watch closely — alert not triggered yet."
-            )
+            msg  = alert_header("🟡", "APPROACHING TARGET", "═════════════════════")
+            msg += f"{em} *{symbol}*\n\n"
+
+            msg += f"💵 *Current*\n"
+            msg += f"`${current:.2f}`\n\n"
+
+            msg += f"🎯 *Target*\n"
+            msg += f"`${target:.2f}`\n\n"
+
+            msg += f"📏 *Distance Remaining*\n"
+            msg += f"`{away_pct:.1f}% away`\n\n"
+
+            msg += "👀 Watch closely — alert not triggered yet."
+
+            send_telegram(msg)
 
             a['warning_sent'] = True
             changed = True
@@ -1654,13 +1712,17 @@ def check_alerts():
     if changed:
         save_alerts(alerts)
 
+
 # ═══════════════════════════════════════════════
-# WATCHLIST SCAN
+# WATCHLIST SCAN — Enhanced Layout v7.2
 # ═══════════════════════════════════════════════
 
 def run_watchlist_scan():
-    send_telegram("Scanning watchlist... ~60s", silent=True)
+
+    send_telegram("🔎 Scanning watchlist... ~60s", silent=True)
+
     all_syms, emoji_map = load_universe()
+
     if not all_syms:
         send_telegram("Could not load symbols.yaml")
         return
@@ -1669,14 +1731,22 @@ def run_watchlist_scan():
     results    = []
 
     for sym in all_syms:
+
         try:
+
             print(f"  -> {sym}...", end=" ", flush=True)
+
             ctx = get_full_context(sym)
+
             time.sleep(0.3)
+
             if not ctx:
-                print("--"); continue
+                print("--")
+                continue
+
             verdict, zone, _, _ = get_verdict(ctx, market_ctx)
             rs_score, rs_label  = calc_relative_strength(ctx)
+
             results.append({
                 'symbol':   sym,
                 'emoji':    emoji_map.get(sym, ''),
@@ -1685,9 +1755,12 @@ def run_watchlist_scan():
                 'drop':     ctx['day_change_pct'],
                 'rsi':      ctx['rsi'],
                 'rs_score': rs_score or 0,
+                'rs_label': rs_label or '',
                 'current':  ctx['current'],
             })
+
             print(f"{ctx['day_change_pct']:+.1f}% {verdict}")
+
         except Exception as e:
             print(f"ERROR {e}")
 
@@ -1696,103 +1769,118 @@ def run_watchlist_scan():
         return
 
     def sort_key(r):
+
         v = r['verdict']
-        if 'MOMENTUM' in v: return (0, -r['drop'])
-        if 'BUY'      in v: return (1, -r['drop'])
-        if 'WATCH'    in v: return (2, -r['drop'])
-        if 'NEUTRAL'  in v: return (3, -r['drop'])
-        if 'EXTENDED' in v: return (4, -r['drop'])
-        if 'AVOID'    in v: return (5, -r['drop'])
+
+        if 'MOMENTUM' in v:
+            return (0, -r['drop'])
+
+        if 'BUY' in v:
+            return (1, -r['drop'])
+
+        if 'WATCH' in v:
+            return (2, -r['drop'])
+
+        if 'NEUTRAL' in v:
+            return (3, -r['drop'])
+
+        if 'EXTENDED' in v:
+            return (4, -r['drop'])
+
+        if 'AVOID' in v:
+            return (5, -r['drop'])
+
         return (6, -r['drop'])
 
     results.sort(key=sort_key)
 
     now = now_est()
     tz  = now.tzname() or "EDT"
-    ts  = now.strftime(f'%a %b %d  %I:%M %p {tz}')
-    msg = f"*WATCHLIST SCAN*\n{ts}\n`━━━━━━━━━━━━━━━━━━━━━`\n\n"
+    ts  = now.strftime(f'%a %b %d · %I:%M %p {tz}')
+
+    msg  = "📋 *WATCHLIST SCAN*\n"
+    msg += f"_{ts}_\n"
+    msg += "`━━━━━━━━━━━━━━━━━━━━━`\n\n"
 
     groups = {}
+
     for r in results:
         groups.setdefault(r['verdict'], []).append(r)
 
     for vkey, items in groups.items():
-        msg += f"*{vkey}*\n"
+
+        if 'MOMENTUM' in vkey:
+            v_em = '🚀'
+        elif 'BUY' in vkey:
+            v_em = '🟢'
+        elif 'WATCH' in vkey:
+            v_em = '🟡'
+        elif 'EXTENDED' in vkey:
+            v_em = '🟠'
+        elif 'AVOID' in vkey:
+            v_em = '🔴'
+        else:
+            v_em = '⚪'
+
+        msg += f"{v_em} *{vkey}*\n"
+
         for r in items:
+
             sign     = "+" if r['drop'] >= 0 else ""
+            drop_em  = "🟢" if r['drop'] >= 0 else "🔴"
+
             decimals = 4 if r['current'] < 10 else 2
             pf       = f"{{:.{decimals}f}}"
-            rs_str   = f" RS {r['rs_score']:+.1f}%" if r['rs_score'] else ""
-            msg += (f"  {r['emoji']} *{r['symbol']}* `${pf.format(r['current'])}`"
-                    f"  {sign}{r['drop']:.1f}%  RSI `{r['rsi']:.0f}`{rs_str}\n")
+
+            rs_line = ""
+
+            if r['rs_score']:
+                rs_line = f" · RS `{r['rs_score']:+.1f}%`"
+
+            rsi_tag = (
+                "🔴" if r['rsi'] >= 70 else
+                "🟢" if r['rsi'] <= 30 else
+                "🟡"
+            )
+
+            msg += (
+                f"{r['emoji']} *{r['symbol']}* "
+                f"`{pf.format(r['current'])}`\n"
+                f"   {drop_em} {sign}{r['drop']:.1f}%"
+                f" · {rsi_tag} RSI `{r['rsi']:.0f}`"
+                f"{rs_line}\n"
+            )
+
         msg += "\n"
 
-    msg += "_Type any symbol for full analysis_\n_AlphaEdge v7.2_"
-    send_telegram(msg)
-
-
-# ═══════════════════════════════════════════════
-# TOP MOVERS
-# ═══════════════════════════════════════════════
-
-def run_top_movers():
-    send_telegram("Fetching top movers...", silent=True)
-    all_syms, emoji_map = load_universe()
-    market_ctx = get_market_ctx()
-    movers     = []
-
-    for sym in all_syms:
-        try:
-            df = yf.download(sym, period='5d', interval='1d',
-                             progress=False, auto_adjust=True)
-            if df.empty or len(df) < 2: continue
-            df     = _clean_df(df)
-            change = (float(df['Close'].iloc[-1]) - float(df['Close'].iloc[-2])) / float(df['Close'].iloc[-2]) * 100
-            movers.append({'symbol': sym, 'emoji': emoji_map.get(sym, ''),
-                           'change': change, 'price': float(df['Close'].iloc[-1])})
-            time.sleep(0.2)
-        except Exception:
-            pass
-
-    if not movers:
-        send_telegram("Could not fetch data"); return
-
-    movers.sort(key=lambda x: -x['change'])
-    gainers = [m for m in movers if m['change'] > 0][:5]
-    losers  = [m for m in movers if m['change'] < 0][-5:]
-    losers.reverse()
-
-    now = now_est()
-    tz  = now.tzname() or "EDT"
-    ts  = now.strftime(f'%a %b %d  %I:%M %p {tz}')
-    msg = f"*TOP MOVERS*\n{ts}\n`━━━━━━━━━━━━━━━━━━━━━`\n\n"
-
-    if gainers:
-        msg += "*GAINERS*\n"
-        for m in gainers:
-            d = 4 if m['price'] < 10 else 2
-            msg += f"  {m['emoji']} *{m['symbol']}* `${m['price']:.{d}f}`  +{m['change']:.2f}%\n"
-    if losers:
-        msg += f"\n*LOSERS*\n"
-        for m in losers:
-            d = 4 if m['price'] < 10 else 2
-            msg += f"  {m['emoji']} *{m['symbol']}* `${m['price']:.{d}f}`  {m['change']:.2f}%\n"
-
+    # Market context footer
     if market_ctx:
+
         spy = market_ctx.get('SPY', {})
         vix = market_ctx.get('^VIX', {})
-        msg += f"\n`─────────────────`\n"
-        if spy:
-            spy_pct  = spy.get('pct', 0)
-            spy_sign = "+" if spy_pct >= 0 else ""
-            msg += f"SPY: `{spy_sign}{spy_pct:.2f}%`"
-        if vix:
-            msg += f"  VIX: `{vix.get('price',0):.1f}`"
-        msg += "\n"
 
-    msg += "\n_Type any symbol for full analysis_"
+        spy_pct = spy.get('pct', 0)
+        vix_val = vix.get('price', 0)
+
+        spy_sign = "+" if spy_pct >= 0 else ""
+        spy_em   = "🟢" if spy_pct >= 0 else "🔴"
+
+        vix_tag = (
+            "🔴 High"
+            if vix_val > 25 else
+            "🟡 Elevated"
+            if vix_val > 18 else
+            "🟢 Calm"
+        )
+
+        msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
+        msg += f"🌍 SPY {spy_em} `{spy_sign}{spy_pct:.2f}%`"
+        msg += f" · VIX `{vix_val:.1f}` {vix_tag}\n\n"
+
+    msg += "_Type any symbol for full analysis_\n"
+    msg += "_AlphaEdge v7.2_"
+
     send_telegram(msg)
-
 
 # ═══════════════════════════════════════════════
 # ON-DEMAND BRIEF
