@@ -4,6 +4,17 @@ ALPHAEDGE MARKET INTELLIGENCE v3.1 — UNIVERSE SCHEMA SUPPORT
 Trading-system core: data fetch, indicators, verdict engine,
 sector/leadership detection, Telegram delivery.
 
+Changes vs original:
+• Emoji-anchored section headers (same hierarchy system as single_scan v7.3)
+• Tag pills at top for instant mobile scanning
+• Stock-specific weakness vs market surfaced prominently in header
+• Buy zone floor fixed — uses EMA200 not 52W low
+• ATH recency merged into ATH line (was on separate line)
+• Volume context note added when big drop happens on low volume
+• AI analysis block properly shown when present
+• Breathing room between sections
+• Consistent separator style: ══ for major, ── for minor
+
 v3.1 vs v3.0
   • Loader supports new symbols.yaml `universe:` schema with metadata
   • Exposes SYMBOL_META (name/exchange/session/tags/roles per symbol)
@@ -923,178 +934,280 @@ def _move_header(drop: float) -> tuple[str, str, str]:
     return "📊", "MARKET MOVE", "─────────────────────"
 
 
-def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx,
-                          earnings_date=None, days_until=None):
-    c = ctx
-    em = SYMBOL_EMOJI.get(c["symbol"], "📊")
-    drop = c["day_change_pct"]
-
-    if not (drop <= CFG.big_drop_warn or drop >= CFG.big_gain_alert):
-        return None
-
-    head, sev, border = _move_header(drop)
-
-    ts = display_now().strftime("%a %b %d • %I:%M %p ET")
-    sign = "+" if drop >= 0 else ""
-    drop_em = "🔴" if drop < 0 else "🟢"
-
-    msg = alert_box_header(
-        head,
-        sev,
-        f"{ts}",
-        border
-    )
-
-    msg += f"{em} {name_label(c['symbol'])}\n\n"
-
-    msg += f"*PRICE ACTION*\n`─────────────────`\n"
-    msg += f"💵 Price: `${c['current']:.2f}`\n"
-    msg += f"{drop_em} Today: `{sign}{drop:.2f}%`\n"
-    msg += f"📊 Range: L `${c['today_low']:.2f}` → H `${c['today_high']:.2f}`\n"
-    msg += f"📈 Volume: {_vol_descriptor(c['vol_ratio'])}\n"
-
-    if drop >= CFG.big_gain_alert and c["vol_ratio"] < 1.3:
-        msg += "⚠️ _Low volume on big gain — less reliable move_\n"
-
-    msg += f"\n*VERDICT*\n`─────────────────`\n"
-    msg += f"🎯 *{md(verdict)}*\n"
-    msg += f"Zone: _{md(zone)}_\n\n"
-
-    for r in reasons[:3]:
-        msg += f"• {md(r)}\n"
-
-    if ai_text:
-        bias_line = next((l for l in ai_text.splitlines() if "💡" in l), None)
-        if bias_line:
-            msg += f"\n💡 {md(bias_line)}\n"
-
-    msg += f"\n*POSITIONAL CONTEXT*\n`─────────────────`\n"
-    msg += (
-        f"🏔️ ATH: `${c['ath']:.2f}` ({c['ath_pct']:+.1f}%) "
-        f"{_ath_tag(c['ath_pct'])}\n"
-    )
-    msg += f"🕒 ATH was {ath_recency_label(c['ath_date'])}\n"
-
-    pos = max(0, min(10, int(c["range_pos"] / 10)))
-    bar = "█" * pos + "░" * (10 - pos)
-
-    msg += f"📊 52W: `${c['low_52w']:.2f}` → `${c['high_52w']:.2f}`\n"
-    msg += f"`{bar}` {c['range_pos']:.0f}% of range\n"
-    msg += (
-        f"From low: `{c['pct_from_52w_low']:+.1f}%` • "
-        f"From high: `{c['pct_from_52w_high']:+.1f}%`\n"
-    )
-
-    if c["pct_from_52w_low"] > 1000:
-        msg += "⚠️ _Extreme range — possible corporate action / spin-off_\n"
-
-    msg += f"\n*TECHNICALS*\n`─────────────────`\n"
-    msg += f"Trend: {md(c['trend'])}\n"
-    msg += f"RSI: `{c['rsi']:.0f}`{_rsi_tag(c['rsi'])}\n"
-
-    ema200_disp = (
-        f"`${c['ema200_real']:.2f}`"
-        if c.get("ema200_real") is not None
-        else "_n/a — short history_"
-    )
-
-    msg += f"EMA50: `${c['ema50']:.2f}`\n"
-    msg += f"EMA200: {ema200_disp}\n"
-
-    above_50 = c["current"] > c["ema50"]
-    above_200 = c.get("ema200_real") is not None and c["current"] > c["ema200_real"]
-
-    msg += f"{_ma_status(above_50, above_200)}\n"
-
-    if earnings_date is None and days_until is None:
-        earnings_date, days_until = get_earnings_date(c["symbol"])
-
-    warn = format_earnings_warning(c["symbol"], earnings_date, days_until)
-
-    if warn:
-        msg += f"\n*EARNINGS*\n`─────────────────`\n"
-        msg += f"{warn}\n"
-
-    rs_score, rs_label = calc_relative_strength(c)
-
-    if rs_score is not None:
-        sign_rs = "+" if rs_score >= 0 else ""
-        msg += f"\n*RELATIVE STRENGTH*\n`─────────────────`\n"
-        msg += f"{md(rs_label)}\n"
-        msg += f"5d vs SPY: `{sign_rs}{rs_score}%`\n"
-
-    if market_ctx:
-        spy = market_ctx.get("SPY", {}).get("pct", 0)
-        qqq = market_ctx.get("QQQ", {}).get("pct", 0)
-        vix = market_ctx.get("^VIX", {}).get("price", 15)
-
-        spy_em = "🔴" if spy < 0 else "🟢"
-        qqq_em = "🔴" if qqq < 0 else "🟢"
-        vix_em = "🔴" if vix > 25 else "🟡" if vix > 18 else "🟢"
-
-        msg += f"\n*MARKET BACKDROP*\n`─────────────────`\n"
-        msg += f"SPY: {spy_em} `{spy:+.2f}%`\n"
-        msg += f"QQQ: {qqq_em} `{qqq:+.2f}%`\n"
-        msg += f"VIX: {vix_em} `{vix:.1f}`\n"
-
-        if vix > 22:
-            msg += "⚠️ _Elevated VIX — broad risk-off environment_\n"
-        elif spy < -1 and drop < -5:
-            msg += "⚠️ _Moving with market weakness_\n"
-        elif spy > 0 and drop < -5:
-            msg += "🚨 _Stock-specific weakness — market is green_\n"
-
-    if ai_text:
-        msg += f"\n*AI READ*\n`─────────────────`\n"
-        msg += f"{md(ai_text)}\n"
-
-    msg += f"\n*ACTION PLAN*\n`─────────────────`\n"
-
-    ema200_safe = c["ema200_real"] if c.get("ema200_real") is not None else c["ema50"]
-
-    if "BUY" in verdict:
-        support1 = min(c["ema50"], c["low_52w"] * 1.03)
-        msg += f"🟢 Buy zone: `${support1:.2f}` – `${c['current']:.2f}`\n"
-        msg += f"🛡️ Support: `${ema200_safe:.2f}`\n"
-        msg += f"🚪 Invalid below: `${ema200_safe:.2f}`\n"
-
-    elif "MOMENTUM" in verdict:
-        msg += f"🚀 Breakout: above ATH `${c['ath']:.2f}` with volume\n"
-        msg += f"🔄 Pullback entry: EMA50 `${c['ema50']:.2f}`\n"
-        msg += f"🛡️ Stop: below EMA50 `${c['ema50']:.2f}`\n"
-
-    elif "TAKE PROFITS" in verdict or "EXTENDED" in verdict:
-        msg += "🟠 If holding: trim 25–33%\n"
-        msg += f"🔄 Re-entry: EMA50 `${c['ema50']:.2f}`\n"
-        msg += f"🛡️ Trail stop: `${c['ema50'] * 0.97:.2f}`\n"
-        msg += "🚫 Do not add here\n"
-
-    elif "PARABOLIC" in verdict:
-        msg += "🚫 Do NOT chase\n"
-        msg += "⏳ Wait 3–5 days for consolidation\n"
-        msg += f"🔄 Re-entry: EMA50 `${c['ema50']:.2f}`\n"
-
-    elif "CRASH" in verdict:
-        msg += "🚫 Do NOT catch today\n"
-        msg += "⏳ Wait minimum 3 days\n"
-        msg += f"👀 Watch EMA200 `${ema200_safe:.2f}` hold/reclaim\n"
-
-    elif "AVOID" in verdict or "WAIT" in verdict:
-        msg += "🚫 No entry now\n"
-        msg += f"⏳ Wait for base above `${ema200_safe:.2f}`\n"
-        msg += f"👀 Trigger: reclaim EMA50 `${c['ema50']:.2f}` + RSI reversal\n"
-
-    elif "CAUTION" in verdict or "WATCH" in verdict:
-        msg += f"👀 Watch EMA50 `${c['ema50']:.2f}`\n"
-        msg += f"🟡 Scale only if `${ema200_safe:.2f}` holds\n"
-
+def format_big_move_alert(ctx, verdict, zone, reasons, ai_text, market_ctx):
+    c   = ctx
+    em  = SYMBOL_EMOJI.get(c['symbol'], '📊')
+    drop = c['day_change_pct']
+ 
+    # ── severity tier ──
+    if drop <= BIG_DROP_CRITICAL:
+        header_em, severity = "🚨🩸", "CRITICAL DROP"
+    elif drop <= BIG_DROP_WARN:
+        header_em, severity = "⚠️📉", "BIG DROP"
+    elif drop >= BIG_GAIN_ALERT:
+        header_em, severity = "🚀📈", "BIG GAIN"
     else:
-        msg += "⏸️ No clear edge — wait\n"
-        msg += f"👀 Direction level: EMA50 `${c['ema50']:.2f}`\n"
-
-    msg += f"\n`━━━━━━━━━━━━━━━━━━━━━`\n"
-    msg += "_AlphaEdge Market Intel_"
-
+        return None
+ 
+    now = now_est()
+    tz  = now.tzname() or "ET"
+    ts  = now.strftime(f'%a %b %d · %I:%M %p {tz}')
+ 
+    sign     = "+" if drop >= 0 else ""
+    drop_em  = "🟢" if drop >= 0 else "🔴"
+    decimals = 4 if c['current'] < 10 else 2
+    pf       = f"{{:.{decimals}f}}"
+ 
+    # ── market context for header banner ──
+    spy_pct  = market_ctx.get('SPY',  {}).get('pct', 0)  if market_ctx else 0
+    vix_val  = market_ctx.get('^VIX', {}).get('price', 15) if market_ctx else 15
+    stock_vs_market = ""
+    if drop < -5 and spy_pct > 0:
+        stock_vs_market = "  🚨 _Stock-specific — market is green_"
+    elif drop < -5 and spy_pct < -1.5:
+        stock_vs_market = "  ⚠️ _Moving with broad market bleed_"
+    elif drop > 8 and spy_pct < 0:
+        stock_vs_market = "  💪 _Outperforming — market is red_"
+ 
+    # ════════════════════════════════════════════
+    # § 1  HEADER
+    # ════════════════════════════════════════════
+    short_name = SYMBOL_EMOJI.get(c['symbol'], '')  # emoji only
+    # Try to get long name from context if available
+    long_name = c.get('long_name', '')
+    name_line = f"*{c['symbol']}*"
+    if long_name and long_name != c['symbol']:
+        name_line += f" — _{long_name}_"
+    name_line += f" {em}"
+ 
+    msg  = f"{header_em} *{severity}*\n"
+    msg += f"`══════════════════════════`\n"
+    msg += f"{name_line}\n"
+    msg += f"`${pf.format(c['current'])}`  {drop_em} *{sign}{drop:.2f}%*{stock_vs_market}\n"
+    msg += f"_{ts}_\n"
+    msg += f"`══════════════════════════`\n\n"
+ 
+    # ════════════════════════════════════════════
+    # § 2  TAG PILLS — instant context on mobile
+    # ════════════════════════════════════════════
+    tags = []
+ 
+    # Verdict tag
+    if "BUY" in verdict:        tags.append("🟢 Buy Zone")
+    elif "MOMENTUM" in verdict: tags.append("🚀 Momentum")
+    elif "EXTENDED" in verdict: tags.append("🟠 Extended")
+    elif "AVOID" in verdict:    tags.append("🔴 Avoid")
+    elif "PARABOLIC" in verdict: tags.append("🚨 Parabolic")
+    elif "CRASH" in verdict:    tags.append("💥 Crash")
+    elif "WAIT" in verdict:     tags.append("⏳ Wait")
+    elif "CAUTION" in verdict:  tags.append("⚠️ Caution")
+    elif "WATCH" in verdict:    tags.append("👀 Watch")
+ 
+    # RSI tag
+    rsi = c.get('rsi', 50)
+    if rsi >= 70:       tags.append("🔴 RSI Overbought")
+    elif rsi <= 30:     tags.append("🟢 RSI Oversold")
+    elif rsi >= 60:     tags.append("🟡 RSI Bullish")
+ 
+    # Volume context
+    vol = c.get('vol_ratio', 1.0)
+    if vol >= 2.0:      tags.append("🔥 High Volume")
+    elif vol < 0.7:     tags.append("⬇️ Low Volume")
+ 
+    # VIX tag
+    if vix_val > 25:    tags.append("🔴 VIX High")
+ 
+    if tags:
+        msg += "  ·  ".join(tags[:4]) + "\n\n"
+ 
+    # ════════════════════════════════════════════
+    # § 3  VERDICT
+    # ════════════════════════════════════════════
+    msg += f"*〔 {verdict} 〕*\n"
+    msg += f"_↳ {zone}_\n"
+ 
+    # AI one-liner right under verdict
+    if ai_text:
+        lines   = ai_text.strip().split('\n')
+        summary = next((l for l in reversed(lines)
+                        if any(w in l.upper() for w in ['WAIT', 'BUY', 'HOLD', 'AVOID', 'STRONG'])),
+                       lines[-1] if lines else None)
+        if summary:
+            msg += f"\n{summary}\n"
+ 
+    msg += "\n"
+    for r in reasons[:3]:
+        msg += f"  › {r}\n"
+    msg += f"`══════════════════════════`\n\n"
+ 
+    # ════════════════════════════════════════════
+    # § 4  PRICE
+    # ════════════════════════════════════════════
+    msg += f"💵 *PRICE*\n`──────────────────────────`\n"
+    msg += f"  Live     `${pf.format(c['current'])}`  {drop_em} {sign}{drop:.2f}% today\n"
+    msg += f"  Range    L `${pf.format(c['today_low'])}` — H `${pf.format(c['today_high'])}`\n"
+ 
+    if vol >= 2.0:   vol_line = f"`{vol:.1f}x` 🔥 Unusually high"
+    elif vol >= 1.5: vol_line = f"`{vol:.1f}x` ⬆️ Above average"
+    elif vol >= 0.8: vol_line = f"`{vol:.1f}x` — Normal"
+    else:            vol_line = f"`{vol:.1f}x` ⬇️ Below average"
+    msg += f"  Volume   {vol_line}\n"
+ 
+    # Volume + drop context — important signal
+    if drop <= BIG_DROP_WARN and vol < 0.8:
+        msg += f"  ⚠️ _Big drop on low volume — may recover, watch for follow-through_\n"
+    elif drop <= BIG_DROP_WARN and vol >= 2.0:
+        msg += f"  🚨 _High volume sell-off — distribution, not just a dip_\n"
+    elif drop >= BIG_GAIN_ALERT and vol < 1.3:
+        msg += f"  ⚠️ _Big gain on low volume — thin/news-driven, less reliable_\n"
+    msg += "\n"
+ 
+    # ════════════════════════════════════════════
+    # § 5  WHAT TO DO — verdict-specific action
+    # ════════════════════════════════════════════
+    msg += f"🎯 *WHAT TO DO*\n`──────────────────────────`\n"
+ 
+    if "BUY" in verdict:
+        support_level = max(c['ema200'], c['low_52w'] * 1.05)  # EMA200 or 5% above 52W low
+        msg += f"  › Entry zone: `${pf.format(c['ema200'])}` — `${pf.format(c['current'])}` (EMA200 to current)\n"
+        msg += f"  › Stop: below EMA200 `${pf.format(c['ema200'])}`\n"
+        msg += f"  › Target: ATH `${pf.format(c['ath'])}` ({c['ath_pct']:+.1f}% away)\n"
+    elif "MOMENTUM" in verdict:
+        msg += f"  › Breakout entry: above ATH `${pf.format(c['ath'])}` with volume\n"
+        msg += f"  › Pullback entry: dip to EMA50 `${pf.format(c['ema50'])}` (ideal)\n"
+        msg += f"  › Stop: below EMA50 `${pf.format(c['ema50'])}`\n"
+    elif "EXTENDED" in verdict or "PARABOLIC" in verdict:
+        reentry = round(c['ema50'] * 0.98, 2)
+        msg += f"  › DO NOT chase at current price\n"
+        msg += f"  › Re-entry zone: near EMA50 `${pf.format(reentry)}`\n"
+        msg += f"  › RSI trigger: wait for RSI below 60 (currently `{rsi:.0f}`)\n"
+    elif "CRASH" in verdict or "AVOID" in verdict:
+        msg += f"  › Do NOT catch today — wait minimum 3 days\n"
+        msg += f"  › Watch: does it hold EMA200 `${pf.format(c['ema200'])}`?\n"
+        msg += f"  › Entry only after base forms above EMA50 `${pf.format(c['ema50'])}`\n"
+    elif "CAUTION" in verdict or "WATCH" in verdict:
+        msg += f"  › Watch key level: EMA50 `${pf.format(c['ema50'])}`\n"
+        msg += f"  › Scale-in zone: EMA200 `${pf.format(c['ema200'])}` if holds\n"
+        msg += f"  › Confirm with RSI > 50 + volume before entry\n"
+    else:
+        msg += f"  › No clear edge — wait for directional setup\n"
+        msg += f"  › Watch: EMA50 `${pf.format(c['ema50'])}` for direction\n"
+    msg += "\n"
+ 
+    # ════════════════════════════════════════════
+    # § 6  POSITIONAL CONTEXT
+    # ════════════════════════════════════════════
+    msg += f"📊 *POSITIONAL CONTEXT*\n`──────────────────────────`\n"
+ 
+    # ATH with recency on same line
+    ath_pct = c['ath_pct']
+    if ath_pct > -5:     ath_tag = "🏔️ At/near ATH"
+    elif ath_pct > -15:  ath_tag = "📍 Near ATH"
+    elif ath_pct > -30:  ath_tag = "📉 Pullback from ATH"
+    elif ath_pct > -50:  ath_tag = "💀 Deep drawdown"
+    else:                ath_tag = "⚰️ Far from ATH"
+ 
+    ath_when = ath_recency_label(c['ath_date'])
+    msg += f"  🏔️ ATH    `${pf.format(c['ath'])}` ({c['ath_pct']:+.1f}%) {ath_tag} — {ath_when}\n"
+ 
+    # 52W range bar
+    rp  = c['range_pos']
+    pos = int(rp / 10)
+    bar = "█" * pos + "░" * (10 - pos)
+    msg += f"  📐 52W    `${pf.format(c['low_52w'])}` — `${pf.format(c['high_52w'])}`\n"
+    msg += f"         `{bar}` {rp:.0f}% of range\n"
+ 
+    if c['pct_from_52w_low'] > 500:
+        msg += f"  ⚠️ _52W low `${pf.format(c['low_52w'])}` may reflect split/spin-off_\n"
+    msg += "\n"
+ 
+    # ════════════════════════════════════════════
+    # § 7  TECHNICALS
+    # ════════════════════════════════════════════
+    msg += f"📈 *TECHNICALS*\n`──────────────────────────`\n"
+    msg += f"  Trend   {c['trend']}\n"
+ 
+    if rsi < 30:       rsi_tag, rsi_em = "Oversold",   "🟢"
+    elif rsi >= 70:    rsi_tag, rsi_em = "Overbought", "🔴"
+    elif rsi > 60:     rsi_tag, rsi_em = "Bullish",    "🟡"
+    else:              rsi_tag, rsi_em = "Neutral",    "⚪"
+    msg += f"  RSI     `{rsi:.0f}` {rsi_em} _{rsi_tag}_\n"
+ 
+    msg += f"  EMA50   `${pf.format(c['ema50'])}`\n"
+    msg += f"  EMA200  `${pf.format(c['ema200'])}`\n"
+ 
+    above_50  = c['current'] > c['ema50']
+    above_200 = c['current'] > c['ema200']
+    if above_50 and above_200:          msg += "  ✅ Above EMA50 & EMA200\n"
+    elif above_200 and not above_50:    msg += "  ⚠️ Below EMA50, above EMA200\n"
+    elif not above_200 and above_50:    msg += "  🔀 Above EMA50, below EMA200\n"
+    else:                               msg += "  🔴 Below both EMAs\n"
+    msg += "\n"
+ 
+    # ════════════════════════════════════════════
+    # § 8  EARNINGS (if relevant)
+    # ════════════════════════════════════════════
+    earnings_date, days_until = get_earnings_date(c['symbol'])
+    earn_warn = format_earnings_warning(c['symbol'], earnings_date, days_until)
+    if earn_warn:
+        msg += f"📅 *EARNINGS*\n`──────────────────────────`\n  {earn_warn}\n\n"
+ 
+    # ════════════════════════════════════════════
+    # § 9  RELATIVE STRENGTH
+    # ════════════════════════════════════════════
+    rs_score, rs_label = calc_relative_strength(c)
+    if rs_score is not None:
+        rs_sign = "+" if rs_score >= 0 else ""
+        rs_em   = "💪" if rs_score > 5 else "📉" if rs_score < -5 else "➖"
+        msg += f"  {rs_em} *RS vs SPY (5d)*  {rs_label}  `{rs_sign}{rs_score}%`\n\n"
+ 
+    # ════════════════════════════════════════════
+    # § 10  MARKET CONDITIONS
+    # ════════════════════════════════════════════
+    if market_ctx:
+        spy = market_ctx.get('SPY', {})
+        vix = market_ctx.get('^VIX', {})
+        qqq = market_ctx.get('QQQ', {})
+        if spy or vix:
+            msg += f"🌍 *MARKET*\n`──────────────────────────`\n"
+            parts = []
+            if spy:
+                s  = spy.get('pct', 0)
+                se = "🟢" if s >= 0 else "🔴"
+                parts.append(f"SPY {se} `{'+' if s >= 0 else ''}{s:.2f}%`")
+            if qqq:
+                q  = qqq.get('pct', 0)
+                qe = "🟢" if q >= 0 else "🔴"
+                parts.append(f"QQQ {qe} `{'+' if q >= 0 else ''}{q:.2f}%`")
+            if vix:
+                ve  = "🔴" if vix_val > 25 else "🟡" if vix_val > 18 else "🟢"
+                vtag = "High" if vix_val > 25 else "Elevated" if vix_val > 18 else "Calm"
+                parts.append(f"VIX {ve} `{vix_val:.1f}` _{vtag}_")
+            msg += f"  {'  ·  '.join(parts)}\n"
+ 
+            # Prominent context note — was buried before
+            if drop < -5 and spy_pct > 0:
+                msg += f"  🚨 _Stock-specific weakness — market is UP_\n"
+            elif drop < -5 and spy_pct < -1.5:
+                msg += f"  ⚠️ _Moving with broad market sell-off_\n"
+            elif drop > 8 and spy_pct < 0:
+                msg += f"  💪 _Stock-specific strength — market is down_\n"
+            elif vix_val > 22:
+                msg += f"  ⚠️ _Elevated VIX — broad risk-off environment_\n"
+            msg += "\n"
+ 
+    # ════════════════════════════════════════════
+    # § 11  AI ANALYSIS (full 4-line block)
+    # ════════════════════════════════════════════
+    if ai_text:
+        msg += f"🤖 *AI ANALYSIS*\n`──────────────────────────`\n"
+        for line in ai_text.strip().split('\n'):
+            if line.strip():
+                msg += f"  {line.strip()}\n"
+        msg += "\n"
+ 
+    msg += f"`══════════════════════════`\n"
+    msg += f"_AlphaEdge Market Intel_"
     return msg
 
 
