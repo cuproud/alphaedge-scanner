@@ -751,10 +751,11 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None, earnings_cache=None):
             reasons.append(f"Near ATH ({from_ath:+.1f}%) — trend is strong")
         if mtf_all_bull:
             reasons.append("All timeframes aligned bullish")
+        upside_to_ath = (c['ath'] - c['current']) / c['current'] * 100
         next_steps = [
             f"Ideal entry: pullback to EMA50 ${c['ema50']:.2f} (lower risk)",
             f"Momentum entry: current ${c['current']:.2f} acceptable if conviction is high",
-            f"Target: ATH ${c['ath']:.2f} ({from_ath:+.1f}% away)",
+            f"Target: ATH ${c['ath']:.2f} (+{upside_to_ath:.1f}% upside)",
             f"Stop: close below EMA50 ${c['ema50']:.2f}",
         ]
 
@@ -769,9 +770,10 @@ def get_verdict(ctx, market_ctx=None, mtf_verdicts=None, earnings_cache=None):
             reasons.append("Near ATH — strong stock pulling back")
         if mtf_all_bull:
             reasons.append("All timeframes remain aligned bullish")
+        upside_to_ath = (c['ath'] - c['current']) / c['current'] * 100
         next_steps = [
             f"Entry: ${c['current']:.2f} or lower — current level is reasonable",
-            f"Target 1: ATH ${c['ath']:.2f} ({from_ath:+.1f}% away)",
+            f"Target 1: ATH ${c['ath']:.2f} (+{upside_to_ath:.1f}% upside)",
             "Target 2: new ATH breakout",
             f"Stop: below EMA200 ${c['ema200']:.2f}",
         ]
@@ -1082,18 +1084,13 @@ def build_tag_pills(verdict, ctx, rs_label, squeeze_state, rsi_div, stock_info):
 def build_price_context_grid(ctx, cad_price, tsx_symbol, usd_cad, support, resistance):
     """
     Compact scannable price context.
+    Volume removed — already shown in PRICE section above.
     Each row has a fixed emoji anchor so the eye can jump to any row instantly.
-    Support/resistance now rendered here (were previously passed but never shown).
+    Support/resistance rendered here (were previously passed but never shown).
     """
     c = ctx
     decimals = 4 if c['current'] < 10 else 2
     pf = f"{{:.{decimals}f}}"
-
-    vol_ratio = c['vol_ratio']
-    if vol_ratio >= 2.0:   vol_str = f"`{vol_ratio:.1f}x` 🔥 Unusually high"
-    elif vol_ratio >= 1.5: vol_str = f"`{vol_ratio:.1f}x` ⬆️ Above average"
-    elif vol_ratio >= 0.8: vol_str = f"`{vol_ratio:.1f}x` — Normal"
-    else:                  vol_str = f"`{vol_ratio:.1f}x` ⬇️ Below average (weak move)"
 
     rp = c['range_pos']
     if rp >= 90:   rp_bar = "████████████ 90%+ — near top"
@@ -1105,7 +1102,6 @@ def build_price_context_grid(ctx, cad_price, tsx_symbol, usd_cad, support, resis
     ath_str = f"`{c['ath_pct']:+.1f}%` — {ath_recency(c['ath_date'])}"
 
     msg  = f"📊 *PRICE CONTEXT*\n`─────────────────────────`\n"
-    msg += f"📦 Volume    {vol_str}\n"
     msg += f"📍 52W Pos   `{rp_bar}`\n"
     msg += f"🏔️ From ATH  {ath_str}\n"
     msg += f"📐 52W Range `${pf.format(c['low_52w'])}` — `${pf.format(c['high_52w'])}`\n"
