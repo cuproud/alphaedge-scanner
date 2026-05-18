@@ -2405,3 +2405,4 @@ if __name__ == "__main__":
 #   morning_brief.py     — morning / evening brief builder
 #   scanner.py           — dip scanner + weekly summary
 #   logs/single_*.log    — daily rotating operational log
+# """
