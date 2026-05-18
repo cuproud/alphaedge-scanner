@@ -1,3 +1,4 @@
+"""
 ╔══════════════════════════════════════════════════════════════════════╗
 ║           ALPHAEDGE SINGLE SCAN  v4.4                               ║
 ║           On-demand symbol analysis + alert engine                  ║
