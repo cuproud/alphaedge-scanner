@@ -1,76 +1,119 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# ALPHAEDGE UNIVERSE CONFIGURATION  v4.0
+# ALPHAEDGE UNIVERSE CONFIGURATION  v5.0
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # PURPOSE
 #   Single source of truth for ALL scanners (intel, brief, dip, scanner).
 #   Edit here → restart any scanner → changes take effect immediately.
 #
-# SCHEMA (per stock — all fields unless marked optional)
-#   symbol      "TICKER"                  yfinance-compatible ticker (required, unique)
-#   name        "Company Inc."            Clean display name — no status notes (required)
-#   exchange    "NASDAQ"|"NYSE"|"CRYPTO"|"COMEX"
-#   asset_class "stock"|"crypto"|"commodity"   drives session + alert logic
-#   emoji       "💎"                      single emoji for Telegram; MUST be globally unique
-#   sector      "AI / Semis"              PRIMARY — used for bleed/leadership math.
-#                                         Must be in sectors_canonical. Sectors need
-#                                         ≥ 2 members for bleed math to work.
-#   tags        ["Defense","Cybersecurity"]  secondary labels (optional list)
-#   roles       ["intel","brief","dip"]   which scanners include this asset:
-#                 intel   → real-time drop/spike alerts
-#                 brief   → morning/evening digest  (requires intel also set)
-#                 dip     → RSI/drop dip scanner
-#                 scanner → custom/future scanner
-#   session     "regular"|"extended"|"24h"
-#                 regular  → 09:30–16:00 ET
-#                 extended → 04:00–20:00 ET (pre + post market)
-#                 24h      → no session filtering (crypto, futures)
+# SCHEMA (per entry — all fields unless marked optional)
+#   symbol        "TICKER"              yfinance-compatible (required, unique).
+#                                       TSX-listed ETFs MUST use ".TO" suffix
+#                                       (e.g. "XIU.TO") or yfinance returns no data.
+#   name          "Name"                Clean display name, no status notes (required).
+#   exchange      "NASDAQ"|"NYSE"|"CBOE"|"TSX"|"CRYPTO"|"COMEX"
+#   asset_class   "stock"|"etf"|"crypto"|"commodity"
+#   emoji         "💎"                  Globally unique — Telegram disambiguation.
+#   sector        "AI / Semis"          PRIMARY for bleed/leadership math.
+#                                       Must be in sectors_canonical.
+#                                       Each sector needs ≥ 2 members.
+#   tags          ["tag1","tag2"]       Secondary labels (optional).
+#   roles         ["intel","brief","dip","scanner"]
+#                   intel   → real-time drop/spike alerts
+#                   brief   → morning/evening digest (requires "intel")
+#                   dip     → RSI/drop dip scanner
+#                   scanner → custom/future scanner
+#                 ETFs typically get intel+brief only (not dip — ETFs don't
+#                 dip-buy the same way individual names do). Exceptions noted.
+#   session       "regular"|"extended"|"24h"
+#                   regular  → 09:30–16:00 ET
+#                   extended → 04:00–20:00 ET
+#                   24h      → no session filter (crypto, futures)
+#   dip_overrides (optional block) — per-entry overrides for dip_scanner defaults.
+#                 Use for high-beta names where global defaults are too tight,
+#                 or low-beta names where defaults are too loose.
+#                 Any key not listed falls back to dip_scanner settings below.
+#                 Valid keys: rsi_min, rsi_max, drop_1d_max, drop_5d_max,
+#                             ath_min, vol_ratio_min, cooldown_hours, max_loss_pct
+#
+# VOLATILITY TIERS (drives dip_overrides presets — see settings.dip_tiers)
+#   high_beta   Quantum, Crypto Mining, EV/Auto, Space, small-cap speculative
+#               → RSI ceiling raised to 48, drop thresholds loosened
+#   standard    AI/Semis, AI Software, Mega Tech, Streaming, Consumer
+#               → global dip_scanner defaults apply (no overrides needed)
+#   low_beta    Safe Haven, Fintech payment rails, Healthcare large-caps, Canadian ETFs
+#               → RSI ceiling lowered to 38, drop thresholds tightened
 #
 # VALIDATION RULES (enforced by loader)
-#   • symbol must be unique across entire universe
-#   • emoji must be globally unique (Telegram disambiguation)
-#   • sector must be in sectors_canonical list at bottom of file
-#   • asset_class ∈ {stock, crypto, commodity}
-#   • roles must be subset of {intel, brief, dip, scanner}
-#   • "brief" role requires "intel" role on the same entry
+#   • symbol must be unique
+#   • emoji must be globally unique
+#   • sector must be in sectors_canonical
+#   • asset_class ∈ {stock, etf, crypto, commodity}
+#   • roles ⊆ {intel, brief, dip, scanner}
+#   • "brief" requires "intel"
 #   • crypto/commodity → session must be "24h"
-#   • sectors with < 2 members → bleed/leadership alerts suppressed
+#   • ETFs → asset_class must be "etf"
+#   • TSX-listed ETFs → symbol must end in ".TO"
+#   • sectors with < 2 members → bleed alerts suppressed
+#   • dip_overrides keys must be valid dip_scanner parameter names
 #
 # DATA QUALITY NOTES
-#   GC=F   Gold continuous futures roll monthly — expect price gaps on roll dates.
-#          yfinance returns the front-month contract.
-#   NVO    Novo Nordisk ADR (NYSE). Primary listing is NOVO-B on Copenhagen.
-#          yfinance NVO returns ADR data; volume will differ from primary.
-#   SNDK   Post-spin SanDisk Corp. (spun from WD in 2024). Limited price history
-#          before spin date; ATH-based dip logic may be unreliable until ~12mo data.
-#   MSTR   MicroStrategy is a BTC treasury company, not a miner. Placed in
-#          "Crypto-Adj" sector so bleed math correctly groups it with COIN/HOOD/SOFI.
-#   COIN   Coinbase is a crypto exchange, not a miner. Same sector fix as MSTR.
-#   UAMY   Micro-cap (~$50M). High volatility; intel alerts expected to fire often.
-#          Set cooldown_hours higher or add min_market_cap guard in code if noisy.
-#   WGRX   Small-cap healthcare. No dip role — price history thin, ATH math unreliable.
+#   GC=F      Gold continuous futures roll monthly — price gaps expected on roll
+#             dates. yfinance returns the front-month contract.
+#   NVO       Novo Nordisk ADR (NYSE). Primary listing is NOVO-B on Copenhagen.
+#             yfinance NVO returns ADR data; volume differs from primary.
+#   SNDK      Post-spin SanDisk Corp. (spun from WD in 2024). ATH-based dip logic
+#             unreliable until ~12 months of post-spin price history accumulates.
+#   MSTR      BTC treasury company, not a miner. Sector: Crypto-Adj.
+#   COIN      Crypto exchange, not a miner. Sector: Crypto-Adj.
+#   UAMY      Micro-cap (~$50M). Alerts will fire often on thin volume.
+#   WGRX      Small-cap healthcare. No dip role — thin history, ATH math unreliable.
+#   DRAM      CBOE-listed. Launched 2026-04-02. ~$9.8B AUM in 43 days (record).
+#             Heavy Korea exposure (~49%): Samsung + SK Hynix. Acts as HBM/memory
+#             bleed signal alongside MU. Volatility profile similar to MU but
+#             more concentrated — use standard dip thresholds.
+#   NASA      NYSE Arca-listed. Launched 2026-03-30. Tema Space Innovators ETF.
+#             Only space ETF with SpaceX exposure (via SPV). SpaceX slice is
+#             valued at transaction cost in daily NAV — will appear flat until
+#             Tema transacts or SpaceX IPOs. Use as sector bleed signal, not
+#             as a pure-price alert vehicle. SpaceX IPO expected mid-2026;
+#             post-IPO the SPV converts to freely traded shares.
+#   XIU.TO    TSX-listed, CAD-denominated. yfinance requires ".TO" suffix.
+#   XIC.TO    Same as above. ~240 holdings; broader than XIU.TO.
+#   ZEB.TO    Equal-weight Canadian Big 6 banks. CAD-denominated.
+#             All Canadian ETFs use session: regular (TSX hours = 09:30–16:00 ET).
+#   SLV       Silver ETF — asset_class: etf (not commodity), trades like a stock
+#             in yfinance. No futures roll gaps.
+#   QTUM      Defiance Quantum ETF — best liquid benchmark for Quantum sector bleed.
+#   SOXX      iShares Semiconductor ETF — sector benchmark for AI/Semis bleed math.
+#   IBIT      iShares Bitcoin Trust (spot BTC ETF) — cleaner BTC price signal than
+#             GC=F analog; no roll gaps, regular session hours.
+#   URNM      Sprott Uranium Miners ETF — Nuclear/Energy sector bleed anchor.
 #
 # CHANGELOG
-#   v4.0  2025-05  Full audit pass.
-#                  Fixed: 11 duplicate emoji conflicts (all resolved with unique glyphs).
-#                  Fixed: MSTR + COIN moved from "Crypto Mining" → "Crypto-Adj" sector.
-#                  Fixed: "Crypto-Adj" added to sectors_canonical (was missing).
-#                  Fixed: EV/Auto, Materials, Safe Haven, Streaming each had 1 member —
-#                         bleed math would divide by zero / be meaningless. Added
-#                         RIVN to EV/Auto, SLV to Safe Haven, DIS to Streaming,
-#                         MP to Materials so each sector has ≥ 2 members.
-#                  Fixed: SNDK name cleaned ("SanDisk Corp." — spin status → tags).
-#                  Fixed: QUBT roles aligned with peer quantum names (added intel+brief).
-#                  Fixed: AVGO + TSM promoted to intel+brief (large-cap sector leaders).
-#                  Improved: dip_scanner.rsi_max lowered 48 → 42 (was catching non-dips).
-#                  Improved: dip_scanner.drop_1d_max tightened -1.5 → -2.0 (reduce noise).
-#                  Improved: dip_scanner.cooldown_hours raised 4 → 8 (reduce dip spam).
-#                  Improved: intel cooldown stays at 4h; dip cooldown now independent.
+#   v5.0  2026-05  New sectors: Cybersecurity, Space, Data Center.
+#                  Added ETF asset_class; ETFs get roles intel+brief (not dip).
+#                  Added ETFs: DRAM (AI/Semis memory), NASA (Space), SOXX (AI/Semis),
+#                    IBIT (Crypto-Adj), URNM (Nuclear/Energy), QTUM (Quantum).
+#                  Added Canadian ETFs: XIU.TO, XIC.TO, ZEB.TO (new "Canada" sector).
+#                  Added Cybersecurity stocks: PANW, S, ZS (CRWD moved from AI Software).
+#                  Added Space stocks: RKLB, LUNR (NASA ETF anchors the sector).
+#                  Added Data Center REITs: EQIX, DLR (new sector).
+#                  Added volatility-adjusted dip_overrides on all high/low-beta entries.
+#                  Added dip_tiers presets to settings for reference.
+#                  Sector "Canada" added to sectors_canonical.
+#                  Sector "Cybersecurity" added to sectors_canonical.
+#                  Sector "Space" added to sectors_canonical.
+#                  Sector "Data Center" added to sectors_canonical.
+#                  CRWD moved from AI Software → Cybersecurity.
+#   v4.0  2025-05  Full audit. 11 emoji conflicts fixed. MSTR/COIN sector corrected.
+#                  Singleton sectors patched (RIVN, DIS, SLV, MP added).
+#                  dip_scanner thresholds tightened. "Financials" eliminated.
 #   v3.0  prior    Original release.
 #
 # ═══════════════════════════════════════════════════════════════════════════════
 
-schema_version: 4
+schema_version: 5
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -78,17 +121,71 @@ schema_version: 4
 # ───────────────────────────────────────────────────────────────────────────────
 universe:
 
-  - { symbol: "BTC-USD", name: "Bitcoin",      exchange: "CRYPTO", asset_class: "crypto",    emoji: "₿",  sector: "Crypto",     session: "24h",      roles: ["intel","brief"] }
-  - { symbol: "ETH-USD", name: "Ethereum",     exchange: "CRYPTO", asset_class: "crypto",    emoji: "Ξ",  sector: "Crypto",     session: "24h",      roles: ["intel","brief"] }
-  - { symbol: "XRP-USD", name: "Ripple",       exchange: "CRYPTO", asset_class: "crypto",    emoji: "◇",  sector: "Crypto",     session: "24h",      roles: ["intel","brief"] }
+  - symbol: "BTC-USD"
+    name: "Bitcoin"
+    exchange: "CRYPTO"
+    asset_class: "crypto"
+    emoji: "₿"
+    sector: "Crypto"
+    session: "24h"
+    roles: ["intel","brief"]
+
+  - symbol: "ETH-USD"
+    name: "Ethereum"
+    exchange: "CRYPTO"
+    asset_class: "crypto"
+    emoji: "Ξ"
+    sector: "Crypto"
+    session: "24h"
+    roles: ["intel","brief"]
+
+  - symbol: "XRP-USD"
+    name: "Ripple"
+    exchange: "CRYPTO"
+    asset_class: "crypto"
+    emoji: "◇"
+    sector: "Crypto"
+    session: "24h"
+    roles: ["intel","brief"]
+
+  - symbol: "IBIT"
+    name: "iShares Bitcoin Trust"
+    exchange: "NASDAQ"
+    asset_class: "etf"
+    emoji: "🪙"
+    sector: "Crypto-Adj"
+    session: "regular"
+    tags: ["Spot-BTC-ETF"]
+    roles: ["intel","brief"]
+    # Cleaner BTC price proxy than futures; no roll gaps. Bleed anchor for Crypto-Adj sector.
+
 
 # ───────────────────────────────────────────────────────────────────────────────
-# SAFE HAVEN  (≥ 2 members required for bleed math)
+# SAFE HAVEN
 # ───────────────────────────────────────────────────────────────────────────────
 
-  - { symbol: "GC=F",    name: "Gold Futures", exchange: "COMEX",  asset_class: "commodity", emoji: "🥇", sector: "Safe Haven", session: "24h",      roles: ["intel","brief"] }
-  - { symbol: "SLV",     name: "iShares Silver Trust", exchange: "NYSE", asset_class: "stock", emoji: "🥈", sector: "Safe Haven", session: "regular", roles: ["intel","brief"] }
-  # NOTE: SLV is an ETF but trades like a stock in yfinance; asset_class: stock is correct.
+  - symbol: "GC=F"
+    name: "Gold Futures"
+    exchange: "COMEX"
+    asset_class: "commodity"
+    emoji: "🥇"
+    sector: "Safe Haven"
+    session: "24h"
+    roles: ["intel","brief"]
+
+  - symbol: "SLV"
+    name: "iShares Silver Trust"
+    exchange: "NYSE"
+    asset_class: "etf"
+    emoji: "🥈"
+    sector: "Safe Haven"
+    session: "regular"
+    roles: ["intel","brief"]
+    dip_overrides:
+      rsi_max: 38         # low-beta ETF — real dips are shallower
+      drop_1d_max: -1.0
+      drop_5d_max: -2.5
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # MEGA TECH  (extended-hours capable)
@@ -100,19 +197,47 @@ universe:
   - { symbol: "META",  name: "Meta Platforms",          exchange: "NASDAQ", asset_class: "stock", emoji: "👓", sector: "Mega Tech", session: "extended", roles: ["intel","brief","dip"] }
   - { symbol: "AMZN",  name: "Amazon.com Inc.",         exchange: "NASDAQ", asset_class: "stock", emoji: "📦", sector: "Mega Tech", session: "extended", roles: ["intel","brief","dip"] }
 
+
 # ───────────────────────────────────────────────────────────────────────────────
-# STREAMING  (≥ 2 members required for bleed math)
+# STREAMING
 # ───────────────────────────────────────────────────────────────────────────────
 
   - { symbol: "NFLX",  name: "Netflix Inc.",            exchange: "NASDAQ", asset_class: "stock", emoji: "🎬", sector: "Streaming", session: "extended", roles: ["intel","brief","dip"] }
   - { symbol: "DIS",   name: "Walt Disney Co.",         exchange: "NYSE",   asset_class: "stock", emoji: "🏰", sector: "Streaming", session: "regular",  roles: ["intel","brief","dip"] }
 
+
 # ───────────────────────────────────────────────────────────────────────────────
-# EV / AUTO  (≥ 2 members required for bleed math)
+# EV / AUTO  (high-beta — loosened dip thresholds)
 # ───────────────────────────────────────────────────────────────────────────────
 
-  - { symbol: "TSLA",  name: "Tesla Inc.",              exchange: "NASDAQ", asset_class: "stock", emoji: "🚘", sector: "EV / Auto", session: "extended", roles: ["intel","brief","dip"] }
-  - { symbol: "RIVN",  name: "Rivian Automotive",       exchange: "NASDAQ", asset_class: "stock", emoji: "🛻", sector: "EV / Auto", session: "regular",  roles: ["intel","brief","dip"] }
+  - symbol: "TSLA"
+    name: "Tesla Inc."
+    exchange: "NASDAQ"
+    asset_class: "stock"
+    emoji: "🚘"
+    sector: "EV / Auto"
+    session: "extended"
+    roles: ["intel","brief","dip"]
+    dip_overrides:
+      rsi_max: 48         # high-beta; RSI 42–48 is still a real dip zone
+      drop_1d_max: -3.5   # -2% daily moves are noise for TSLA
+      drop_5d_max: -7.0
+      max_loss_pct: 12.0
+
+  - symbol: "RIVN"
+    name: "Rivian Automotive"
+    exchange: "NASDAQ"
+    asset_class: "stock"
+    emoji: "🛻"
+    sector: "EV / Auto"
+    session: "regular"
+    roles: ["intel","brief","dip"]
+    dip_overrides:
+      rsi_max: 48
+      drop_1d_max: -4.0   # even more volatile than TSLA
+      drop_5d_max: -9.0
+      max_loss_pct: 15.0
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # AI / SEMIS — GPU & Compute
@@ -120,7 +245,6 @@ universe:
 
   - { symbol: "NVDA",  name: "NVIDIA Corp.",            exchange: "NASDAQ", asset_class: "stock", emoji: "💎", sector: "AI / Semis", session: "extended", roles: ["intel","brief","dip"] }
   - { symbol: "AMD",   name: "Advanced Micro Devices",  exchange: "NASDAQ", asset_class: "stock", emoji: "🔴", sector: "AI / Semis", session: "extended", roles: ["intel","brief","dip"] }
-  # AMD emoji changed ⚡→🔴 (⚡ was shared with CEG)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # AI / SEMIS — Memory & Fab
@@ -128,24 +252,48 @@ universe:
 
   - { symbol: "MU",    name: "Micron Technology",       exchange: "NASDAQ", asset_class: "stock", emoji: "💾", sector: "AI / Semis", session: "regular",  roles: ["intel","brief","dip"] }
   - { symbol: "TSM",   name: "Taiwan Semiconductor",    exchange: "NYSE",   asset_class: "stock", emoji: "🏭", sector: "AI / Semis", session: "regular",  roles: ["intel","brief","dip"] }
-  # TSM promoted to intel+brief — largest foundry; sector leader for bleed signals
   - { symbol: "ASML",  name: "ASML Holding",            exchange: "NASDAQ", asset_class: "stock", emoji: "🔭", sector: "AI / Semis", session: "regular",  roles: ["intel","brief","dip"] }
-  # ASML emoji changed 🔬→🔭 (🔬 was shared with QBTS/QUBT)
   - { symbol: "SMCI",  name: "Super Micro Computer",    exchange: "NASDAQ", asset_class: "stock", emoji: "💻", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
   - { symbol: "SNDK",  name: "SanDisk Corp.",           exchange: "NASDAQ", asset_class: "stock", emoji: "💽", sector: "AI / Semis", session: "regular",  tags: ["Post-Spin","WD-Spinoff"], roles: ["intel","brief"] }
-  # SNDK name cleaned; spin status moved to tags; no dip role (limited price history post-spin)
   - { symbol: "NBIS",  name: "Nebius Group",            exchange: "NASDAQ", asset_class: "stock", emoji: "🛰️", sector: "AI / Semis", session: "regular",  roles: ["intel","brief"] }
-  # NBIS emoji changed 🌐→🛰️ (🌐 was shared with ANET)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # AI / SEMIS — Networking & Silicon
 # ───────────────────────────────────────────────────────────────────────────────
 
   - { symbol: "AVGO",  name: "Broadcom Inc.",           exchange: "NASDAQ", asset_class: "stock", emoji: "🔷", sector: "AI / Semis", session: "regular",  roles: ["intel","brief","dip"] }
-  # AVGO promoted to intel+brief — ASIC/networking sector leader
-  - { symbol: "MRVL",  name: "Marvell Technology",      exchange: "NASDAQ", asset_class: "stock", emoji: "🛸", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
+  - { symbol: "MRVL",  name: "Marvell Technology",      exchange: "NASDAQ", asset_class: "stock", emoji: "🔩", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
   - { symbol: "ARM",   name: "Arm Holdings",            exchange: "NASDAQ", asset_class: "stock", emoji: "🦾", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
   - { symbol: "ANET",  name: "Arista Networks",         exchange: "NYSE",   asset_class: "stock", emoji: "🌐", sector: "AI / Semis", session: "regular",  roles: ["dip"] }
+
+# ───────────────────────────────────────────────────────────────────────────────
+# AI / SEMIS — ETF Benchmarks
+# ───────────────────────────────────────────────────────────────────────────────
+
+  - symbol: "SOXX"
+    name: "iShares Semiconductor ETF"
+    exchange: "NASDAQ"
+    asset_class: "etf"
+    emoji: "🧩"
+    sector: "AI / Semis"
+    session: "regular"
+    tags: ["Sector-Benchmark"]
+    roles: ["intel","brief"]
+    # Broad semis benchmark. Bleed anchor — if SOXX moves, the whole sector is in play.
+
+  - symbol: "DRAM"
+    name: "Roundhill Memory ETF"
+    exchange: "CBOE"
+    asset_class: "etf"
+    emoji: "🧠"
+    sector: "AI / Semis"
+    session: "regular"
+    tags: ["HBM","Memory","AI-Infra"]
+    roles: ["intel","brief"]
+    # Pure-play HBM/DRAM/NAND. ~$9.8B AUM in 43 days (record launch). Top 3 holdings
+    # Samsung + SK Hynix + Micron = ~75% of fund. Korea ~49% exposure.
+    # Strong bleed pair with MU. Launched 2026-04-02.
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # AI SOFTWARE / SAAS / DATA
@@ -158,19 +306,92 @@ universe:
   - { symbol: "SNOW",  name: "Snowflake Inc.",          exchange: "NYSE",   asset_class: "stock", emoji: "❄️", sector: "AI Software", session: "regular",  roles: ["dip"] }
   - { symbol: "NOW",   name: "ServiceNow Inc.",         exchange: "NYSE",   asset_class: "stock", emoji: "⏱️", sector: "AI Software", session: "regular",  roles: ["dip"] }
   - { symbol: "DDOG",  name: "Datadog Inc.",            exchange: "NASDAQ", asset_class: "stock", emoji: "🐕", sector: "AI Software", session: "regular",  roles: ["dip"] }
-  - { symbol: "CRWD",  name: "CrowdStrike Holdings",   exchange: "NASDAQ", asset_class: "stock", emoji: "🛡️", sector: "AI Software", session: "regular",  tags: ["Cybersecurity","AI-Native"], roles: ["dip"] }
   - { symbol: "APP",   name: "AppLovin Corp.",          exchange: "NASDAQ", asset_class: "stock", emoji: "📱", sector: "AI Software", session: "regular",  roles: ["dip"] }
   - { symbol: "DUOL",  name: "Duolingo Inc.",           exchange: "NASDAQ", asset_class: "stock", emoji: "🦉", sector: "AI Software", session: "regular",  roles: ["dip"] }
 
+
 # ───────────────────────────────────────────────────────────────────────────────
-# QUANTUM COMPUTING
+# CYBERSECURITY  (new sector — CRWD moved here from AI Software)
 # ───────────────────────────────────────────────────────────────────────────────
 
-  - { symbol: "IONQ",  name: "IonQ Inc.",               exchange: "NYSE",   asset_class: "stock", emoji: "⚛️", sector: "Quantum", session: "regular",  roles: ["intel","brief","dip"] }
-  - { symbol: "RGTI",  name: "Rigetti Computing",       exchange: "NASDAQ", asset_class: "stock", emoji: "🧪", sector: "Quantum", session: "regular",  roles: ["intel","brief","dip"] }
-  - { symbol: "QBTS",  name: "D-Wave Quantum",          exchange: "NYSE",   asset_class: "stock", emoji: "🔬", sector: "Quantum", session: "regular",  roles: ["intel","brief","dip"] }
-  - { symbol: "QUBT",  name: "Quantum Computing Inc.",  exchange: "NASDAQ", asset_class: "stock", emoji: "🧲", sector: "Quantum", session: "regular",  roles: ["intel","brief","dip"] }
-  # QUBT: emoji changed 🔬→🧲 (🔬 shared with QBTS); roles aligned with peer quantum names
+  - { symbol: "CRWD",  name: "CrowdStrike Holdings",    exchange: "NASDAQ", asset_class: "stock", emoji: "🛡️", sector: "Cybersecurity", session: "regular",  tags: ["AI-Native"], roles: ["intel","brief","dip"] }
+  # CRWD promoted to intel+brief as sector lead now that Cybersecurity is its own sector
+  - { symbol: "PANW",  name: "Palo Alto Networks",      exchange: "NASDAQ", asset_class: "stock", emoji: "🔒", sector: "Cybersecurity", session: "regular",  roles: ["intel","brief","dip"] }
+  - { symbol: "S",     name: "SentinelOne Inc.",        exchange: "NYSE",   asset_class: "stock", emoji: "🕵️", sector: "Cybersecurity", session: "regular",  roles: ["dip"] }
+  - { symbol: "ZS",    name: "Zscaler Inc.",            exchange: "NASDAQ", asset_class: "stock", emoji: "🔐", sector: "Cybersecurity", session: "regular",  roles: ["dip"] }
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# QUANTUM COMPUTING  (high-beta — loosened dip thresholds)
+# ───────────────────────────────────────────────────────────────────────────────
+
+  - symbol: "IONQ"
+    name: "IonQ Inc."
+    exchange: "NYSE"
+    asset_class: "stock"
+    emoji: "⚛️"
+    sector: "Quantum"
+    session: "regular"
+    roles: ["intel","brief","dip"]
+    dip_overrides:
+      rsi_max: 48
+      drop_1d_max: -4.0
+      drop_5d_max: -10.0
+      max_loss_pct: 15.0
+
+  - symbol: "RGTI"
+    name: "Rigetti Computing"
+    exchange: "NASDAQ"
+    asset_class: "stock"
+    emoji: "🧪"
+    sector: "Quantum"
+    session: "regular"
+    roles: ["intel","brief","dip"]
+    dip_overrides:
+      rsi_max: 48
+      drop_1d_max: -5.0
+      drop_5d_max: -12.0
+      max_loss_pct: 20.0
+
+  - symbol: "QBTS"
+    name: "D-Wave Quantum"
+    exchange: "NYSE"
+    asset_class: "stock"
+    emoji: "🔬"
+    sector: "Quantum"
+    session: "regular"
+    roles: ["intel","brief","dip"]
+    dip_overrides:
+      rsi_max: 48
+      drop_1d_max: -5.0
+      drop_5d_max: -12.0
+      max_loss_pct: 20.0
+
+  - symbol: "QUBT"
+    name: "Quantum Computing Inc."
+    exchange: "NASDAQ"
+    asset_class: "stock"
+    emoji: "🧲"
+    sector: "Quantum"
+    session: "regular"
+    roles: ["intel","brief","dip"]
+    dip_overrides:
+      rsi_max: 50         # most speculative of the group
+      drop_1d_max: -6.0
+      drop_5d_max: -15.0
+      max_loss_pct: 25.0
+
+  - symbol: "QTUM"
+    name: "Defiance Quantum ETF"
+    exchange: "NYSE"
+    asset_class: "etf"
+    emoji: "🌀"
+    sector: "Quantum"
+    session: "regular"
+    tags: ["Sector-Benchmark"]
+    roles: ["intel","brief"]
+    # Best liquid benchmark for Quantum sector bleed signals.
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # NUCLEAR / ENERGY
@@ -178,77 +399,260 @@ universe:
 
   - { symbol: "OKLO",  name: "Oklo Inc.",               exchange: "NYSE",   asset_class: "stock", emoji: "☢️", sector: "Nuclear / Energy", session: "regular",  roles: ["intel","brief","dip"] }
   - { symbol: "CEG",   name: "Constellation Energy",    exchange: "NASDAQ", asset_class: "stock", emoji: "⚡", sector: "Nuclear / Energy", session: "regular",  roles: ["dip"] }
-  # CEG emoji kept ⚡ here; AMD's ⚡ was changed to 🔴 to resolve the conflict
   - { symbol: "VST",   name: "Vistra Corp.",            exchange: "NYSE",   asset_class: "stock", emoji: "🔌", sector: "Nuclear / Energy", session: "regular",  roles: ["dip"] }
   - { symbol: "SMR",   name: "NuScale Power",           exchange: "NYSE",   asset_class: "stock", emoji: "🏗️", sector: "Nuclear / Energy", session: "regular",  roles: ["dip"] }
-  # SMR emoji changed ⚛️→🏗️ (⚛️ shared with IONQ)
   - { symbol: "NNE",   name: "Nano Nuclear Energy",     exchange: "NASDAQ", asset_class: "stock", emoji: "🌡️", sector: "Nuclear / Energy", session: "regular",  roles: ["dip"] }
-  # NNE emoji changed ☢️→🌡️ (☢️ shared with OKLO)
+
+  - symbol: "URNM"
+    name: "Sprott Uranium Miners ETF"
+    exchange: "NYSE"
+    asset_class: "etf"
+    emoji: "☀️"
+    sector: "Nuclear / Energy"
+    session: "regular"
+    tags: ["Uranium","Sector-Benchmark"]
+    roles: ["intel","brief"]
+    # Uranium miners bleed anchor. Signals when uranium spot price moves
+    # before individual nuclear names react.
+
 
 # ───────────────────────────────────────────────────────────────────────────────
-# CRYPTO-ADJ  (crypto-correlated equities — treasury, exchange, fintech)
-# Previously: MSTR + COIN were incorrectly in "Crypto Mining" sector.
-# Bleed math grouped them with pure miners (MARA/RIOT/IREN) — misleading.
+# SPACE  (new sector)
+# ───────────────────────────────────────────────────────────────────────────────
+
+  - symbol: "RKLB"
+    name: "Rocket Lab USA"
+    exchange: "NASDAQ"
+    asset_class: "stock"
+    emoji: "🚀"
+    sector: "Space"
+    session: "regular"
+    roles: ["intel","brief","dip"]
+    dip_overrides:
+      rsi_max: 48         # high-beta small-cap
+      drop_1d_max: -4.0
+      drop_5d_max: -10.0
+      max_loss_pct: 15.0
+
+  - symbol: "LUNR"
+    name: "Intuitive Machines"
+    exchange: "NASDAQ"
+    asset_class: "stock"
+    emoji: "🌙"
+    sector: "Space"
+    session: "regular"
+    roles: ["intel","brief","dip"]
+    dip_overrides:
+      rsi_max: 50         # very high volatility small-cap
+      drop_1d_max: -6.0
+      drop_5d_max: -15.0
+      max_loss_pct: 25.0
+
+  - symbol: "NASA"
+    name: "Tema Space Innovators ETF"
+    exchange: "NYSE"
+    asset_class: "etf"
+    emoji: "🛸"
+    sector: "Space"
+    session: "regular"
+    tags: ["SpaceX-Exposure","Sector-Benchmark"]
+    roles: ["intel","brief"]
+    # Only space ETF with SpaceX exposure (via SPV ~10% weight).
+    # SpaceX slice valued at transaction cost — appears flat in daily NAV
+    # until SpaceX IPO (expected mid-2026) or Tema transacts.
+    # Launched 2026-03-30. ~$1.3B AUM. Largest space ETF by AUM.
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# DATA CENTER  (new sector — AI infra REITs)
+# ───────────────────────────────────────────────────────────────────────────────
+
+  - symbol: "EQIX"
+    name: "Equinix Inc."
+    exchange: "NASDAQ"
+    asset_class: "stock"
+    emoji: "🏢"
+    sector: "Data Center"
+    session: "regular"
+    tags: ["REIT","AI-Infra"]
+    roles: ["intel","brief","dip"]
+    dip_overrides:
+      rsi_max: 38         # REIT — low-beta, real dips are shallower
+      drop_1d_max: -1.5
+      drop_5d_max: -3.5
+      max_loss_pct: 6.0
+
+  - symbol: "DLR"
+    name: "Digital Realty Trust"
+    exchange: "NYSE"
+    asset_class: "stock"
+    emoji: "🖥️"
+    sector: "Data Center"
+    session: "regular"
+    tags: ["REIT","AI-Infra"]
+    roles: ["intel","brief","dip"]
+    dip_overrides:
+      rsi_max: 38
+      drop_1d_max: -1.5
+      drop_5d_max: -3.5
+      max_loss_pct: 6.0
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CRYPTO-ADJ  (crypto-correlated equities)
 # ───────────────────────────────────────────────────────────────────────────────
 
   - { symbol: "MSTR",  name: "MicroStrategy",           exchange: "NASDAQ", asset_class: "stock", emoji: "🏦",  sector: "Crypto-Adj", session: "regular",  tags: ["BTC Treasury"], roles: ["dip"] }
-  # MSTR emoji changed ₿→🏦 (₿ shared with BTC-USD); sector corrected Mining→Crypto-Adj
   - { symbol: "COIN",  name: "Coinbase Global",         exchange: "NASDAQ", asset_class: "stock", emoji: "🏛️",  sector: "Crypto-Adj", session: "regular",  tags: ["Exchange"], roles: ["dip"] }
-  # COIN emoji changed 🪙→🏛️ (🪙 shared with IREN/AXP); sector corrected Mining→Crypto-Adj
-  - { symbol: "SOFI",  name: "SoFi Technologies",       exchange: "NASDAQ", asset_class: "stock", emoji: "📊",  sector: "Crypto-Adj", session: "regular",  tags: ["Fintech","Crypto-Adj"], roles: ["intel","brief","dip"] }
-  # SOFI emoji changed 🏦→📊 (🏦 now used by MSTR); moved from Fintech → Crypto-Adj for bleed accuracy
-  - { symbol: "HOOD",  name: "Robinhood Markets",       exchange: "NASDAQ", asset_class: "stock", emoji: "🏹",  sector: "Crypto-Adj", session: "regular",  tags: ["Fintech","Crypto-Adj"], roles: ["dip"] }
+  - { symbol: "SOFI",  name: "SoFi Technologies",       exchange: "NASDAQ", asset_class: "stock", emoji: "📊",  sector: "Crypto-Adj", session: "regular",  tags: ["Fintech"], roles: ["intel","brief","dip"] }
+  - { symbol: "HOOD",  name: "Robinhood Markets",       exchange: "NASDAQ", asset_class: "stock", emoji: "🏹",  sector: "Crypto-Adj", session: "regular",  tags: ["Fintech"], roles: ["dip"] }
+  # IBIT also in Crypto-Adj — listed under Crypto section above
+
 
 # ───────────────────────────────────────────────────────────────────────────────
-# CRYPTO MINING  (pure miners and data center miners)
+# CRYPTO MINING  (high-beta — loosened dip thresholds)
 # ───────────────────────────────────────────────────────────────────────────────
 
-  - { symbol: "IREN",  name: "IREN Limited",            exchange: "NASDAQ", asset_class: "stock", emoji: "🪙", sector: "Crypto Mining", session: "regular",  tags: ["Data Center"], roles: ["intel","brief","dip"] }
-  - { symbol: "MARA",  name: "MARA Holdings",           exchange: "NASDAQ", asset_class: "stock", emoji: "⛏️", sector: "Crypto Mining", session: "regular",  roles: ["dip"] }
-  - { symbol: "RIOT",  name: "Riot Platforms",          exchange: "NASDAQ", asset_class: "stock", emoji: "🪨", sector: "Crypto Mining", session: "regular",  roles: ["dip"] }
-  # RIOT emoji changed ⛏️→🪨 (⛏️ shared with MARA)
+  - symbol: "IREN"
+    name: "IREN Limited"
+    exchange: "NASDAQ"
+    asset_class: "stock"
+    emoji: "⛏️"
+    sector: "Crypto Mining"
+    session: "regular"
+    tags: ["Data Center"]
+    roles: ["intel","brief","dip"]
+    dip_overrides:
+      rsi_max: 48
+      drop_1d_max: -4.0
+      drop_5d_max: -10.0
+      max_loss_pct: 15.0
+
+  - symbol: "MARA"
+    name: "MARA Holdings"
+    exchange: "NASDAQ"
+    asset_class: "stock"
+    emoji: "🪨"
+    sector: "Crypto Mining"
+    session: "regular"
+    roles: ["dip"]
+    dip_overrides:
+      rsi_max: 48
+      drop_1d_max: -5.0
+      drop_5d_max: -12.0
+      max_loss_pct: 20.0
+
+  - symbol: "RIOT"
+    name: "Riot Platforms"
+    exchange: "NASDAQ"
+    asset_class: "stock"
+    emoji: "⚙️"
+    sector: "Crypto Mining"
+    session: "regular"
+    roles: ["dip"]
+    dip_overrides:
+      rsi_max: 48
+      drop_1d_max: -5.0
+      drop_5d_max: -12.0
+      max_loss_pct: 20.0
+
 
 # ───────────────────────────────────────────────────────────────────────────────
-# FINTECH  (pure payment rails and lending — crypto-adj stocks moved above)
+# FINTECH  (payment rails + neobanks)
 # ───────────────────────────────────────────────────────────────────────────────
 
-  - { symbol: "JPM",   name: "JPMorgan Chase",          exchange: "NYSE",   asset_class: "stock", emoji: "🏢", sector: "Fintech", session: "regular",  roles: ["dip"] }
-  # JPM emoji changed 🏦→🏢 (🏦 now used by MSTR)
+  - symbol: "JPM"
+    name: "JPMorgan Chase"
+    exchange: "NYSE"
+    asset_class: "stock"
+    emoji: "🏒"
+    sector: "Fintech"
+    session: "regular"
+    roles: ["dip"]
+    dip_overrides:
+      rsi_max: 38         # large-cap bank — low-beta
+      drop_1d_max: -1.5
+      drop_5d_max: -3.5
+
   - { symbol: "V",     name: "Visa Inc.",               exchange: "NYSE",   asset_class: "stock", emoji: "💳", sector: "Fintech", session: "regular",  roles: ["dip"] }
-  - { symbol: "MA",    name: "Mastercard Inc.",         exchange: "NYSE",   asset_class: "stock", emoji: "💴", sector: "Fintech", session: "regular",  roles: ["dip"] }
-  # MA emoji changed 💳→💴 (💳 shared with V)
-  - { symbol: "AXP",   name: "American Express",        exchange: "NYSE",   asset_class: "stock", emoji: "💵", sector: "Fintech", session: "regular",  roles: ["dip"] }
-  # AXP emoji changed 🪙→💵 (🪙 shared with IREN)
-  # NOTE: JPM/V/MA/AXP moved from "Financials" into "Fintech" so sector has
-  #       ≥ 2 members. "Financials" sector removed — was duplicate grouping.
+  - { symbol: "MA",    name: "Mastercard Inc.",          exchange: "NYSE",   asset_class: "stock", emoji: "💴", sector: "Fintech", session: "regular",  roles: ["dip"] }
+  - { symbol: "AXP",   name: "American Express",         exchange: "NYSE",   asset_class: "stock", emoji: "💵", sector: "Fintech", session: "regular",  roles: ["dip"] }
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # HEALTHCARE / PHARMA / BIOTECH
 # ───────────────────────────────────────────────────────────────────────────────
 
-  - { symbol: "LLY",   name: "Eli Lilly and Co.",       exchange: "NYSE",   asset_class: "stock", emoji: "💊", sector: "Healthcare", session: "regular",  roles: ["dip"] }
-  - { symbol: "NVO",   name: "Novo Nordisk ADR",        exchange: "NYSE",   asset_class: "stock", emoji: "💉", sector: "Healthcare", session: "regular",  roles: ["intel","brief","dip"] }
+  - { symbol: "LLY",   name: "Eli Lilly and Co.",        exchange: "NYSE",   asset_class: "stock", emoji: "💊", sector: "Healthcare", session: "regular",  roles: ["dip"] }
+  - { symbol: "NVO",   name: "Novo Nordisk ADR",          exchange: "NYSE",   asset_class: "stock", emoji: "💉", sector: "Healthcare", session: "regular",  roles: ["intel","brief","dip"] }
   - { symbol: "REGN",  name: "Regeneron Pharmaceuticals", exchange: "NASDAQ", asset_class: "stock", emoji: "🧬", sector: "Healthcare", session: "regular",  roles: ["dip"] }
-  - { symbol: "WGRX",  name: "Wellgistics Health",      exchange: "NASDAQ", asset_class: "stock", emoji: "🩺", sector: "Healthcare", session: "regular",  roles: ["intel","brief"] }
-  # WGRX emoji changed 💊→🩺 (💊 shared with LLY); no dip role (thin history, micro-cap)
+  - { symbol: "WGRX",  name: "Wellgistics Health",        exchange: "NASDAQ", asset_class: "stock", emoji: "🩺", sector: "Healthcare", session: "regular",  roles: ["intel","brief"] }
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # CONSUMER / RETAIL
 # ───────────────────────────────────────────────────────────────────────────────
 
-  - { symbol: "SHOP",  name: "Shopify Inc.",            exchange: "NYSE",   asset_class: "stock", emoji: "🛍️", sector: "Consumer", session: "regular",  roles: ["dip"] }
-  - { symbol: "UBER",  name: "Uber Technologies",       exchange: "NYSE",   asset_class: "stock", emoji: "🚗", sector: "Consumer", session: "regular",  roles: ["dip"] }
-  - { symbol: "SPOT",  name: "Spotify Technology",      exchange: "NYSE",   asset_class: "stock", emoji: "🎵", sector: "Consumer", session: "regular",  roles: ["dip"] }
-  - { symbol: "COST",  name: "Costco Wholesale",        exchange: "NASDAQ", asset_class: "stock", emoji: "🏪", sector: "Consumer", session: "regular",  roles: ["dip"] }
-  - { symbol: "CAVA",  name: "CAVA Group",              exchange: "NYSE",   asset_class: "stock", emoji: "🫒", sector: "Consumer", session: "regular",  roles: ["dip"] }
+  - { symbol: "SHOP",  name: "Shopify Inc.",             exchange: "NYSE",   asset_class: "stock", emoji: "🛍️", sector: "Consumer", session: "regular",  roles: ["dip"] }
+  - { symbol: "UBER",  name: "Uber Technologies",        exchange: "NYSE",   asset_class: "stock", emoji: "🚗", sector: "Consumer", session: "regular",  roles: ["dip"] }
+  - { symbol: "SPOT",  name: "Spotify Technology",       exchange: "NYSE",   asset_class: "stock", emoji: "🎵", sector: "Consumer", session: "regular",  roles: ["dip"] }
+  - { symbol: "COST",  name: "Costco Wholesale",         exchange: "NASDAQ", asset_class: "stock", emoji: "🏪", sector: "Consumer", session: "regular",  roles: ["dip"] }
+  - { symbol: "CAVA",  name: "CAVA Group",               exchange: "NYSE",   asset_class: "stock", emoji: "🫒", sector: "Consumer", session: "regular",  roles: ["dip"] }
+
 
 # ───────────────────────────────────────────────────────────────────────────────
-# MATERIALS  (≥ 2 members required for bleed math)
+# MATERIALS
 # ───────────────────────────────────────────────────────────────────────────────
 
-  - { symbol: "UAMY",  name: "United States Antimony",  exchange: "NYSE",   asset_class: "stock", emoji: "⚒️", sector: "Materials", session: "regular",  roles: ["intel","brief"] }
-  - { symbol: "MP",    name: "MP Materials",            exchange: "NYSE",   asset_class: "stock", emoji: "⛰️", sector: "Materials", session: "regular",  roles: ["intel","brief"] }
-  # MP added: rare earth miner; natural bleed pair for UAMY (both critical minerals)
+  - { symbol: "UAMY",  name: "United States Antimony",   exchange: "NYSE",   asset_class: "stock", emoji: "⚒️", sector: "Materials", session: "regular",  roles: ["intel","brief"] }
+  - { symbol: "MP",    name: "MP Materials",             exchange: "NYSE",   asset_class: "stock", emoji: "⛰️", sector: "Materials", session: "regular",  roles: ["intel","brief"] }
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CANADA  (TSX-listed, CAD-denominated — REQUIRES ".TO" suffix for yfinance)
+#
+# session: regular maps to TSX hours 09:30–16:00 ET (same as NYSE/NASDAQ).
+# These are macro/bleed signals for the Canadian market. Low-beta — dip
+# thresholds tightened accordingly. No dip role (broad ETFs don't dip-buy).
+# ───────────────────────────────────────────────────────────────────────────────
+
+  - symbol: "XIU.TO"
+    name: "iShares S&P/TSX 60 Index ETF"
+    exchange: "TSX"
+    asset_class: "etf"
+    emoji: "🍁"
+    sector: "Canada"
+    session: "regular"
+    tags: ["TSX","Canadian-Blue-Chip","Sector-Benchmark"]
+    roles: ["intel","brief"]
+    # Canada's largest and most liquid ETF. Top 60 TSX stocks.
+    # Heavy financials (~35%) + energy. Best bleed signal for Canadian market.
+    # MER 0.18%. Pays quarterly dividends ~3% yield.
+
+  - symbol: "XIC.TO"
+    name: "iShares Core S&P/TSX Capped Composite ETF"
+    exchange: "TSX"
+    asset_class: "etf"
+    emoji: "🌲"
+    sector: "Canada"
+    session: "regular"
+    tags: ["TSX","Broad-Market"]
+    roles: ["intel","brief"]
+    # Broader than XIU.TO — ~240 stocks across large, mid, small cap.
+    # MER 0.06%. Better breadth signal; XIU.TO better for liquidity/trading.
+
+  - symbol: "ZEB.TO"
+    name: "BMO Equal Weight Banks Index ETF"
+    exchange: "TSX"
+    asset_class: "etf"
+    emoji: "🏧"
+    sector: "Canada"
+    session: "regular"
+    tags: ["TSX","Canadian-Banks"]
+    roles: ["intel","brief"]
+    # Equal-weight exposure to all 6 Canadian Big Banks (RBC, TD, BNS, BMO,
+    # CIBC, National Bank). Bleed signal for Canadian financials.
+    # MER ~0.28%. Yield ~2.9%.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -256,143 +660,176 @@ universe:
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Loader rejects any universe entry whose sector is not in this list.
-# Every sector listed here must have ≥ 2 universe members for bleed/leadership
-# math to produce meaningful signals. Sectors with 1 member will still alert
-# on intel/brief but bleed correlations will be suppressed by the scanner.
+# Every sector needs ≥ 2 members for bleed/leadership math.
+# Sectors with 1 member still alert on intel/brief; bleed suppressed.
 #
-# To add a sector: add it here AND ensure ≥ 2 stocks reference it.
-# To remove a sector: remove all universe entries first, then remove from here.
+# To add a sector: add here AND add ≥ 2 universe entries.
+# To remove a sector: remove all universe entries first.
 #
 # ═══════════════════════════════════════════════════════════════════════════════
 sectors_canonical:
-  - "Crypto"          # BTC, ETH, XRP
-  - "Crypto Mining"   # IREN, MARA, RIOT
-  - "Crypto-Adj"      # MSTR, COIN, SOFI, HOOD  (crypto-correlated equities)
-  - "Safe Haven"      # GC=F, SLV
-  - "Mega Tech"       # AAPL, MSFT, GOOGL, META, AMZN
-  - "AI / Semis"      # NVDA, AMD, MU, TSM, ASML, AVGO, MRVL, ARM, ANET, SMCI, SNDK, NBIS
-  - "AI Software"     # PLTR, CRM, ADBE, ORCL, SNOW, NOW, DDOG, CRWD, APP, DUOL
-  - "Quantum"         # IONQ, RGTI, QBTS, QUBT
-  - "Nuclear / Energy" # OKLO, CEG, VST, SMR, NNE
-  - "Fintech"         # JPM, V, MA, AXP, SOFI*, HOOD*  (*also Crypto-Adj)
-  - "EV / Auto"       # TSLA, RIVN
-  - "Streaming"       # NFLX, DIS
-  - "Healthcare"      # LLY, NVO, REGN, WGRX
-  - "Consumer"        # SHOP, UBER, SPOT, COST, CAVA
-  - "Materials"       # UAMY, MP
+  - "Crypto"             # BTC-USD, ETH-USD, XRP-USD
+  - "Crypto Mining"      # IREN, MARA, RIOT
+  - "Crypto-Adj"         # MSTR, COIN, SOFI, HOOD, IBIT
+  - "Safe Haven"         # GC=F, SLV
+  - "Mega Tech"          # AAPL, MSFT, GOOGL, META, AMZN
+  - "AI / Semis"         # NVDA, AMD, MU, TSM, ASML, AVGO, MRVL, ARM, ANET, SMCI, SNDK, NBIS, SOXX, DRAM
+  - "AI Software"        # PLTR, CRM, ADBE, ORCL, SNOW, NOW, DDOG, APP, DUOL
+  - "Cybersecurity"      # CRWD, PANW, S, ZS
+  - "Quantum"            # IONQ, RGTI, QBTS, QUBT, QTUM
+  - "Nuclear / Energy"   # OKLO, CEG, VST, SMR, NNE, URNM
+  - "Space"              # RKLB, LUNR, NASA
+  - "Data Center"        # EQIX, DLR
+  - "Fintech"            # JPM, V, MA, AXP
+  - "EV / Auto"          # TSLA, RIVN
+  - "Streaming"          # NFLX, DIS
+  - "Healthcare"         # LLY, NVO, REGN, WGRX
+  - "Consumer"           # SHOP, UBER, SPOT, COST, CAVA
+  - "Materials"          # UAMY, MP
+  - "Canada"             # XIU.TO, XIC.TO, ZEB.TO
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SCANNER SETTINGS
 # ═══════════════════════════════════════════════════════════════════════════════
-#
-# Applied at startup by the loader. Any key not present falls back to the
-# dataclass default in code. All thresholds are percentages unless noted.
-#
-# ═══════════════════════════════════════════════════════════════════════════════
 settings:
 
   intel:
-    big_drop_warn:        -5.0    # % intraday drop → WARN alert
-    big_drop_critical:   -10.0    # % intraday drop → CRITICAL alert
+    big_drop_warn:        -5.0    # % intraday drop → WARN
+    big_drop_critical:   -10.0    # % intraday drop → CRITICAL
     big_gain_alert:        8.0    # % intraday gain → alert
-    cooldown_hours:        4      # min hours between repeat alerts per symbol
-    sector_bleed_cooldown: 4      # min hours between sector bleed alerts
-    leadership_cooldown:   3      # min hours between sector leadership alerts
+    cooldown_hours:        4
+    sector_bleed_cooldown: 4
+    leadership_cooldown:   3
 
   brief:
-    morning_window:  ["08:45", "12:00"]   # ET — digest sent once in this window
-    evening_window:  ["16:15", "20:00"]   # ET — digest sent once in this window
+    morning_window:  ["08:45", "12:00"]   # ET
+    evening_window:  ["16:15", "20:00"]   # ET
     fetch_workers:   5
 
   dip_scanner:
-    rsi_min:        25      # RSI floor — below this is potential capitulation, not dip
-    rsi_max:        42      # RSI ceiling — was 48 (too high; caught noise, not real dips)
-    drop_1d_max:    -2.0    # min 1-day drop % to qualify — was -1.5 (too shallow for vol stocks)
+    # ── Global defaults (apply when no dip_overrides on the entry) ───────────
+    rsi_min:        25      # below = capitulation, not dip
+    rsi_max:        42      # was 48 in v3; tightened — catches real dips not noise
+    drop_1d_max:    -2.0    # min 1-day drop % to qualify
     drop_5d_max:    -4.0    # min 5-day drop % to qualify
-    ath_min:        -30.0   # must be within 30% of ATH (filters structural downtrends)
-    vol_ratio_min:   0.6    # current vol / avg vol — screens out dead-air dips
-    cooldown_hours:  8      # was 4 — raised to reduce dip alert spam
+    ath_min:        -30.0   # must be within 30% of ATH
+    vol_ratio_min:   0.6    # current vol / avg vol
+    cooldown_hours:  8
     fetch_workers:   5
-    max_loss_pct:    8.0    # max drawdown from entry before stop-loss flag
+    max_loss_pct:    8.0
+
+    # ── Volatility tier presets (REFERENCE ONLY — not parsed by loader) ──────
+    # These document the dip_overrides values used on high/low-beta entries.
+    # Copy the appropriate block into a universe entry's dip_overrides field.
+    # The loader reads dip_overrides per-entry; this block is for human reference.
+    #
+    # dip_tiers:
+    #   high_beta:            # Quantum, Crypto Mining, EV/Auto, Space small-caps
+    #     rsi_max:       48
+    #     drop_1d_max:  -4.0
+    #     drop_5d_max: -10.0
+    #     max_loss_pct: 15.0
+    #
+    #   very_high_beta:       # Most speculative (QUBT, LUNR, RGTI, RIOT, MARA)
+    #     rsi_max:       50
+    #     drop_1d_max:  -6.0
+    #     drop_5d_max: -15.0
+    #     max_loss_pct: 25.0
+    #
+    #   low_beta:             # REITs, large-cap banks, Safe Haven ETFs
+    #     rsi_max:       38
+    #     drop_1d_max:  -1.5
+    #     drop_5d_max:  -3.5
+    #     max_loss_pct:  6.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PROMPT FOR FUTURE IMPROVEMENTS  (copy into a new chat to continue this work)
+# PROMPT FOR FUTURE IMPROVEMENTS  (paste into a new chat to continue this work)
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # You are working on AlphaEdge, a multi-scanner stock/crypto alerting system.
-# The file above is `universe.yaml` v4.0 — the single source of truth for all
-# scanners (intel, brief, dip). It has been fully audited. Here is the current
-# state and what to tackle next:
+# The file above is `universe.yaml` v5.0. Here is the full state of what has
+# been done and what remains.
 #
-# WHAT WAS FIXED IN v4.0 (don't redo these):
-#   - All 11 duplicate emoji conflicts resolved with unique glyphs
-#   - MSTR + COIN moved from "Crypto Mining" → "Crypto-Adj" sector
-#   - EV/Auto, Streaming, Safe Haven, Materials each had 1 member (bleed math
-#     undefined) → added RIVN, DIS, SLV, MP to fix
-#   - SNDK name cleaned; spin status moved to tags
-#   - QUBT roles aligned with peer quantum names
-#   - AVGO + TSM promoted to intel+brief
-#   - dip_scanner thresholds tightened (rsi_max 48→42, drop_1d -1.5→-2.0)
-#   - "Financials" sector eliminated; JPM/V/MA/AXP merged into Fintech
-#   - "Crypto-Adj" added to sectors_canonical
+# WHAT IS DONE — DO NOT REDO:
+#   v4.0  11 duplicate emoji conflicts fixed. MSTR/COIN sector corrected to
+#         Crypto-Adj. Singleton sectors patched. dip_scanner thresholds
+#         tightened. "Financials" sector eliminated.
+#   v5.0  New sectors: Cybersecurity, Space, Data Center, Canada.
+#         asset_class "etf" added with validation rule (ETFs → no dip role
+#         by default; TSX ETFs must use ".TO" suffix).
+#         ETFs added: DRAM, NASA, SOXX, IBIT, URNM, QTUM, SLV.
+#         Canadian ETFs added: XIU.TO, XIC.TO, ZEB.TO.
+#         CRWD moved to Cybersecurity sector; PANW, S, ZS added.
+#         RKLB, LUNR added to Space; NASA ETF anchors the sector.
+#         EQIX, DLR added as Data Center REIT sector.
+#         Per-entry dip_overrides on all high-beta and low-beta names.
+#         dip_tiers reference presets documented in settings.
 #
-# NEXT PRIORITIES TO WORK ON:
+# NEXT PRIORITIES:
 #
-# 1. VOLATILITY-ADJUSTED DIP THRESHOLDS
-#    The dip_scanner uses flat thresholds for all stocks. A -2% move on NVDA
-#    is noise; the same on COST is a real dip. Implement per-sector or per-tier
-#    volatility multipliers. Proposed: add optional `dip_overrides` block per
-#    stock (rsi_max, drop_1d_max, drop_5d_max). High-beta sectors (Quantum,
-#    Crypto Mining, EV/Auto) warrant looser thresholds.
+# 1. SCHEMA VALIDATION SCRIPT  (highest priority — prevents regressions)
+#    Write `validate_universe.py` that enforces ALL rules in VALIDATION RULES:
+#      - Emoji globally unique
+#      - Sector in sectors_canonical
+#      - Sector member count ≥ 2
+#      - "brief" requires "intel"
+#      - crypto/commodity → session = "24h"
+#      - etf asset_class → no dip role (unless explicitly tagged dip_ok: true)
+#      - TSX ETF → symbol ends in ".TO"
+#      - dip_overrides keys are valid dip_scanner param names
+#    Gate deploys on this script passing. Suggest running as pre-commit hook.
 #
 # 2. TIER / PRIORITY SYSTEM
-#    Add a `tier: 1|2|3` field to each universe entry. Tier 1 = core conviction
-#    (NVDA, AAPL, BTC, etc.), Tier 2 = secondary, Tier 3 = speculative/micro.
-#    Scanners can use tier to: throttle Tier 3 alert frequency, suppress Tier 3
-#    from brief digest, or weight bleed/leadership math by tier.
+#    Add `tier: 1|2|3` to each entry. Tier 1 = core (NVDA, BTC, AAPL).
+#    Tier 2 = secondary. Tier 3 = speculative/micro/new.
+#    Scanners use tier to: throttle Tier 3 frequency, suppress from brief,
+#    weight bleed math. Tier 3 should still fire intel alerts — just less often.
 #
-# 3. MIN MARKET CAP GUARD
-#    UAMY (~$50M) and WGRX (small-cap) can generate noisy intel alerts on thin
-#    volume. Add `min_market_cap_m` to dip_scanner settings (e.g. 500) and a
-#    per-entry `market_cap_exempt: true` flag for intentional small-cap coverage.
-#
-# 4. SCHEMA VALIDATION SCRIPT
-#    Write `validate_universe.py` that loads this YAML and enforces ALL rules
-#    listed in the VALIDATION RULES section at the top, including:
-#      - Emoji uniqueness across entire universe
-#      - Sector membership count ≥ 2
-#      - "brief" requires "intel"
-#      - session consistency with asset_class
-#      - No unknown sector names
-#    Run this in CI/pre-commit so bad edits are caught before deploy.
-#
-# 5. SNDK DIP READINESS
-#    SNDK has no dip role because price history is thin post-spin (2024).
-#    Add a `active_from: "YYYY-MM-DD"` field so the loader can automatically
-#    promote entries to dip role once sufficient history exists (e.g. 252 trading
-#    days / 1 year). Same pattern would apply to any future IPO/spin additions.
-#
-# 6. SECTOR BLEED MATH REVIEW
-#    With "Financials" merged into "Fintech", that sector now has 6 members
-#    (JPM, V, MA, AXP, SOFI, HOOD) with very different beta profiles. Consider
-#    whether bleed signals from JPM (large-cap bank) to HOOD (crypto-adj retail
-#    broker) are meaningful, or if the sector should be split further:
+# 3. SECTOR BLEED MATH REVIEW — FINTECH
+#    Fintech sector (JPM, V, MA, AXP) has very low intra-sector correlation.
+#    JPM moves on macro/rates; V/MA move on spend volume; AXP on premium consumer.
+#    Consider splitting:
 #      "Payment Rails" → V, MA, AXP
-#      "Fintech / Neobank" → JPM, SOFI, HOOD
+#      "Financials"    → JPM + 1-2 others (GS, BAC?)
+#    Need ≥ 2 members in each after split.
 #
-# 7. ADDITIONAL UNIVERSE CANDIDATES TO EVALUATE
-#    Cybersecurity (standalone sector): S (SentinelOne), PANW (Palo Alto),
-#      ZS (Zscaler) — currently CRWD is the only cyber stock, in AI Software
-#    Space: RKLB (Rocket Lab), LUNR (Intuitive Machines)
-#    AI Infra / Data Center REITs: EQIX, DLR
-#    Commodity expansion: SI=F (Silver futures as alternative to SLV ETF),
-#      CL=F (Crude oil — macro signal for energy sector)
+# 4. MIN MARKET CAP GUARD
+#    UAMY (~$50M) and WGRX generate noisy intel alerts on thin volume.
+#    Add `min_market_cap_m` to dip_scanner settings (suggest: 200).
+#    Add per-entry `market_cap_exempt: true` for intentional small-cap coverage.
+#
+# 5. ACTIVE_FROM DATE FOR NEW / SPINOFF ENTRIES
+#    SNDK has no dip role (thin post-spin history). Add `active_from: "YYYY-MM-DD"`
+#    so the loader auto-promotes to dip role after e.g. 252 trading days (~1 year).
+#    Same pattern for NASA, DRAM, RKLB, LUNR — all launched in 2026.
+#
+# 6. SPACEX IPO READINESS
+#    NASA ETF holds SpaceX via SPV (~10% weight). SpaceX IPO expected mid-2026.
+#    When SpaceX lists: add SPCE (or whatever ticker) to Space sector.
+#    NASA's SPV converts to freely traded shares post-lockup (~6 months post-IPO).
+#    Flag: the MARS ticker (Roundhill Space ETF) may compete with NASA for
+#    capital — monitor relative AUM flows as SpaceX IPO approaches.
+#
+# 7. CANADIAN ETF EXPANSION
+#    Current: XIU.TO (TSX 60), XIC.TO (broad market), ZEB.TO (banks).
+#    Consider adding:
+#      ZRE.TO  BMO Equal Weight REITs — real estate income signal
+#      XEI.TO  iShares High Dividend — dividend yield signal
+#      HXT.TO  Horizons S&P/TSX 60 (swap-based, 0.04% MER) — tax-efficient
+#               alternative to XIU.TO for bleed math
+#    All would go in the existing "Canada" sector.
+#
+# 8. DRAM ETF WATCH
+#    DRAM launched 2026-04-02. Only 7 weeks of price history as of v5.0.
+#    ATH-based dip logic will be unreliable for months. Re-evaluate adding
+#    dip role for DRAM around Q4 2026 once price history is sufficient.
+#    Also watch: Korea FX risk (~49% KRW exposure) — a KRW/USD move can
+#    distort DRAM NAV independently of memory stock prices.
 #
 # HOW TO USE THIS PROMPT:
-#   Paste this entire comment block (lines starting with #) into a new chat.
-#   Attach the full universe.yaml v4.0 file. Then specify which of the above
-#   priorities you want to work on, or say "start with #1" to go in order.
+#   Paste this entire comment block into a new chat. Attach universe.yaml v5.0.
+#   State which priority to work on, or say "start from #1" to go in order.
 #
 # ═══════════════════════════════════════════════════════════════════════════════
