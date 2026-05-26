@@ -163,20 +163,6 @@
   Multi-POC     compute_poc() returns the single highest-volume node.
                 Detecting secondary POC clusters (common in range markets)
                 is a future enhancement — see poc_hardened.py comments.
-────────────────────────────────────────────────────────────────────────────────
-REQUIRED FILES:
-────────────────────────────────────────────────────────────────────────────────
-  symbols.yaml       — watchlist config (see README for format)
-  requirements.txt   — add: pyyaml
-
-────────────────────────────────────────────────────────────────────────────────
-ENVIRONMENT VARIABLES:
-────────────────────────────────────────────────────────────────────────────────
-  TELEGRAM_TOKEN    (required)
-  CHAT_ID           (required)
-  GEMINI_API_KEY    (optional — enables AI analysis)
-
-═══════════════════════════════════════════════════════════════════════════════
 """
 
 # ═══════════════════════════════════════════════════════════════════════════════
