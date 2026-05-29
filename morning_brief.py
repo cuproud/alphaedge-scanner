@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║              ALPHAEDGE BRIEF v3.3 — UNIFIED MORNING + EVENING               ║
-║              Full audit, bug-fix & hardening pass — May 2026                ║
+║              ALPHAEDGE BRIEF v3.4 — UNIFIED MORNING + EVENING               ║
+║              DST double-fire fix & noise-reduction pass — May 2026          ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  PURPOSE                                                                     ║
 ║  Fires twice every weekday via cron or scheduler:                            ║
@@ -30,44 +30,43 @@
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  CHANGELOG                                                                   ║
 ║                                                                              ║
-║  v3.3 — Audit / Bug-Fix Pass (this file)                                   ║
-║  BUG FIXES                                                                   ║
-║   1. build_morning_brief(): `mmsg +=` typo → NameError whenever             ║
-║      avoid_list is non-empty. Fixed to `msg +=`.                            ║
-║   2. Late `import re` + `import requests` appeared mid-file inside the AI   ║
-║      section. Moved to top-of-file with all other stdlib imports.           ║
-║   3. collect_brief_data(): earnings_soon always appended session=None.      ║
-║      earnings_label() branches on 'BMO'/'AMC' — always silently hit the    ║
-║      fallback. Added TODO + explicit comment; doc'd as known limitation.    ║
-║   4. build_evening_brief() open_trades loop: float(t.get('entry', 0))      ║
-║      crashes when value is explicitly None (key present, value null).       ║
-║      Fixed: or 0.0 fallback applied after get() to handle None.            ║
-║   5. collect_brief_data() never called clear_caches() before parallel       ║
-║      get_full_context() calls — stale DataFrames from a prior run could     ║
-║      persist. Fixed: clear_caches() called at top of collect_brief_data(). ║
-║   6. compute_ah_movers(): no log/warn when no regular-hours bars found      ║
-║      (e.g. called before market open). Added debug log + early return.     ║
+║  v3.4 — DST Double-Fire Fix & Noise-Reduction Pass                         ║
+║  PROBLEM: The brief workflow has two cron entries per slot (e.g. 13:00 and  ║
+║  14:00 UTC for the morning brief) to cover both EDT and EST. During the      ║
+║  EDT season both jobs fire on the same ET calendar day. The v3.3 cooldown   ║
+║  was 23 h time-based, which failed to block the second job when they run    ║
+║  minutes apart (both see "no prior record" and both send).                  ║
 ║                                                                              ║
-║  CLEAN-UPS                                                                   ║
-║   7. Removed unused imports: field, calc_relative_strength,                 ║
-║      format_earnings_warning, H_RULE, SUB_RULE, save_json, STATE_FILE.     ║
-║   8. Removed redundant local MARKET_TZ / DISPLAY_TZ definitions —          ║
-║      already defined in market_intel and available via market_now() /       ║
-║      display_now().                                                          ║
-║   9. _sanitize_ai() local re-implementation removed; now imported directly  ║
-║      from market_intel (single source of truth).                            ║
-║  10. from market_intel import SESSION moved to top import block.            ║
-║  11. fetch_timeout in Config documented as currently unused (reserved for   ║
-║      future per-call timeout enforcement in _fetch_one).                    ║
-║  12. Section headers added throughout for Notepad++ code folding.           ║
-║  13. Prompt template appended at EOF for new-session context handoff.       ║
+║  FIX  Slot cooldown keys now include the ET calendar date:                  ║
+║         last_morning_brief:{YYYY-MM-DD}                                     ║
+║         last_evening_brief:{YYYY-MM-DD}                                     ║
+║       The second cron for the same slot finds the key already written and   ║
+║       exits immediately, regardless of how close together the two jobs run. ║
+║       Uses _daily_cool_key() imported from market_intel (same helper used   ║
+║       for intel big-move / sector-bleed / leadership dedup).                ║
+║       can_alert() called with hours=0 — any prior write for today's key     ║
+║       is sufficient to block; no time delta check needed.                   ║
+║                                                                              ║
+║  NEW  _brief_slot_key(kind) — helper that returns the daily-scoped state    ║
+║       key for a given brief slot ('morning' | 'evening').                   ║
+║                                                                              ║
+║  REMOVED  slot_cooldown_h field from Config — no longer used. Backward-     ║
+║       compat alias kept as a module-level constant for any external caller  ║
+║       that referenced it.                                                    ║
+║                                                                              ║
+║  v3.3 — Audit / Bug-Fix Pass                                                ║
+║   1. build_morning_brief(): mmsg += typo → NameError in avoid block        ║
+║   2. Late import re / import requests moved to top of file                  ║
+║   3. collect_brief_data(): earnings_soon always appended session=None       ║
+║   4. build_evening_brief(): float(t.get('entry', 0)) crashes on None       ║
+║   5. collect_brief_data() never called clear_caches()                       ║
+║   6. compute_ah_movers(): no log when no regular-hours bars found           ║
+║   7. Removed unused imports (field, calc_relative_strength, etc.)           ║
+║   8. Removed redundant local MARKET_TZ / DISPLAY_TZ definitions            ║
+║   9. _sanitize_ai() local re-implementation removed; imported from intel    ║
+║  10. from market_intel import SESSION moved to top import block             ║
 ║                                                                              ║
 ║  v3.2 — Alignment with market_intel v3.1 + symbols.yaml v3                 ║
-║   • Reads SYMBOL_META → company name + exchange in headers                  ║
-║   • Applies YAML_SETTINGS["brief"] overrides                                ║
-║   • Cooldown via market_intel.can_alert / mark_alert                        ║
-║   • Reuses SESSION, tg_escape, send_telegram from market_intel              ║
-║   • Pre-fetches earnings once per scan (central 12 h cache)                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -96,8 +95,6 @@ import yfinance as yf
 
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │ LOCAL IMPORTS — from market_intel                                       │
-# │ Unused imports removed (v3.3): field, calc_relative_strength,          │
-# │ format_earnings_warning, H_RULE, SUB_RULE, save_json, STATE_FILE       │
 # └─────────────────────────────────────────────────────────────────────────┘
 from market_intel import (
     # Data & universe
@@ -122,10 +119,12 @@ from market_intel import (
     market_now,
     # HTTP session (pooled, retrying) — reused for Gemini calls
     SESSION,
-    # Cache management — FIX v3.3: must be called before parallel fetch
+    # Cache management — must be called before parallel fetch
     clear_caches,
-    # AI text sanitiser — FIX v3.3: reuse instead of reimplementing locally
+    # AI text sanitiser — reuse instead of reimplementing locally
     _sanitize_ai,
+    # Daily cooldown key helper — used for brief slot dedup (v3.4)
+    _daily_cool_key,
 )
 
 
@@ -139,14 +138,11 @@ LOGS_DIR.mkdir(exist_ok=True)
 TRADES_FILE  = "active_trades.json"   # active position store (evening)
 HISTORY_FILE = "trade_history.json"   # closed trade log     (evening)
 
-# NOTE v3.3: MARKET_TZ / DISPLAY_TZ removed — already defined in market_intel
-# and available via market_now() / display_now(). Redefining them here was
-# redundant and risked divergence if market_intel ever changes the TZ.
+# Backward-compat alias for any external caller that referenced slot_cooldown_h
+SLOT_COOLDOWN_H = 23   # kept for compat only; not used internally in v3.4
 
 # ════════════════════════════════════════════════════════════
 # § GEMINI AI CONSTANTS
-#   Defined at module level so _gemini_call() can reference them
-#   without importing from market_intel (brief has its own prompts).
 # ════════════════════════════════════════════════════════════
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -156,47 +152,39 @@ GEMINI_TIMEOUT = 20   # seconds
 
 # ════════════════════════════════════════════════════════════
 # § CONFIGURATION DATACLASS
-#   All tunable parameters live here.
-#   Override via settings.brief in symbols.yaml.
-#   Force-run flags read from environment at startup.
 # ════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class Config:
     # ── Parallelism ──────────────────────────────────────────
     fetch_workers: int = 5
-
-    # fetch_timeout is RESERVED for future per-call timeout enforcement
-    # inside _fetch_one(). Currently not wired to yf.download() or the
-    # ThreadPoolExecutor since yfinance doesn't expose a clean timeout param.
-    fetch_timeout: int = 25
+    fetch_timeout: int = 25   # reserved for future per-call timeout enforcement
 
     # ── Scheduling windows (market / ET time) ────────────────
     morning_window: tuple[dtime, dtime] = (dtime(8, 45),  dtime(12, 0))
     evening_window: tuple[dtime, dtime] = (dtime(16, 15), dtime(20, 0))
 
     # ── Display limits ───────────────────────────────────────
-    ah_move_min_pct:    float = 0.5   # min AH % change to appear in list
-    max_buy_candidates: int   = 8     # max rows in BUY ZONE CANDIDATES section
-    max_avoid_shown:    int   = 6     # max rows in AVOID/WAIT section
-    max_movers_shown:   int   = 5     # max gainers / losers rows
-    max_ah_movers:      int   = 6     # max after-hours rows
-
-    # ── Cooldown ─────────────────────────────────────────────
-    slot_cooldown_h: int = 23   # one brief per slot per 23 h (allows slight drift)
+    ah_move_min_pct:    float = 0.5
+    max_buy_candidates: int   = 8
+    max_avoid_shown:    int   = 6
+    max_movers_shown:   int   = 5
+    max_ah_movers:      int   = 6
 
     # ── Force-run flags (env overrides, set by _load_force_flags) ──
     force_morning: bool = False
     force_evening: bool = False
     force_brief:   bool = False
 
+    # NOTE v3.4: slot_cooldown_h removed from Config.
+    # Brief slots are now deduped by ET calendar date (one per day) rather
+    # than a rolling time window. This prevents the DST double-fire where
+    # both the EDT cron (13:00 UTC) and the EST cron (14:00 UTC) fire on
+    # the same ET calendar day during summer.
+
 
 def _apply_yaml_overrides(cfg: Config) -> Config:
-    """
-    Merge settings.brief from symbols.yaml into Config.
-    Handles time-window strings: ["08:45", "12:00"] → tuple[dtime, dtime].
-    Unknown keys silently dropped — no accidental injection.
-    """
+    """Merge settings.brief from symbols.yaml into Config."""
     overrides = dict((YAML_SETTINGS or {}).get("brief") or {})
     if not overrides:
         return cfg
@@ -210,6 +198,14 @@ def _apply_yaml_overrides(cfg: Config) -> Config:
         overrides["morning_window"] = _to_window(overrides["morning_window"])
     if isinstance(overrides.get("evening_window"), list):
         overrides["evening_window"] = _to_window(overrides["evening_window"])
+
+    # slot_cooldown_h in yaml is now a no-op; log and ignore
+    if "slot_cooldown_h" in overrides:
+        logging.info(
+            "brief: 'slot_cooldown_h' in yaml is ignored in v3.4 — "
+            "brief slots are now deduplicated by ET calendar date"
+        )
+        overrides.pop("slot_cooldown_h")
 
     valid = set(cfg.__dataclass_fields__)
     safe  = {k: v for k, v in overrides.items() if k in valid}
@@ -247,15 +243,36 @@ def in_window(win: tuple[dtime, dtime]) -> bool:
 
 
 # ════════════════════════════════════════════════════════════
+# § BRIEF SLOT COOLDOWN HELPER
+#
+#   Returns a date-scoped state key for a brief slot.
+#   Including the ET date means:
+#     - A new key is generated each calendar day → no explicit reset needed
+#     - Two crons for the same slot (DST hedge) that both fire on the same
+#       ET day share the same key → second one sees it and exits cleanly
+#
+#   Example keys:
+#     last_morning_brief:2026-05-28
+#     last_evening_brief:2026-05-28
+# ════════════════════════════════════════════════════════════
+
+def _brief_slot_key(kind: str) -> str:
+    """
+    Return the daily-scoped cooldown key for a brief slot.
+
+    Parameters
+    ----------
+    kind : 'morning' | 'evening'
+    """
+    return _daily_cool_key(f"last_{kind}_brief")
+
+
+# ════════════════════════════════════════════════════════════
 # § COMPANY LABEL HELPER
 # ════════════════════════════════════════════════════════════
 
 def name_label(sym: str, *, bold_ticker: bool = True) -> str:
-    """
-    Return 'AAPL — Apple Inc. (NASDAQ)' when SYMBOL_META is populated,
-    else just the (escaped) ticker symbol.
-    Ticker is *bold* by default for Telegram Markdown.
-    """
+    """Return 'AAPL — Apple Inc. (NASDAQ)' when SYMBOL_META is populated."""
     meta = SYMBOL_META.get(sym, {})
     name = meta.get("name", "")
     exch = meta.get("exchange", "")
@@ -269,21 +286,19 @@ def name_label(sym: str, *, bold_ticker: bool = True) -> str:
 
 # ════════════════════════════════════════════════════════════
 # § DATA COLLECTION (shared by morning + evening)
-#   All expensive I/O (yfinance + earnings) happens here.
-#   Results are bundled into BriefData and passed to renderers.
 # ════════════════════════════════════════════════════════════
 
 @dataclass
 class BriefData:
     """All pre-fetched data for one brief cycle."""
-    market_ctx:    dict                    # SPY / QQQ / VIX
-    contexts:      dict[str, dict]         # full context per symbol
-    failed_count:  int                     # symbols that failed to fetch
-    sectors:       list[tuple[str, float]] # (sector_name, avg_pct), sorted desc
-    gainers:       list[dict]              # top N positive movers
-    losers:        list[dict]              # top N negative movers
+    market_ctx:    dict
+    contexts:      dict[str, dict]
+    failed_count:  int
+    sectors:       list[tuple[str, float]]
+    gainers:       list[dict]
+    losers:        list[dict]
     earnings_soon: list[tuple]             # (sym, date, days, session|None)
-    earnings_days: dict[str, int | None]   # sym → days_until (for get_verdict)
+    earnings_days: dict[str, int | None]
 
 
 def _fetch_one(symbol: str) -> tuple[str, dict | None, Exception | None]:
@@ -297,11 +312,9 @@ def _fetch_one(symbol: str) -> tuple[str, dict | None, Exception | None]:
 def collect_brief_data() -> BriefData:
     """
     Fetch market context + full context for every symbol in MONITOR_LIST.
-
-    FIX v3.3: clear_caches() called first so stale per-scan DataFrames
-    from a prior run do not bleed into this scan.
+    clear_caches() called first to prevent stale DataFrames carrying over.
     """
-    clear_caches()   # FIX v3.3 — must precede parallel get_full_context() calls
+    clear_caches()
     market_ctx = get_market_ctx()
     contexts: dict[str, dict] = {}
     failed = 0
@@ -321,7 +334,6 @@ def collect_brief_data() -> BriefData:
                 failed += 1
                 print(f"  → {symbol:10s} —")
 
-    # ── Sector averages ──────────────────────────────────────
     sectors: list[tuple[str, float]] = []
     for sector, syms in SECTORS.items():
         ctxs = [contexts[s] for s in syms if s in contexts]
@@ -330,7 +342,6 @@ def collect_brief_data() -> BriefData:
             sectors.append((sector, avg))
     sectors.sort(key=lambda x: -x[1])
 
-    # ── Movers — split before slicing so gainers never leak into losers ──
     sorted_desc = sorted(contexts.values(), key=lambda c: -c["day_change_pct"])
     pos = [c for c in sorted_desc if c["day_change_pct"] > 0]
     neg = [c for c in sorted_desc if c["day_change_pct"] < 0]
@@ -343,18 +354,16 @@ def collect_brief_data() -> BriefData:
         for c in neg[-CFG.max_movers_shown:][::-1]
     ]
 
-    # ── Earnings — single fetch per symbol (uses central 12 h cache) ────
-    # NOTE v3.3: session is always None because SYMBOL_META does not yet
-    # carry a 'report_time' field ('BMO' / 'AMC'). earnings_label() will
-    # always hit its else-branch. TODO: add report_time to symbols.yaml
-    # and expose it via SYMBOL_META once the schema is extended.
+    # NOTE: session is always None — SYMBOL_META does not yet carry report_time.
+    # earnings_label() will always hit its else-branch until symbols.yaml is
+    # extended with a 'report_time' field ('BMO' / 'AMC').
     earnings_soon: list[tuple] = []
     earnings_days: dict[str, int | None] = {}
     for sym in contexts:
         ed, days = get_earnings_date(sym)
         earnings_days[sym] = days
         if ed is not None and days is not None and days <= 1:
-            earnings_soon.append((sym, ed, days, None))  # session: TODO
+            earnings_soon.append((sym, ed, days, None))
 
     return BriefData(
         market_ctx=market_ctx,
@@ -370,18 +379,12 @@ def collect_brief_data() -> BriefData:
 
 # ════════════════════════════════════════════════════════════
 # § AFTER-HOURS MOVER CALCULATOR
-#   Compares last AH price to the 4 PM close.
-#   Only symbols that moved ≥ ah_move_min_pct are returned.
 # ════════════════════════════════════════════════════════════
 
 def compute_ah_movers(symbols: Iterable[str]) -> list[dict]:
     """
     Return list of {symbol, pct, price} for symbols with significant
     after-hours moves. Sorted by |pct| descending, capped at max_ah_movers.
-
-    FIX v3.3: added debug log when no regular-hours bars are found
-    (e.g. function called before market opens or on a holiday).
-    The original silently returned an empty list in this case.
     """
     movers: list[dict] = []
 
@@ -396,14 +399,12 @@ def compute_ah_movers(symbols: Iterable[str]) -> list[dict]:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-            # Normalise index to market timezone
             idx = df.index
             if idx.tz is not None:
                 df.index = idx.tz_convert("America/New_York")
             else:
                 df.index = idx.tz_localize("UTC").tz_convert("America/New_York")
 
-            # Regular-hours bars: up to and including 4:00 PM close
             regular_mask = df.index.time <= dtime(16, 0)
 
             if not regular_mask.any():
@@ -411,7 +412,6 @@ def compute_ah_movers(symbols: Iterable[str]) -> list[dict]:
                 continue
 
             if not (~regular_mask).any():
-                # No after-hours bars yet — market just closed
                 logging.debug(f"AH {sym}: no after-hours bars yet")
                 continue
 
@@ -434,22 +434,10 @@ def compute_ah_movers(symbols: Iterable[str]) -> list[dict]:
 
 # ════════════════════════════════════════════════════════════
 # § EARNINGS LABEL
-#   Generates the display string for upcoming earnings.
-#   session ('BMO' / 'AMC' / None) is not yet populated — see TODO
-#   in collect_brief_data(). All paths will fall through to the
-#   generic label until session data is added to SYMBOL_META.
 # ════════════════════════════════════════════════════════════
 
 def earnings_label(days: int, session: str | None, brief_kind: str) -> str:
-    """
-    Return a human-readable earnings warning string.
-
-    Parameters
-    ----------
-    days       : days until earnings (0 = today, 1 = tomorrow)
-    session    : 'BMO' (before market open) / 'AMC' (after market close) / None
-    brief_kind : 'morning' | 'evening' (affects phrasing)
-    """
+    """Return a human-readable earnings warning string."""
     if days == 0:
         if session == "BMO":
             return "🔴 REPORTED PRE-MARKET" if brief_kind == "evening" else "🔴 REPORTING PRE-MARKET"
@@ -465,8 +453,6 @@ def earnings_label(days: int, session: str | None, brief_kind: str) -> str:
 
 # ════════════════════════════════════════════════════════════
 # § RENDER HELPERS — TELEGRAM MARKDOWN COMPOSITION
-#   Pure functions; all take pre-computed data, return strings.
-#   No I/O or side effects.
 # ════════════════════════════════════════════════════════════
 
 def brief_header(
@@ -514,10 +500,7 @@ def render_market_row(label: str, d: dict | None) -> str:
 
 
 def render_market_snapshot(market_ctx: dict, title: str) -> str:
-    """
-    Compose the market overview section (SPY / QQQ / VIX + regime note).
-    Returns empty string when market_ctx is falsy.
-    """
+    """Compose the market overview section. Returns empty string when market_ctx is falsy."""
     if not market_ctx:
         return ""
 
@@ -560,7 +543,7 @@ def render_movers(
     losers:  list[dict],
     title:   str,
 ) -> str:
-    """Render top gainers and losers side-by-side under one section header."""
+    """Render top gainers and losers under one section header."""
     if not (gainers or losers):
         return ""
     out = section_header("📊", title)
@@ -596,7 +579,7 @@ def render_earnings(
 
 
 def render_header(emoji: str, title: str) -> str:
-    """Route to brief_header() with the correct subtitle for morning / evening."""
+    """Route to brief_header() with the correct subtitle."""
     if "MORNING" in title.upper():
         return brief_header(
             emoji, title,
@@ -623,8 +606,6 @@ def render_footer(failed_count: int, total: int, tail: str) -> str:
 
 # ════════════════════════════════════════════════════════════
 # § MORNING BRIEF
-#   Builds and sends the morning brief message.
-#   Returns True on successful Telegram delivery.
 # ════════════════════════════════════════════════════════════
 
 def build_morning_brief() -> bool:
@@ -650,7 +631,6 @@ def build_morning_brief() -> bool:
 
     earnings_syms = {sym for sym, *_ in data.earnings_soon}
 
-    # ── Verdicts (earnings_days passed in — no redundant fetch) ──────────
     buy_candidates: list[tuple] = []
     avoid_list:     list[tuple] = []
 
@@ -668,14 +648,12 @@ def build_morning_brief() -> bool:
         elif ("AVOID" in verdict or "WAIT" in verdict) and sym not in earnings_syms:
             avoid_list.append((sym, ctx, verdict, zone))
 
-    # Sort buy candidates by RSI ascending (most oversold first)
     buy_candidates.sort(key=lambda x: x[1].get("rsi", 50))
 
     print("  🤖 Getting AI morning outlook...")
     ai_outlook = ai_daily_outlook(data.market_ctx, data.sectors,
                                   data.gainers + data.losers)
 
-    # ── Compose message ───────────────────────────────────────
     msg = render_header("🌅", "MORNING BRIEF")
     msg += render_market_snapshot(data.market_ctx, "🌍 MARKET SNAPSHOT")
 
@@ -692,7 +670,6 @@ def build_morning_brief() -> bool:
     msg += render_sectors(data.sectors, "🌡️ SECTOR PERFORMANCE")
     msg += render_movers(data.gainers, data.losers, "📊 TOP MOVERS")
 
-    # ── Buy Zone Candidates ───────────────────────────────────
     msg += section_header("🎯", "BUY ZONE CANDIDATES", "━━━━━━━━━━━━━━━━━")
     if buy_candidates:
         shown = min(CFG.max_buy_candidates, len(buy_candidates))
@@ -714,9 +691,7 @@ def build_morning_brief() -> bool:
     else:
         msg += "  _No clean buy setups — wait for better conditions_\n"
 
-    # ── Avoid / Wait ──────────────────────────────────────────
     if avoid_list:
-        # FIX v3.3: `mmsg +=` was a typo for `msg +=` — caused NameError at runtime
         msg += section_header("🚫", "AVOID / WAIT", "═════════════════")
         shown = min(CFG.max_avoid_shown, len(avoid_list))
         for sym, _ctx, _v, zone in avoid_list[:shown]:
@@ -742,8 +717,6 @@ def build_morning_brief() -> bool:
 
 # ════════════════════════════════════════════════════════════
 # § EVENING BRIEF
-#   Builds and sends the evening brief message.
-#   Returns True on successful Telegram delivery.
 # ════════════════════════════════════════════════════════════
 
 def build_evening_brief() -> bool:
@@ -767,7 +740,6 @@ def build_evening_brief() -> bool:
         print("❌ No contexts — aborting evening brief")
         return False
 
-    # ── Load open trades (defensive) ─────────────────────────
     open_trades: dict = {}
     try:
         all_trades = load_json(TRADES_FILE, {})
@@ -775,7 +747,6 @@ def build_evening_brief() -> bool:
     except Exception as e:
         logging.error(f"trades load: {e}")
 
-    # ── Load closed-today trades (defensive) ─────────────────
     closed_today: list = []
     try:
         history   = load_json(HISTORY_FILE, [])
@@ -797,7 +768,6 @@ def build_evening_brief() -> bool:
         open_trades,
     )
 
-    # ── Compose message ───────────────────────────────────────
     msg = render_header("🌆", "EVENING BRIEF")
     msg += render_market_snapshot(data.market_ctx, "🔔 DAY CLOSE")
 
@@ -805,7 +775,6 @@ def build_evening_brief() -> bool:
         msg += section_header("🤖", "END-OF-DAY ANALYSIS")
         msg += f"{ai_summary}\n"
 
-    # ── Open trades ───────────────────────────────────────────
     if open_trades:
         msg += section_header("📊", f"OPEN TRADES ({len(open_trades)})", "━━━━━━━━━━━━━━━━━")
         msg += "_Still active going into after-hours:_\n"
@@ -816,8 +785,7 @@ def build_evening_brief() -> bool:
                 dir_em = "🟢" if signal == "BUY" else "🔴"
                 sym    = t.get("symbol", k)
                 tf     = md(t.get("tf_label", t.get("tf", "—")))
-                # FIX v3.3: float(t.get('entry', 0)) crashes when value is None
-                # (key present but value null). Use `or 0.0` after get().
+                # float(...) crashes when value is explicitly None — use `or 0.0`
                 entry  = float(t.get("entry") or 0.0)
                 sl     = float(t.get("sl")    or 0.0)
                 msg += (
@@ -830,7 +798,6 @@ def build_evening_brief() -> bool:
     else:
         msg += "\n📊 _No open trades going into after-hours._\n"
 
-    # ── Closed today ──────────────────────────────────────────
     if closed_today:
         wins    = [t for t in closed_today if (t.get("final_r") or 0) > 0]
         losses  = [t for t in closed_today if (t.get("final_r") or 0) < 0]
@@ -843,7 +810,6 @@ def build_evening_brief() -> bool:
     msg += render_sectors(data.sectors, "🌡️ SECTOR CLOSE")
     msg += render_movers(data.gainers, data.losers, "🏆 DAY MOVERS")
 
-    # ── After-hours movers ────────────────────────────────────
     if ah_movers:
         msg += section_header("🌙", "AFTER-HOURS MOVERS")
         for m in ah_movers:
@@ -879,19 +845,10 @@ def build_evening_brief() -> bool:
 
 # ════════════════════════════════════════════════════════════
 # § AI — GEMINI CALLS (morning outlook + evening summary)
-#   Prompts are brief-specific and live here.
-#   All calls reuse SESSION from market_intel (pooled, retrying).
-#   Non-blocking on 429: logs and returns None.
-#
-#   FIX v3.3: _sanitize_ai() now imported from market_intel
-#   instead of re-implemented locally (was identical copy).
 # ════════════════════════════════════════════════════════════
 
 def _gemini_call(prompt: str, label: str) -> str | None:
-    """
-    POST to Gemini Flash and return raw text content, or None on error.
-    Skips (returns None) on 429 — does NOT block.
-    """
+    """POST to Gemini Flash and return raw text content, or None on error."""
     if not GEMINI_API_KEY:
         return None
 
@@ -929,10 +886,7 @@ def ai_daily_outlook(
     sector_summary: list[tuple[str, float]],
     top_movers:     list[dict],
 ) -> str | None:
-    """
-    Generate the morning AI outlook (4 lines).
-    Returns sanitised string or None when AI unavailable / rate-limited.
-    """
+    """Generate the morning AI outlook (4 lines)."""
     mkt = market_ctx or {}
     spy = mkt.get("SPY",  {}).get("pct",   0)
     qqq = mkt.get("QQQ",  {}).get("pct",   0)
@@ -971,10 +925,7 @@ def ai_evening_summary(
     day_losers:     list[dict],
     open_trades:    dict,
 ) -> str | None:
-    """
-    Generate the evening AI summary (4 lines).
-    Returns sanitised string or None when AI unavailable / rate-limited.
-    """
+    """Generate the evening AI summary (4 lines)."""
     mkt = market_ctx or {}
     spy = mkt.get("SPY",  {}).get("pct",   0)
     qqq = mkt.get("QQQ",  {}).get("pct",   0)
@@ -1018,20 +969,17 @@ NO extra headers, bullets, intros, or outros. 4 lines only."""
 
 # ════════════════════════════════════════════════════════════
 # § SCHEDULING — JOB DISPATCH
-#   can_alert / mark_alert from market_intel manage the cooldown
-#   so no local slot-tracking is needed.
 # ════════════════════════════════════════════════════════════
 
 @dataclass
 class Job:
     kind:     str             # 'morning' | 'evening'
-    slot_key: str             # key in scanner_state.json
     builder:  Callable[[], bool]
 
 
 JOBS: dict[str, Job] = {
-    "morning": Job("morning", "last_morning_brief", build_morning_brief),
-    "evening": Job("evening", "last_evening_brief", build_evening_brief),
+    "morning": Job("morning", build_morning_brief),
+    "evening": Job("evening", build_evening_brief),
 }
 
 
@@ -1044,24 +992,35 @@ def decide_job() -> Job | None:
 
 def run_job(job: Job, *, force: bool = False) -> None:
     """
-    Execute a brief job, respecting the cooldown unless force=True.
+    Execute a brief job, respecting the daily slot cooldown unless force=True.
+
+    Cooldown key format: last_{kind}_brief:{YYYY-MM-DD}
+    Including the ET calendar date means:
+      - Two DST-hedge crons that fire on the same ET day share the same key.
+        The second run finds it already marked and exits cleanly.
+      - No explicit reset needed — each new trading day has a fresh key.
+
     mark_alert() is called only on confirmed successful delivery.
     """
-    today = market_now().strftime("%Y-%m-%d")
-    if not force and not can_alert(job.slot_key, CFG.slot_cooldown_h):
+    slot_key = _brief_slot_key(job.kind)
+    today    = market_now().strftime("%Y-%m-%d")
+
+    if not force and not can_alert(slot_key, hours=0):
+        # hours=0: any prior write for today's key is enough to block
         print(f"ℹ️  {job.kind.title()} brief already sent today ({today})")
+        logging.info(f"{job.kind} brief skipped — already sent today ({today})")
         return
+
     try:
         ok = job.builder()
         if ok:
-            mark_alert(job.slot_key)   # ← only on confirmed send
+            mark_alert(slot_key)   # ← only on confirmed send
     except Exception as e:
         logging.exception(f"{job.kind} brief crashed: {e}")
 
 
 # ════════════════════════════════════════════════════════════
 # § LOGGING SETUP
-#   Idempotent — safe to call multiple times.
 # ════════════════════════════════════════════════════════════
 
 def setup_logging() -> None:
@@ -1069,7 +1028,7 @@ def setup_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     if any(isinstance(h, TimedRotatingFileHandler) for h in root.handlers):
-        return  # already configured
+        return
     handler = TimedRotatingFileHandler(
         LOGS_DIR / "brief.log", when="midnight", backupCount=14, utc=False,
     )
@@ -1114,67 +1073,44 @@ if __name__ == "__main__":
 # ════════════════════════════════════════════════════════════════════════════
 # ║  NEW-CHAT CONTEXT HANDOFF PROMPT
 # ║
-# ║  Copy the block below into a new conversation to onboard Claude with
-# ║  full context about this codebase.
-# ║
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  --- PASTE THIS INTO NEW CHAT ---                                        ║
 # ║                                                                          ║
-# ║  I'm working on AlphaEdge Brief (brief.py v3.3), the daily briefing     ║
-# ║  module that runs on top of market_intel.py v3.2.                       ║
+# ║  I'm working on AlphaEdge Brief (brief.py v3.4).                        ║
 # ║                                                                          ║
 # ║  WHAT IT DOES                                                            ║
 # ║  • Fires twice every weekday:                                            ║
 # ║      🌅 Morning Brief (~9 AM ET): buy candidates, risk map, AI outlook  ║
 # ║      🌆 Evening Brief (~4:30 PM ET): recap, open trades, AH movers      ║
 # ║  • Delegates ALL data/indicator work to market_intel.py                 ║
-# ║  • Reads open positions from active_trades.json (evening only)          ║
-# ║  • Reads closed trade history from trade_history.json (evening only)    ║
-# ║  • Calls Gemini Flash for 4-line AI outlook / summary                   ║
-# ║  • Sends rich Telegram Markdown v1 via market_intel.send_telegram()     ║
-# ║  • Uses market_intel.can_alert() / mark_alert() for cooldown (23 h)    ║
+# ║                                                                          ║
+# ║  BRIEF SLOT DEDUP MODEL (v3.4)                                           ║
+# ║  • Each brief slot is allowed to fire ONCE PER ET CALENDAR DAY.         ║
+# ║  • Key: last_{morning|evening}_brief:{YYYY-MM-DD}                       ║
+# ║  • Generated by _brief_slot_key(kind) → _daily_cool_key(base)           ║
+# ║  • can_alert() called with hours=0: any prior write blocks re-fire.     ║
+# ║  • This fixes the DST double-fire: both the EDT cron (13:00 UTC) and    ║
+# ║    the EST cron (14:00 UTC) fire on the same ET calendar day in summer. ║
+# ║    The second run finds today's key already written and exits.           ║
+# ║  • slot_cooldown_h removed from Config — no longer used.                ║
+# ║    SLOT_COOLDOWN_H module constant kept for backward compat only.       ║
 # ║                                                                          ║
 # ║  KEY DESIGN CONSTRAINTS                                                  ║
-# ║  • clear_caches() MUST be called at top of collect_brief_data()         ║
-# ║    (already done in v3.3 — do not remove)                               ║
+# ║  • _daily_cool_key() imported from market_intel — do not redefine       ║
+# ║  • clear_caches() MUST remain first call in collect_brief_data()        ║
 # ║  • _sanitize_ai() imported from market_intel — do not re-implement      ║
 # ║  • SESSION imported from market_intel — do not create a new session     ║
 # ║  • MARKET_TZ / DISPLAY_TZ NOT defined locally — use market_now() /      ║
 # ║    display_now() from market_intel instead                               ║
-# ║  • format_big_move_alert() not used here — brief.py never calls it      ║
-# ║  • earnings_soon session field is always None (TODO: add report_time    ║
-# ║    to symbols.yaml and SYMBOL_META to enable BMO/AMC logic)             ║
+# ║  • mark_alert() only called inside run_job() when builder() returns True║
 # ║                                                                          ║
-# ║  BUGS FIXED IN v3.3 (verify these do not regress)                       ║
-# ║  1. mmsg += → msg += (NameError in build_morning_brief avoid block)     ║
-# ║  2. Late import re / import requests → moved to top of file             ║
-# ║  3. float(t.get('entry', 0)) → float(t.get('entry') or 0.0)           ║
-# ║     (crashes when value is explicitly None in active_trades.json)       ║
-# ║  4. clear_caches() added at top of collect_brief_data()                ║
-# ║  5. compute_ah_movers() now logs when no regular-hours bars found       ║
-# ║  6. Removed 6 unused imports from market_intel                          ║
-# ║                                                                          ║
-# ║  FILES                                                                   ║
-# ║  • brief.py             — this file                                      ║
-# ║  • market_intel.py      — data engine (must be present)                 ║
-# ║  • symbols.yaml         — watchlist + config                             ║
-# ║  • active_trades.json   — open positions (auto-created by trade module) ║
-# ║  • trade_history.json   — closed trades  (auto-created by trade module) ║
-# ║  • scanner_state.json   — shared cooldown store (market_intel manages)  ║
-# ║  • logs/brief.log       — rotating log (14-day)                         ║
-# ║                                                                          ║
-# ║  ENV VARS                                                                ║
-# ║  TELEGRAM_TOKEN, CHAT_ID, GEMINI_API_KEY (optional)                     ║
-# ║  FORCE_MORNING=true | FORCE_EVENING=true | FORCE_BRIEF=true             ║
-# ║                                                                          ║
-# ║  WHAT TO VERIFY IN REVIEW                                                ║
-# ║  □ msg += used throughout build_morning_brief() (not mmsg)              ║
-# ║  □ All imports at top of file, none mid-file                            ║
-# ║  □ float(t.get('entry') or 0.0) pattern in evening trade rows          ║
-# ║  □ clear_caches() is first call in collect_brief_data()                ║
-# ║  □ _sanitize_ai not redefined locally — only imported                   ║
-# ║  □ mark_alert() only called inside run_job() when builder() returns True║
-# ║  □ No local MARKET_TZ / DISPLAY_TZ definitions                          ║
+# ║  BUGS FIXED IN v3.3 (still intact — do not regress)                     ║
+# ║  1. mmsg += → msg += (NameError in avoid block)                         ║
+# ║  2. Late import re / import requests → top of file                      ║
+# ║  3. float(t.get('entry') or 0.0) pattern in evening trade rows         ║
+# ║  4. clear_caches() first in collect_brief_data()                        ║
+# ║  5. compute_ah_movers() logs when no regular-hours bars found            ║
+# ║  6. Unused imports removed                                               ║
 # ║  --- END PASTE ---                                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 # ════════════════════════════════════════════════════════════════════════════
