@@ -1724,6 +1724,21 @@ def format_leadership_alert(leaders: list[dict], laggards: list[dict]) -> str | 
 #   a confirmed successful Telegram send.
 # ════════════════════════════════════════════════════════════
 
+def _daily_cool_key(base: str) -> str:
+    """
+    Return a date-scoped state key for daily deduplication.
+    Including the ET calendar date means the key resets automatically
+    each trading day — no explicit cleanup needed.
+
+    Example: _daily_cool_key("last_morning_brief")
+             → "last_morning_brief:2026-05-28"
+
+    Used by brief.py to prevent DST double-fire where two crons
+    (EDT + EST hedge) both run on the same ET calendar day.
+    """
+    today = market_now().strftime("%Y-%m-%d")
+    return f"{base}:{today}"
+    
 def can_alert(key: str, hours: int = COOLDOWN_HOURS) -> bool:
     """
     PURE check: has enough time elapsed since the last alert for `key`?
