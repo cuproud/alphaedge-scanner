@@ -367,7 +367,7 @@ def _load_from_yaml() -> dict | None:
                 problems.append(f"{sym}: emoji length suspicious ({emoji!r})")
 
             ac = item.get("asset_class", "stock")
-            if ac not in {"stock", "crypto", "commodity"}:
+            if ac not in {"stock", "etf", "crypto", "commodity"}:
                 problems.append(f"{sym}: invalid asset_class '{ac}'")
 
             roles = set(item.get("roles") or ["intel", "brief"])
