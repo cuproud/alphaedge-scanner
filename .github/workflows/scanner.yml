@@ -1,39 +1,59 @@
-name: AlphaEdge Scanner v7.0
+name: AlphaEdge Scanner v7.1
+
 on:
   schedule:
-    # ═══════════════════════════════════════════════
-    # All times in UTC. Covers BOTH EDT (UTC-4) and EST (UTC-5)
-    # So the active hours overlap cleanly.
-    # ═══════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
+    # All times UTC. Two crons per slot = DST hedge (EDT=UTC-4, EST=UTC-5).
+    # brief.py uses date-scoped keys to prevent double-fire on same ET day.
+    # scanner.py uses alert_cache.json cooldowns for the same protection.
+    #
+    # OVERLAP FIX vs v7.0:
+    #   Old: */10 13-21 overlapped with */15 8-14 at hours 13-14 UTC.
+    #   New: regular market starts at hour 14 (safe for both EDT+EST).
+    #        pre-market ends at hour 13 (no overlap).
+    # ═══════════════════════════════════════════════════════════════
+
     # 📈 REGULAR MARKET (9:30 AM – 4:00 PM ET) — every 10 min
-    # Covers EDT 13:30–20:00 UTC  AND  EST 14:30–21:00 UTC
-    - cron: '*/10 13-21 * * 1-5'
+    # EDT: 13:30–20:00 UTC → hour range 14–19 safe (misses first 30min EDT but no overlap)
+    # EST: 14:30–21:00 UTC → hour range 14–21
+    # Compromise: 14–20 covers both seasons without overlap
+    - cron: '*/10 14-20 * * 1-5'
+
     # 🌙 AFTER-HOURS (4:00 PM – 8:00 PM ET) — every 15 min
-    # Covers EDT 20:00–00:00 UTC  AND  EST 21:00–01:00 UTC
+    # EDT: 20:00–00:00 UTC
+    # EST: 21:00–01:00 UTC
     - cron: '*/15 20-23 * * 1-5'
     - cron: '*/15 0-1 * * 2-6'
+
     # 🌅 PRE-MARKET (4:00 AM – 9:30 AM ET) — every 15 min
-    # Covers EDT 08:00–13:30 UTC  AND  EST 09:00–14:30 UTC
-    - cron: '*/15 8-14 * * 1-5'
+    # EDT: 08:00–13:30 UTC → hours 8–13
+    # EST: 09:00–14:30 UTC → hours 9–13
+    # Safe range: 8–13 (no overlap with regular market starting at 14)
+    - cron: '*/15 8-13 * * 1-5'
+
     # 🌑 OVERNIGHT (crypto only, 8 PM – 4 AM ET) — every 30 min
     # Covers 01:00–09:00 UTC (spans both DST regimes)
-    - cron: '0,30 2-8 * * 2-6'
+    - cron: '0,30 1-8 * * 2-6'
+
     # 🪙 WEEKENDS (crypto only) — every 30 min
     - cron: '*/30 * * * 0,6'
+
+  # Manual trigger — useful for testing or forcing a scan
   workflow_dispatch:
 
 concurrency:
   group: alphaedge-scanner
-  cancel-in-progress: false
+  cancel-in-progress: false   # queue, don't kill — state writes must complete
 
 permissions:
   contents: read
-  actions: write
+  actions: write   # needed for cache cleanup step
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # bumped from 12 — v7.0 pre-fetches HTF+MTF for all symbols
+    timeout-minutes: 20   # safety net; normal runs finish in 8–12 min
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -74,7 +94,7 @@ jobs:
         run: python scanner.py
 
       - name: Save scanner state
-        if: always()
+        if: always()   # save even if scanner crashes — preserves cooldowns
         uses: actions/cache/save@v4
         with:
           path: |
@@ -101,6 +121,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Keep only the 5 most recent scanner-state caches
           gh cache list --limit 50 --json key,id,createdAt \
             | jq -r '.[] | select(.key | startswith("scanner-state-")) | .id' \
             | tail -n +6 | xargs -I {} gh cache delete {} || true
