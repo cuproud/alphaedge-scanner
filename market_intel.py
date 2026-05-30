@@ -1606,7 +1606,102 @@ def format_sector_bleed_alert(sector_moves: dict) -> str | None:
 
     return msg
 
+def format_mover_digest(all_contexts: dict[str, dict], market_ctx: dict | None = None) -> str | None:
+    """
+    Single end-of-day digest of all notable movers across the full universe.
+    Fires once per ET calendar day via _daily_cool_key().
+    Only runs during or after regular market hours (after 15:45 ET).
+    """
+    # Only fire during/after regular session — not pre-market noise
+    t = market_now()
+    if t.weekday() >= 5:
+        return None
+    session_minutes = t.hour * 60 + t.minute
+    if session_minutes < 15 * 60 + 45:   # before 3:45 PM ET
+        return None
 
+    gainers = [
+        (sym, ctx) for sym, ctx in all_contexts.items()
+        if ctx["day_change_pct"] >= CFG.big_gain_alert
+    ]
+    losers = [
+        (sym, ctx) for sym, ctx in all_contexts.items()
+        if ctx["day_change_pct"] <= CFG.big_drop_warn
+    ]
+
+    if not gainers and not losers:
+        return None
+
+    gainers.sort(key=lambda x: -x[1]["day_change_pct"])
+    losers.sort(key=lambda x: x[1]["day_change_pct"])
+
+    spy_pct = market_ctx.get("SPY", {}).get("pct", 0) if market_ctx else 0
+    qqq_pct = market_ctx.get("QQQ", {}).get("pct", 0) if market_ctx else 0
+    vix_val = market_ctx.get("^VIX", {}).get("price", 15) if market_ctx else 15
+
+    ts  = display_now().strftime("%a %b %d • %I:%M %p ET")
+    msg = f"📊 *TODAY'S BIG MOVERS*\n`━━━━━━━━━━━━━━━━━━━━━`\n_{ts}_\n"
+
+    # Market context line
+    spy_em = "🟢" if spy_pct >= 0 else "🔴"
+    qqq_em = "🟢" if qqq_pct >= 0 else "🔴"
+    vix_em = "🟢" if vix_val < 18 else ("🟡" if vix_val < 25 else "🔴")
+    msg += f"SPY {spy_em} `{spy_pct:+.1f}%` · QQQ {qqq_em} `{qqq_pct:+.1f}%` · VIX {vix_em} `{vix_val:.0f}`\n"
+
+    def _vol_tag(vol_ratio: float) -> str:
+        if vol_ratio >= 2.0: return "🔥"
+        if vol_ratio >= 1.5: return "⬆️"
+        if vol_ratio < 0.7:  return "⬇️"
+        return ""
+
+    def _rsi_tag(rsi: float) -> str:
+        if rsi >= 70: return "🔴"
+        if rsi <= 30: return "🟢"
+        return ""
+
+    def _vs_mkt(pct: float, is_gain: bool) -> str:
+        if is_gain and spy_pct < -0.5:
+            return " 💪"
+        if not is_gain and spy_pct > 0.5:
+            return " 🚨"
+        return ""
+
+    if gainers:
+        msg += f"\n🚀 *GAINERS* (≥{CFG.big_gain_alert:.0f}%)\n`─────────────────`\n"
+        for sym, ctx in gainers:
+            em      = SYMBOL_EMOJI.get(sym, "📊")
+            pct     = ctx["day_change_pct"]
+            rsi     = ctx["rsi"]
+            vol     = ctx["vol_ratio"]
+            vtag    = _vol_tag(vol)
+            rtag    = _rsi_tag(rsi)
+            mkt     = _vs_mkt(pct, True)
+            msg += (
+                f"  {em} *{md(sym)}* `{pct:+.1f}%`"
+                f"  RSI `{rsi:.0f}`{rtag}"
+                f"  {vtag}{mkt}\n"
+            )
+
+    if losers:
+        msg += f"\n📉 *DROPS* (≤{CFG.big_drop_warn:.0f}%)\n`─────────────────`\n"
+        for sym, ctx in losers:
+            em      = SYMBOL_EMOJI.get(sym, "📊")
+            pct     = ctx["day_change_pct"]
+            rsi     = ctx["rsi"]
+            vol     = ctx["vol_ratio"]
+            vtag    = _vol_tag(vol)
+            rtag    = _rsi_tag(rsi)
+            mkt     = _vs_mkt(pct, False)
+            msg += (
+                f"  {em} *{md(sym)}* `{pct:+.1f}%`"
+                f"  RSI `{rsi:.0f}`{rtag}"
+                f"  {vtag}{mkt}\n"
+            )
+
+    msg += "\n`━━━━━━━━━━━━━━━━━━━━━`\n"
+    msg += "_Reply with ticker for full analysis_"
+    return msg
+    
 # ════════════════════════════════════════════════════════════
 # § LEADERSHIP / LAGGARD DETECTOR
 #   Within a bleed/rip sector, finds stocks that diverge
@@ -1970,6 +2065,15 @@ def run_intel_scan() -> None:
             mark_alert("last_leadership_alert")
             alerts_fired += 1
             print("💪 Leadership alert sent")
+
+    # ── End-of-day mover digest (once per day, after 3:45 PM ET) ─────────
+    digest_key = _daily_cool_key("last_mover_digest")
+    if can_alert(digest_key, hours=0):
+        digest = format_mover_digest(all_contexts, market_ctx)
+        if digest and send_telegram(digest, silent=False):
+            mark_alert(digest_key)
+            alerts_fired += 1
+            print("📊 Mover digest sent")
 
     elapsed = time.time() - t0
     summary = (
