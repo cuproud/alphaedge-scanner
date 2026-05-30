@@ -2219,7 +2219,7 @@ def run_intel_scan() -> None:
     if (leaders or laggards) and can_alert(leadership_key, hours=0):
         msg = format_leadership_alert(leaders, laggards)
         if msg and send_telegram(msg, silent=True):
-            mark_alert("last_leadership_alert")
+            mark_alert(leadership_key)
             alerts_fired += 1
             print("💪 Leadership alert sent")
 
