@@ -1611,13 +1611,21 @@ def format_mover_digest(all_contexts: dict[str, dict], market_ctx: dict | None =
     Single end-of-day digest of all notable movers across the full universe.
     Fires once per ET calendar day via _daily_cool_key().
     Only runs during or after regular market hours (after 15:45 ET).
+
+    v3.3 changes:
+    - Added current price to every row
+    - Fixed missing volume tag (defaults to — when unavailable)
+    - Added trend pill (📈 / 💀 / 🔀 / ⚖️) per row
+    - Gainers split into High Conviction vs Watch tiers
+    - Pullback watch levels added to drops section
+    - Pullback levels added selectively to gainers (low RSI + intact trend only)
+    - Parabolic gainers (RSI ≥ 78) labelled ⚠️ Extended — no zone shown
     """
-    # Only fire during/after regular session — not pre-market noise
     t = market_now()
     if t.weekday() >= 5:
         return None
     session_minutes = t.hour * 60 + t.minute
-    if session_minutes < 15 * 60 + 45:   # before 3:45 PM ET
+    if session_minutes < 15 * 60 + 45:
         return None
 
     gainers = [
@@ -1642,61 +1650,159 @@ def format_mover_digest(all_contexts: dict[str, dict], market_ctx: dict | None =
     ts  = display_now().strftime("%a %b %d • %I:%M %p ET")
     msg = f"📊 *TODAY'S BIG MOVERS*\n`━━━━━━━━━━━━━━━━━━━━━`\n_{ts}_\n"
 
-    # Market context line
     spy_em = "🟢" if spy_pct >= 0 else "🔴"
     qqq_em = "🟢" if qqq_pct >= 0 else "🔴"
     vix_em = "🟢" if vix_val < 18 else ("🟡" if vix_val < 25 else "🔴")
     msg += f"SPY {spy_em} `{spy_pct:+.1f}%` · QQQ {qqq_em} `{qqq_pct:+.1f}%` · VIX {vix_em} `{vix_val:.0f}`\n"
 
-    def _vol_tag(vol_ratio: float) -> str:
-        if vol_ratio >= 2.0: return "🔥"
-        if vol_ratio >= 1.5: return "⬆️"
-        if vol_ratio < 0.7:  return "⬇️"
-        return ""
+    # ── Helper: volume tag ────────────────────────────────────
+    def _vol_tag(vol_ratio: float | None) -> str:
+        if vol_ratio is None: return "—"
+        if vol_ratio >= 2.0:  return "🔥"
+        if vol_ratio >= 1.5:  return "⬆️"
+        if vol_ratio < 0.7:   return "⬇️"
+        return "—"
 
+    # ── Helper: RSI tag ───────────────────────────────────────
     def _rsi_tag(rsi: float) -> str:
         if rsi >= 70: return "🔴"
         if rsi <= 30: return "🟢"
         return ""
 
+    # ── Helper: stock-vs-market context flag ─────────────────
     def _vs_mkt(pct: float, is_gain: bool) -> str:
-        if is_gain and spy_pct < -0.5:
-            return " 💪"
-        if not is_gain and spy_pct > 0.5:
-            return " 🚨"
+        if is_gain and spy_pct < -0.5:   return " 💪"
+        if not is_gain and spy_pct > 0.5: return " 🚨"
         return ""
 
-    if gainers:
-        msg += f"\n🚀 *GAINERS* (≥{CFG.big_gain_alert:.0f}%)\n`─────────────────`\n"
-        for sym, ctx in gainers:
-            em      = SYMBOL_EMOJI.get(sym, "📊")
-            pct     = ctx["day_change_pct"]
-            rsi     = ctx["rsi"]
-            vol     = ctx["vol_ratio"]
-            vtag    = _vol_tag(vol)
-            rtag    = _rsi_tag(rsi)
-            mkt     = _vs_mkt(pct, True)
-            msg += (
-                f"  {em} *{md(sym)}* `{pct:+.1f}%`"
-                f"  RSI `{rsi:.0f}`{rtag}"
-                f"  {vtag}{mkt}\n"
-            )
+    # ── Helper: short trend pill ─────────────────────────────
+    def _trend_pill(trend: str) -> str:
+        if "STRONG UPTREND"   in trend: return "🚀"
+        if "UPTREND"          in trend: return "📈"
+        if "STRONG DOWNTREND" in trend: return "💀"
+        if "DOWNTREND"        in trend: return "📉"
+        if "RECOVERING"       in trend: return "🔀"
+        if "PULLBACK"         in trend: return "↩️"
+        return "⚖️"
 
+    # ── Helper: price formatter (4dp under $10, 2dp otherwise) ─
+    def _pf(price: float) -> str:
+        return f"${price:.4f}" if price < 10 else f"${price:.2f}"
+
+    # ── Helper: pullback zone line ────────────────────────────
+    # Only shown when the setup warrants it (see logic per section below).
+    def _pullback_zone(ctx: dict) -> str | None:
+        ema50  = ctx.get("ema50")
+        ema200 = ctx.get("ema200")
+        if ema50 is None or ema200 is None:
+            return None
+        return f"     `└─` Watch: EMA50 {_pf(ema50)} · EMA200 {_pf(ema200)}\n"
+
+    # ── Classify gainers into conviction tiers ────────────────
+    # High conviction: volume ≥ 1.5x AND trend upward AND RSI < 78
+    # Parabolic: RSI ≥ 78 OR (gain > 30% — likely earnings re-rating)
+    # Watch: everything else
+    high_conv: list = []
+    watch_g:   list = []
+    parabolic: list = []
+
+    for sym, ctx in gainers:
+        rsi = ctx.get("rsi", 50)
+        vol = ctx.get("vol_ratio")
+        pct = ctx["day_change_pct"]
+        trend = ctx.get("trend", "")
+
+        if rsi >= 78 or pct >= 30:
+            parabolic.append((sym, ctx))
+        elif vol is not None and vol >= 1.5 and any(x in trend for x in ["UPTREND", "MOMENTUM"]):
+            high_conv.append((sym, ctx))
+        else:
+            watch_g.append((sym, ctx))
+
+    # ── Gainer row builder ────────────────────────────────────
+    def _gainer_row(sym: str, ctx: dict, show_zone: bool = False) -> str:
+        em    = SYMBOL_EMOJI.get(sym, "📊")
+        pct   = ctx["day_change_pct"]
+        price = ctx.get("current", 0)
+        rsi   = ctx.get("rsi", 50)
+        vol   = ctx.get("vol_ratio")
+        trend = ctx.get("trend", "")
+        vtag  = _vol_tag(vol)
+        rtag  = _rsi_tag(rsi)
+        tpill = _trend_pill(trend)
+        mkt   = _vs_mkt(pct, True)
+
+        row = (
+            f"  {em} *{md(sym)}* `{pct:+.1f}%`  `{_pf(price)}`"
+            f"  RSI `{rsi:.0f}`{rtag}  {tpill}  {vtag}{mkt}\n"
+        )
+
+        # Pullback zone: only for Watch-tier gainers with low RSI + intact structure
+        if show_zone:
+            zone = _pullback_zone(ctx)
+            if zone:
+                row += zone
+
+        return row
+
+    # ── Gainer section ────────────────────────────────────────
+    if gainers:
+        msg += f"\n🚀 *GAINERS* (≥{CFG.big_gain_alert:.0f}%)\n"
+
+        if high_conv:
+            msg += "`── High Conviction ──`\n"
+            for sym, ctx in high_conv:
+                msg += _gainer_row(sym, ctx, show_zone=False)
+
+        if watch_g:
+            msg += "`── Watch ──`\n"
+            for sym, ctx in watch_g:
+                rsi = ctx.get("rsi", 50)
+                # Show pullback zone only when RSI < 65 (not extended)
+                show_zone = rsi < 65
+                msg += _gainer_row(sym, ctx, show_zone=show_zone)
+
+        if parabolic:
+            msg += "`── Extended / Parabolic ──`\n"
+            for sym, ctx in parabolic:
+                em    = SYMBOL_EMOJI.get(sym, "📊")
+                pct   = ctx["day_change_pct"]
+                price = ctx.get("current", 0)
+                rsi   = ctx.get("rsi", 50)
+                vol   = ctx.get("vol_ratio")
+                vtag  = _vol_tag(vol)
+                rtag  = _rsi_tag(rsi)
+                tpill = _trend_pill(ctx.get("trend", ""))
+                mkt   = _vs_mkt(pct, True)
+                msg += (
+                    f"  {em} *{md(sym)}* `{pct:+.1f}%`  `{_pf(price)}`"
+                    f"  RSI `{rsi:.0f}`{rtag}  {tpill}  {vtag}{mkt}"
+                    f"  ⚠️ _Extended_\n"
+                )
+
+    # ── Drops section ─────────────────────────────────────────
     if losers:
         msg += f"\n📉 *DROPS* (≤{CFG.big_drop_warn:.0f}%)\n`─────────────────`\n"
         for sym, ctx in losers:
-            em      = SYMBOL_EMOJI.get(sym, "📊")
-            pct     = ctx["day_change_pct"]
-            rsi     = ctx["rsi"]
-            vol     = ctx["vol_ratio"]
-            vtag    = _vol_tag(vol)
-            rtag    = _rsi_tag(rsi)
-            mkt     = _vs_mkt(pct, False)
+            em    = SYMBOL_EMOJI.get(sym, "📊")
+            pct   = ctx["day_change_pct"]
+            price = ctx.get("current", 0)
+            rsi   = ctx.get("rsi", 50)
+            vol   = ctx.get("vol_ratio")
+            trend = ctx.get("trend", "")
+            vtag  = _vol_tag(vol)
+            rtag  = _rsi_tag(rsi)
+            tpill = _trend_pill(trend)
+            mkt   = _vs_mkt(pct, False)
+
             msg += (
-                f"  {em} *{md(sym)}* `{pct:+.1f}%`"
-                f"  RSI `{rsi:.0f}`{rtag}"
-                f"  {vtag}{mkt}\n"
+                f"  {em} *{md(sym)}* `{pct:+.1f}%`  `{_pf(price)}`"
+                f"  RSI `{rsi:.0f}`{rtag}  {tpill}  {vtag}{mkt}\n"
             )
+            # Always show watch levels for drops — this is where zones are actionable
+            zone = _pullback_zone(ctx)
+            if zone:
+                msg += zone
 
     msg += "\n`━━━━━━━━━━━━━━━━━━━━━`\n"
     msg += "_Reply with ticker for full analysis_"
@@ -1716,8 +1822,15 @@ def check_leadership(
     Return (leaders, laggards).
 
     Leaders: stock is up relative to a bleeding sector (div > +2pp).
-    Laggards: stock is down relative to a rising sector (div < -2pp).
-    Only considers sectors with |avg| > 1.5%.
+    Laggards: stock meaningfully underperforms a rising sector.
+
+    v3.3 changes vs v3.2:
+    - Laggard floor raised: divergence must be < -5pp (was -2pp) to cut noise
+    - Laggard absolute filter: stock must be below +3% on the day to be a
+      meaningful laggard — a stock up +8% in a +16% sector is NOT a laggard
+      in any actionable trading sense
+    - Sector avg threshold kept at |avg| > 1.5% (unchanged)
+    - Only the symbol's PRIMARY sector contributes (unchanged)
     """
     leaders:  list[dict] = []
     laggards: list[dict] = []
@@ -1728,7 +1841,6 @@ def check_leadership(
             continue
 
         for sym, pct in data["all"]:
-            # Only the symbol's PRIMARY sector contributes to leadership
             if SYMBOL_TO_SECTOR.get(sym) != sector:
                 continue
             ctx = all_contexts.get(sym)
@@ -1745,7 +1857,10 @@ def check_leadership(
                     "sector_avg": s_avg,
                     "divergence": div,
                 })
-            elif s_avg > 2 and div < -2:
+            elif s_avg > 2 and div < -5 and pct < 3.0:
+                # v3.3: require both significant divergence AND that the stock
+                # is actually flat/down on the day — avoids flagging stocks
+                # like ADBE +8.7% as a "laggard" just because sector did +15%
                 laggards.append({
                     "symbol":     sym,
                     "ctx":        ctx,
@@ -1757,59 +1872,100 @@ def check_leadership(
     return leaders, laggards
 
 
-def name_label(sym: str, *, bold_ticker: bool = True) -> str:
-    """Return 'AAPL — Apple Inc. (NASDAQ)' when metadata is available."""
-    meta = SYMBOL_META.get(sym, {})
-    name = meta.get("name", "")
-    exch = meta.get("exchange", "")
-    ticker = f"*{md(sym)}*" if bold_ticker else md(sym)
-    if name and exch: return f"{ticker} — {md(name)} ({md(exch)})"
-    if name:          return f"{ticker} — {md(name)}"
-    return ticker
-
-
 def format_leadership_alert(leaders: list[dict], laggards: list[dict]) -> str | None:
-    """Compose Telegram message for leadership/laggard detection. Returns None if empty."""
+    """
+    Compose Telegram message for leadership/laggard detection.
+
+    v3.3 changes:
+    - Returns None if laggards are all positive-on-day (broad rip day with
+      no real weakness — not worth alerting)
+    - Retitles dynamically: 'RELATIVE WEAKNESS' when no leaders present
+    - Caps list at 10 entries per section to prevent wall-of-text on big days
+    - Adds current price and trend pill per entry
+    - Adds EMA50 watch level per laggard entry
+    """
     if not leaders and not laggards:
         return None
 
-    ts  = display_now().strftime("%a %b %d • %I:%M %p ET")
-    msg = f"💪 *RELATIVE STRENGTH SIGNALS*\n`═════════════════════`\n_{ts}_\n\n"
+    # v3.3: on a broad rip day, all "laggards" may still be positive.
+    # If every laggard is up on the day, suppress the alert — it's just
+    # "everything went up but some went up less" which isn't actionable.
+    if not leaders and laggards:
+        all_positive = all(ldr["ctx"]["day_change_pct"] >= 0 for ldr in laggards)
+        if all_positive:
+            return None
 
+    # Dynamic title
+    if leaders and laggards:
+        title = "💪 *RELATIVE STRENGTH SIGNALS*"
+    elif leaders:
+        title = "🏆 *SECTOR LEADERS*"
+    else:
+        title = "⚠️ *RELATIVE WEAKNESS SIGNALS*"
+
+    ts  = display_now().strftime("%a %b %d • %I:%M %p ET")
+    msg = f"{title}\n`═════════════════════`\n_{ts}_\n\n"
+
+    # ── Helper: price formatter ───────────────────────────────
+    def _pf(price: float) -> str:
+        return f"${price:.4f}" if price < 10 else f"${price:.2f}"
+
+    # ── Helper: short trend pill ──────────────────────────────
+    def _trend_pill(trend: str) -> str:
+        if "STRONG UPTREND"   in trend: return "🚀"
+        if "UPTREND"          in trend: return "📈"
+        if "STRONG DOWNTREND" in trend: return "💀"
+        if "DOWNTREND"        in trend: return "📉"
+        if "RECOVERING"       in trend: return "🔀"
+        if "PULLBACK"         in trend: return "↩️"
+        return "⚖️"
+
+    # ── Leaders (cap at 10) ───────────────────────────────────
     if leaders:
         msg += "🏆 *LEADERS*\n_Holding strong while sector is weak_\n`─────────────────`\n"
-        for ldr in sorted(leaders, key=lambda x: -x["divergence"]):
-            em = SYMBOL_EMOJI.get(ldr["symbol"], "📊")
+        for ldr in sorted(leaders, key=lambda x: -x["divergence"])[:10]:
+            em    = SYMBOL_EMOJI.get(ldr["symbol"], "📊")
+            price = ldr["ctx"].get("current", 0)
+            trend = ldr["ctx"].get("trend", "")
+            tpill = _trend_pill(trend)
             msg += f"{em} {name_label(ldr['symbol'])}\n"
-            msg += f"Sector: {md(ldr['sector'])}\n"
             msg += (
-                f"Stock: `{ldr['ctx']['day_change_pct']:+.2f}%` • "
-                f"Sector: `{ldr['sector_avg']:+.2f}%`\n"
+                f"Stock: `{ldr['ctx']['day_change_pct']:+.2f}%` {_pf(price)}  "
+                f"Sector avg: `{ldr['sector_avg']:+.2f}%`  {tpill}\n"
             )
             msg += f"💪 Outperforming by *{ldr['divergence']:+.2f}%*\n\n"
         msg += "💡 _Leaders during weakness can become future winners._\n\n"
 
+    # ── Laggards (cap at 10) ──────────────────────────────────
     if laggards:
         msg += "🔻 *LAGGARDS*\n_Weak names inside strong sectors_\n`─────────────────`\n"
-        for ldr in sorted(laggards, key=lambda x: x["divergence"]):
-            em = SYMBOL_EMOJI.get(ldr["symbol"], "📊")
+        for ldr in sorted(laggards, key=lambda x: x["divergence"])[:10]:
+            em    = SYMBOL_EMOJI.get(ldr["symbol"], "📊")
+            price = ldr["ctx"].get("current", 0)
+            trend = ldr["ctx"].get("trend", "")
+            tpill = _trend_pill(trend)
+            ema50 = ldr["ctx"].get("ema50")
+
             msg += f"{em} {name_label(ldr['symbol'])}\n"
-            msg += f"Sector: {md(ldr['sector'])}\n"
             msg += (
-                f"Stock: `{ldr['ctx']['day_change_pct']:+.2f}%` • "
-                f"Sector: `{ldr['sector_avg']:+.2f}%`\n"
+                f"Stock: `{ldr['ctx']['day_change_pct']:+.2f}%` {_pf(price)}  "
+                f"Sector avg: `{ldr['sector_avg']:+.2f}%`  {tpill}\n"
             )
-            msg += f"📉 Underperforming by *{ldr['divergence']:+.2f}%*\n\n"
+            msg += f"📉 Underperforming by *{ldr['divergence']:+.2f}%*\n"
+            if ema50 is not None:
+                msg += f"  `└─` Watch reclaim: EMA50 {_pf(ema50)}\n"
+            msg += "\n"
         msg += "⚠️ _Laggards in strong sectors show relative weakness._\n\n"
 
     msg += "*ACTION*\n`─────────────────`\n"
-    msg += "🏆 Prioritize leaders on pullbacks\n"
-    msg += "🔻 Avoid laggards until trend improves\n"
-    msg += "👀 Confirm with volume + EMA50 reclaim\n"
+    if leaders:
+        msg += "🏆 Prioritize leaders on pullbacks\n"
+    if laggards:
+        msg += "🔻 Avoid laggards until trend improves\n"
+        msg += "👀 Confirm with volume + EMA50 reclaim\n"
     msg += "\n`━━━━━━━━━━━━━━━━━━━━━`\n_AlphaEdge Leadership Intel_"
 
     return msg
-
 
 # ════════════════════════════════════════════════════════════
 # § COOLDOWN MANAGEMENT
@@ -2059,7 +2215,8 @@ def run_intel_scan() -> None:
             }
 
     leaders, laggards = check_leadership(all_contexts, sector_full)
-    if (leaders or laggards) and can_alert("last_leadership_alert", CFG.leadership_cooldown_h):
+    leadership_key = _daily_cool_key("last_leadership_alert")  # date-scoped = fires once per day max
+    if (leaders or laggards) and can_alert(leadership_key, hours=0):
         msg = format_leadership_alert(leaders, laggards)
         if msg and send_telegram(msg, silent=True):
             mark_alert("last_leadership_alert")
