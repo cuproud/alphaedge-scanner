@@ -1909,31 +1909,32 @@ def run_intel_scan() -> None:
             all_contexts[sym] = ctx
             print(f"  → {sym:10s} {ctx['day_change_pct']:+.2f}%")
 
-    # ── Big-move alerts ───────────────────────────────────────
-    for sym, ctx in all_contexts.items():
-        drop = ctx["day_change_pct"]
-        if not (drop <= CFG.big_drop_warn or drop >= CFG.big_gain_alert):
-            continue
-
-        cool_key = f"intel_bigmove_{sym}"
-        if not can_alert(cool_key, CFG.cooldown_hours):
-            print(f"  🔕 {sym} cooldown")
-            continue
-
-        # Fetch earnings once; pass to both get_verdict and format_big_move_alert
-        ed, days = get_earnings_date(sym)
-        verdict, zone, reasons = get_verdict(ctx, market_ctx, earnings_days=days)
-        ai_text = ai_analyze_drop(ctx, market_ctx) if abs(drop) >= 5 else None
-
-        msg = format_big_move_alert(
-            ctx, verdict, zone, reasons, ai_text, market_ctx,
-            earnings_date=ed,
-            days_until=days,
-        )
-        if msg and send_telegram(msg, silent=False):
-            mark_alert(cool_key)
-            alerts_fired += 1
-            print(f"  🚨 {sym} alert sent")
+   # ── Big-move alerts — DISABLED (manual on-demand only) ───
+    # To re-enable: uncomment the block below
+    # for sym, ctx in all_contexts.items():
+    #     drop = ctx["day_change_pct"]
+    #     if not (drop <= CFG.big_drop_warn or drop >= CFG.big_gain_alert):
+    #         continue
+    #
+    #     cool_key = f"intel_bigmove_{sym}"
+    #     if not can_alert(cool_key, CFG.cooldown_hours):
+    #         print(f"  🔕 {sym} cooldown")
+    #         continue
+    #
+    #     # Fetch earnings once; pass to both get_verdict and format_big_move_alert
+    #     ed, days = get_earnings_date(sym)
+    #     verdict, zone, reasons = get_verdict(ctx, market_ctx, earnings_days=days)
+    #     ai_text = ai_analyze_drop(ctx, market_ctx) if abs(drop) >= 5 else None
+    #
+    #     msg = format_big_move_alert(
+    #         ctx, verdict, zone, reasons, ai_text, market_ctx,
+    #         earnings_date=ed,
+    #         days_until=days,
+    #     )
+    #     if msg and send_telegram(msg, silent=False):
+    #         mark_alert(cool_key)
+    #         alerts_fired += 1
+    #         print(f"  🚨 {sym} alert sent")
 
     if not all_contexts:
         print("\n⚠️ No contexts — skipping aggregate detectors")
