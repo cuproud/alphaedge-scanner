@@ -1870,7 +1870,16 @@ def check_leadership(
                 })
 
     return leaders, laggards
-
+    
+def name_label(sym: str, *, bold_ticker: bool = True) -> str:
+    """Return 'AAPL — Apple Inc. (NASDAQ)' when metadata is available."""
+    meta = SYMBOL_META.get(sym, {})
+    name = meta.get("name", "")
+    exch = meta.get("exchange", "")
+    ticker = f"*{md(sym)}*" if bold_ticker else md(sym)
+    if name and exch: return f"{ticker} — {md(name)} ({md(exch)})"
+    if name:          return f"{ticker} — {md(name)}"
+    return ticker
 
 def format_leadership_alert(leaders: list[dict], laggards: list[dict]) -> str | None:
     """
