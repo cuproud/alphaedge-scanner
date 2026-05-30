@@ -1692,11 +1692,13 @@ def format_mover_digest(all_contexts: dict[str, dict], market_ctx: dict | None =
     # ── Helper: pullback zone line ────────────────────────────
     # Only shown when the setup warrants it (see logic per section below).
     def _pullback_zone(ctx: dict) -> str | None:
-        ema50  = ctx.get("ema50")
-        ema200 = ctx.get("ema200")
+        ema50   = ctx.get("ema50")
+        ema200  = ctx.get("ema200")
+        current = ctx.get("current", 0)
         if ema50 is None or ema200 is None:
             return None
-        return f"     `└─` Watch: EMA50 {_pf(ema50)} · EMA200 {_pf(ema200)}\n"
+        label = "Reclaim" if current < ema50 else "Watch"
+        return f"     `└─` {label}: EMA50 {_pf(ema50)} · EMA200 {_pf(ema200)}\n"
 
     # ── Classify gainers into conviction tiers ────────────────
     # High conviction: volume ≥ 1.5x AND trend upward AND RSI < 78
