@@ -1909,7 +1909,7 @@ def run_intel_scan() -> None:
             all_contexts[sym] = ctx
             print(f"  → {sym:10s} {ctx['day_change_pct']:+.2f}%")
 
-   # ── Big-move alerts — DISABLED (manual on-demand only) ───
+    # ── Big-move alerts — DISABLED (manual on-demand only) ───
     # To re-enable: uncomment the block below
     # for sym, ctx in all_contexts.items():
     #     drop = ctx["day_change_pct"]
