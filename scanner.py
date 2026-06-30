@@ -289,9 +289,43 @@ HISTORY_FILE = 'trade_history.json'
 STATE_FILE = 'scanner_state.json'
 SQS_HISTORY_FILE = 'sqs_history.json'
 DYNAMIC_THRESHOLD_FILE = 'dynamic_threshold.json'
+GEMINI_COUNTER_FILE = 'gemini_counter.json'
 SYMBOLS_YAML = 'symbols.yaml'
 LOGS_DIR = Path('logs')
 LOGS_DIR.mkdir(exist_ok=True)
+
+# ── Gemini free-tier hard cap ──
+GEMINI_DAILY_CAP = 1400  # under 1500/day free tier ceiling
+
+
+def _gemini_counter_load():
+    """Load today's Gemini call counter. Resets on new day."""
+    today = datetime.now(EST).strftime('%Y-%m-%d')
+    try:
+        with open(GEMINI_COUNTER_FILE, 'r') as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    if data.get('date') != today:
+        return {'date': today, 'count': 0}
+    return data
+
+
+def gemini_can_call() -> bool:
+    """Return True if under daily Gemini cap."""
+    return _gemini_counter_load()['count'] < GEMINI_DAILY_CAP
+
+
+def gemini_increment():
+    """Increment daily Gemini call counter."""
+    data = _gemini_counter_load()
+    data['count'] += 1
+    with open(GEMINI_COUNTER_FILE, 'w') as f:
+        json.dump(data, f)
+
+
+def gemini_calls_today() -> int:
+    return _gemini_counter_load()['count']
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2502,8 +2536,14 @@ def get_ai_analysis(sig):
     """
     Gemini analysis with company-name + sector context in the prompt
     (so AI knows it's analyzing 'NVIDIA Corp. — AI / Semis', not just 'NVDA').
+
+    Free-tier protection: hard cap at GEMINI_DAILY_CAP calls/day.
     """
     if not GEMINI_API_KEY:
+        return None
+
+    if not gemini_can_call():
+        logging.warning(f"Gemini daily cap {GEMINI_DAILY_CAP} reached ({gemini_calls_today()} today) — skipping AI")
         return None
 
     ah_note = ""
@@ -2542,7 +2582,10 @@ Respond EXACTLY (no extra lines):
         if r.status_code == 200:
             data = r.json()
             if data.get('candidates'):
+                gemini_increment()
                 return data['candidates'][0]['content']['parts'][0]['text'].strip()
+        elif r.status_code == 429:
+            logging.warning(f"Gemini 429 — rate limited (today: {gemini_calls_today()})")
     except Exception as e:
         logging.error(f"AI error: {e}")
     return None
