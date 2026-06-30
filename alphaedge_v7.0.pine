@@ -711,7 +711,10 @@ float chopHiLo      = ta.highest(high, chopIndexLen) - ta.lowest(low, chopIndexL
 float chopIndex     = chopHiLo > 0 ? 100.0 * math.log10(chopAtrSum / chopHiLo) / math.log10(chopIndexLen) : 50.0
 // Apply on 1H+ only — on 15m/30m pullback-resumption fires in consolidation
 // where CHOP reads high, blocking valid entries. Regime ADX floor handles it there.
-float chopThreshEff = timeframe.in_seconds() >= 3600 ? chopIndexThresh : 100.0
+// v7.0 I6: Choppiness gate now active on 30m+ (was 1H+ only in v6.10).
+// 15m left at 100.0 (effectively disabled) to preserve trade count on
+// pullback-resumption which legitimately fires in 15m consolidation.
+float chopThreshEff = timeframe.in_seconds() >= 1800 ? chopIndexThresh : 100.0
 bool  chopIdxOk     = not useChopIndex or chopIndex < chopThreshEff
 // ══════════════════════════════════════════════════════════════════════════════
 // HTF BIAS
@@ -1404,8 +1407,49 @@ passesGradeFilter(int sc) =>
         "All (incl C)" => true
         => true
 
-float sqsBull = f_calcSQS(true, bullScore, bearScore)
-float sqsBear = f_calcSQS(false, bullScore, bearScore)
+// v7.0 I7: Time-of-day SQS multiplier (US session bias)
+//   10:00-11:00 ET → 1.05× (morning trend window)
+//   14:00-15:00 ET → 1.05× (afternoon trend window)
+//   11:30-13:30 ET → 0.90× (lunch chop penalty)
+//   Other → 1.00×
+int   v7_nyHourTQ = hour(time,   "America/New_York")
+int   v7_nyMinTQ  = minute(time, "America/New_York")
+int   v7_nyMins   = v7_nyHourTQ * 60 + v7_nyMinTQ
+float v7_tqMult   = 1.0
+if v7_nyMins >= 600 and v7_nyMins < 660
+    v7_tqMult := 1.05
+else if v7_nyMins >= 840 and v7_nyMins < 900
+    v7_tqMult := 1.05
+else if v7_nyMins >= 690 and v7_nyMins < 810
+    v7_tqMult := 0.90
+
+// v7.0 I8: RS vs SPY (5-day lookback) confluence bonus
+//   Long signal: +1pt if symbol outperforming SPY 5d
+//   Short signal: +1pt if symbol underperforming SPY 5d
+//   Final score capped at 12 to preserve grade boundaries.
+spyCloseToday_v7 = request.security("SPY", "D", close[1], barmerge.gaps_off, barmerge.lookahead_off)
+spyClose5_v7     = request.security("SPY", "D", close[6], barmerge.gaps_off, barmerge.lookahead_off)
+float spyRet5_v7 = not na(spyClose5_v7) and spyClose5_v7 > 0 ? (spyCloseToday_v7 - spyClose5_v7) / spyClose5_v7 * 100.0 : 0.0
+
+// Approximate 5-session lookback in current TF bars
+int v7_barsPerSession = math.max(1, int(390 / math.max(1.0, timeframe.in_minutes())))
+int v7_lookbackBars   = math.min(2000, 5 * v7_barsPerSession)
+float v7_closeBack    = close[v7_lookbackBars]
+float v7_symRet5      = not na(v7_closeBack) and v7_closeBack > 0 ? (close - v7_closeBack) / v7_closeBack * 100.0 : 0.0
+float v7_rs5d         = v7_symRet5 - spyRet5_v7
+
+bool v7_rsBullOk = v7_rs5d > 0
+bool v7_rsBearOk = v7_rs5d < 0
+
+int bullScoreRaw = bullScore + (v7_rsBullOk ? 1 : 0)
+int bearScoreRaw = bearScore + (v7_rsBearOk ? 1 : 0)
+bullScore := math.min(12, bullScoreRaw)
+bearScore := math.min(12, bearScoreRaw)
+
+float sqsBull = f_calcSQS(true, bullScore, bearScore) * v7_tqMult
+float sqsBear = f_calcSQS(false, bullScore, bearScore) * v7_tqMult
+sqsBull := math.min(100.0, sqsBull)
+sqsBear := math.min(100.0, sqsBear)
 
 var float sqsBullConfirmed = na
 var float sqsBearConfirmed = na
