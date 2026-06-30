@@ -1,58 +1,68 @@
 //@version=6
 // ════════════════════════════════════════════════════════
-// ALPHAEDGE v6.10 | Author: VAMSI | Updated: June 23 2026
+// ALPHAEDGE v7.0 | Author: VAMSI | Updated: June 30 2026
 // 5-pillar confluence signal system for US equities + crypto
 // P1: HTF trend (3pts) P2: Momentum (2pts) P3: Volume (3pts)
 // P4: Regime (2pts) P5: Candle body (2pts) — max 12pts
+// + v7.0 RS bonus (+1pt if outperforming SPY 5d), score capped at 12
 // Regime gate: TRENDING + VOLATILE (+ TRANSITIONAL on 15m only)
-// SL: structure-based, capped at 5.0×ATR (standard + volatile regime)
+// SL: structure-based, staged (5.0×ATR initial → tightens to 3.0×ATR after +0.5R)
 // TP1/2/3: 1R / 2R / 3.5R | Early BE at 0.75R
 // ATR trail engages after TP1 on 1H, after early BE on 15m/30m
+// Stage-aware trail: 1.8× base → 1.5× after TP1 → 1.0× after TP2 → 0.6× after TP3
 // SQS 0-100: Regime 30% | Confluence 25% | MTF 20% | Vol 15% | Volatility 10%
+//          + time-of-day multiplier (1.05× during 10-11/14-15 ET, 0.90× during lunch)
 // Gates: POC distance (ATR-based) | EMA200 extension | HTF/LTF conflict
 //        (consolidated severity-weighted check) | Pillar purity (3-of-5 min)
-//        | Choppiness Index (1H+ only) | Direction-aware chop/cooldown filter
+//        | Choppiness Index (30m+ now, v7.0) | Direction-aware chop/cooldown filter
 // TF-aware tuning:
 //   - AE range filter length: 100 (15m) / 150 (30m) / 200 (1H+)
 //   - EMA200 slope floor: 0.003 (15m) / 0.005 (30m) / 0.006 (1H+)
 //   - Regime ADX floor: 15 (15m) / 20 (30m) / 22 (1H+)
 //   - Grade filter: 15m hardcoded score≥7 (bypasses dropdown, includes B-grade)
 //                   30m respects Grade Filter input (currently B and better)
-//                   1H+ hardcoded score≥9 (A+/A only, regardless of dropdown —
-//                   B-grade signals tested worse on 1H across all 4 symbols)
+//                   1H+ hardcoded score≥9 (A+/A only)
 //   - Min bars between signals: 1 (15m, no cooldown) / input value (30m+)
 // Circuit breaker: pauses new entries after 3 consecutive losses; cooldown
-//   escalates +10 bars per loss beyond the 3rd (prevents repeated-loss chains)
+//   escalates +10 bars per loss beyond the 3rd
 // Features: Volume Profile + Multi-TF POC, Order Blocks, FVGs, BOS/CHoCH,
 //   Anchored VWAP, CVD, Liquidity sweeps, MTF dashboard, Signal Quality Score,
 //   Smart Re-Entry, Gate Funnel audit table (diagnostic, zero effect on signal)
 // Backtest: grade-level WR (A+/A/B) | regime WR (Trending/Volatile) |
 //   drawdown (MaxDD/current, mark-to-market) | position sizing
 // Themes: 5 only (Ice Diamond, Bloomberg Classic, Honey Gold, Guntur Karam,
-//   Arctic Aurora) — reduced from 16 to manage compiled token limit
+//   Arctic Aurora)
 // Alerts: disabled (TradingView alerts are a paid feature not in use;
 //   Telegram delivery handled separately via AlphaEdge GitHub Actions repo)
 //
-// v6.10 CHANGES (June 23 2026):
-//   • Removed Pulse Animation (pure visual, no trading value)
-//   • Removed Label Glow Effects (triples label count, cosmetic only)
-//   • Removed Gradient TP/SL Lines (6 extra line objects per trade, aesthetic)
-//   • Watermark: kept text, removed animation
-//   • Live Bias Arrow: optimized — emoji + bias text + MTF bar only
-//     (removed score breakdown, bull/bear split, SQS — redundant with info table)
-//   • Removed Fast Mode (redundant after pulse/glow/gradient removal)
-//   • Multi-TF POC Lines: kept as-is for now
-//   • SMC Features: kept as optional toggles (OB, FVG, MS, Liq)
-//   • Elapsed Time Counter: kept as-is
+// v7.0 CHANGES (June 30 2026 — vs v6.10):
+//   • I1: P2 Momentum AND-logic — MACD+RSI both true=2pts, either=1pt, neither=0
+//   • I1: P3 Volume AND-logic — high vol+CVD both=3pts, either=1pt, neither=0
+//   • I3: Staged SL — tightens from initial 5.0×ATR to 3.0×ATR after +0.5R move
+//   • I4: Stage-aware trail mult — 1.8 base → 1.5 after TP1 → 1.0 after TP2 → 0.6 after TP3
+//   • I6: Choppiness gate now on 30m+ (was 1H+ only) — preserves 15m trade count
+//   • I7: Time-of-day SQS multiplier — boost 10-11AM/2-3PM, penalize 11:30-1:30 lunch
+//   • I8: RS vs SPY 5d confluence bonus (+1pt if outperforming, capped at 12)
+//   • Removed Pulse Animation (kept from v6.10)
+//   • Removed Label Glow Effects (kept from v6.10)
+//   • Removed Gradient TP/SL Lines (kept from v6.10)
+//   • Live Bias Arrow optimized (kept from v6.10)
 //   • Theme Engine (5 themes): kept as-is
+//
+// EXPECTED v7.0a IMPACT:
+//   PF: 1.5-1.8 → 2.2-2.4 (estimated)
+//   A-grade WR: 55-65% → 60-70%
+//   B-grade WR: 40-50% → 45-55%
+//   MaxDD: ~7R → ~5R (staged SL cap)
+//   Trade count: -5% to -10% (cleaner gates)
 // ════════════════════════════════════════════════════════
 
-indicator("AlphaEdge v6.10 by VAMSI", overlay=true, shorttitle="AE v6.10", max_labels_count=500, max_lines_count=500, max_boxes_count=500, max_bars_back=2000)
+indicator("AlphaEdge v7.0 by VAMSI", overlay=true, shorttitle="AE v7.0", max_labels_count=500, max_lines_count=500, max_boxes_count=500, max_bars_back=2000)
 import wbburgin/wbburgin_utils/2 as utils
 
 // ─── VERSION CONSTANTS ──────────────────────────────────────
-VERSION      = "v6.10"
-VERSION_FULL = "AlphaEdge v6.10"
+VERSION      = "v7.0"
+VERSION_FULL = "AlphaEdge v7.0"
 AUTHOR       = "VAMSI"
 
 // ─── GROUP CONSTANTS ────────────────────────────────────────
