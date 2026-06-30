@@ -1910,23 +1910,52 @@ bool canCheck = bar_index > (entryBar + 2) and tradeDir != 0 and not slHit
 // ──────────────────────────────────────────────────────────────────────────────
 float trailAtrMultEff = nz(trailAtrMult, slMult)
 
+// v7.0 I4: Stage-aware trail multiplier — tighter as trade matures
+f_stagedTrailMult(bool _tp1, bool _tp2, bool _tp3) =>
+    float m = trailAtrMultEff   // base 1.8 (from input)
+    if _tp3
+        m := 0.6                // lock most of TP3 gains
+    else if _tp2
+        m := 1.0                // tight after TP2
+    else if _tp1
+        m := 1.5                // moderate after TP1
+    m
+
 bool rsiExhaustLong  = rsiVal > 72 and rsiVal < rsiVal[1] and rsiVal[1] < rsiVal[2]
 bool rsiExhaustShort = rsiVal < 28 and rsiVal > rsiVal[1] and rsiVal[1] > rsiVal[2]
 // ── EARLY BREAKEVEN DETECTION ─────────────────────────────────────────────────
 var bool earlyBEArmed = false
+var bool slStageTightened = false   // v7.0 I3: SL tighten flag
 
 if confirmedBuy or confirmedSell
     earlyBEArmed := false
+    slStageTightened := false
 
 if canCheck and tradeDir == 1
     float profitR = not na(entryPrice) and not na(tradeRisk) and tradeRisk > 0 ? (high - entryPrice) / tradeRisk : 0.0
     if profitR >= 0.75 and not earlyBEArmed
         earlyBEArmed := true
+    // v7.0 I3: Stage-tighten SL after +0.5R favorable move
+    if profitR >= 0.5 and not slStageTightened
+        float effMax = regimeVolatile ? maxSLDistVol : maxSLDistance
+        float currentDist = entryPrice - slPrice    // long: positive
+        float tightenDist = atrVal * math.min(effMax, 3.0)
+        if currentDist > tightenDist
+            slPrice := entryPrice - tightenDist
+        slStageTightened := true
 
 if canCheck and tradeDir == -1
     float profitR = not na(entryPrice) and not na(tradeRisk) and tradeRisk > 0 ? (entryPrice - low) / tradeRisk : 0.0
     if profitR >= 0.75 and not earlyBEArmed
         earlyBEArmed := true
+    // v7.0 I3: Stage-tighten SL after +0.5R favorable move
+    if profitR >= 0.5 and not slStageTightened
+        float effMax = regimeVolatile ? maxSLDistVol : maxSLDistance
+        float currentDist = slPrice - entryPrice    // short: positive
+        float tightenDist = atrVal * math.min(effMax, 3.0)
+        if currentDist > tightenDist
+            slPrice := entryPrice + tightenDist
+        slStageTightened := true
 
 if canCheck and tradeDir == 1
     float trailFloor = slPrice
@@ -1943,7 +1972,8 @@ if canCheck and tradeDir == 1
     bool trailEngaged = timeframe.in_seconds() >= 3600 ? (regimeTrending ? tp1Hit : earlyBEArmed) : earlyBEArmed
     float newTrail = trailFloor
     if trailEngaged
-        float atrTrailLevel = high - atrVal * trailAtrMultEff
+        float stagedMult    = f_stagedTrailMult(tp1Hit, tp2Hit, tp3Hit)   // v7.0 I4
+        float atrTrailLevel = high - atrVal * stagedMult
         newTrail := math.max(atrTrailLevel, trailFloor)
     trailPrice := math.max(trailPrice, newTrail)
 
@@ -1978,7 +2008,8 @@ if canCheck and tradeDir == -1
     bool trailEngaged = timeframe.in_seconds() >= 3600 ? (regimeTrending ? tp1Hit : earlyBEArmed) : earlyBEArmed
     float newTrail = trailFloor
     if trailEngaged
-        float atrTrailLevel = low + atrVal * trailAtrMultEff
+        float stagedMult    = f_stagedTrailMult(tp1Hit, tp2Hit, tp3Hit)   // v7.0 I4
+        float atrTrailLevel = low + atrVal * stagedMult
         newTrail := math.min(atrTrailLevel, trailFloor)
     trailPrice := math.min(trailPrice, newTrail)
 
