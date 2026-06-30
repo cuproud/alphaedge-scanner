@@ -1,11 +1,11 @@
-# 🎯 AlphaEdge v6.10 Trading System
+# 🎯 AlphaEdge v7.0 Trading System
 
 > **Pine Script parity signal scanner + market intelligence suite**  
-> Telegram alerts • 12-point scoring • Quiet hours • Circuit breaker • **Free forever**
+> Telegram alerts • 12-point scoring + RS bonus • Quiet hours • Circuit breaker • **Free forever**
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
-![Status](https://img.shields.io/badge/status-v6.10%20migration-orange)
-![Version](https://img.shields.io/badge/version-6.10--beta-yellow)
+![Status](https://img.shields.io/badge/status-v7.0%20beta-orange)
+![Version](https://img.shields.io/badge/version-7.0--beta-yellow)
 
 ---
 
@@ -260,9 +260,11 @@ alphaedge-scanner/
 
 ## 📖 Documentation
 
+- **[V7.0_RELEASE.md](docs/V7.0_RELEASE.md)** — v7.0 release notes + backtest plan
+- **[V7.0_REVIEW_AND_DESIGN.md](docs/V7.0_REVIEW_AND_DESIGN.md)** — Deep review of v6.10 + design rationale
 - **[TELEGRAM_ALERTS.md](docs/TELEGRAM_ALERTS.md)** — All 7 alert types with examples
-- **[V6.10_MIGRATION_PLAN.md](docs/V6.10_MIGRATION_PLAN.md)** — Technical blueprint
-- **[V6.10_PROGRESS.md](docs/V6.10_PROGRESS.md)** — Real-time status
+- **[V6.10_MIGRATION_PLAN.md](docs/V6.10_MIGRATION_PLAN.md)** — Technical blueprint (legacy)
+- **[V6.10_PROGRESS.md](docs/V6.10_PROGRESS.md)** — v6.10 migration tracker
 - **[FREE_TIER_FIXES.md](docs/FREE_TIER_FIXES.md)** — 8 free-tier safety fixes
 - **[SETUP.md](SETUP.md)** — Detailed setup instructions
 
