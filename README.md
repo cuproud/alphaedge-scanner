@@ -242,18 +242,19 @@ alphaedge-scanner/
 
 ## 🔬 Migration Status
 
-**Current:** v6.10 migration in progress (~30% complete)
+**Current:** v6.10 migration in progress
 
 | Feature | Status |
 |---------|--------|
 | Configuration (symbols.yaml) | ✅ Done |
-| Quiet Hours Gate | ✅ Done |
+| Quiet Hours Gate (market_intel + scanner) | ✅ Done |
+| Free-tier safety fixes (8 total) | ✅ Done |
 | Enhanced Alert UI | ⏳ Next |
 | 12-Point Scoring | ⏳ Pending |
 | Circuit Breaker | ⏳ Pending |
 | Dynamic TP/SL | ⏳ Pending |
 
-**See:** `docs/V6.10_PROGRESS.md` for detailed status
+**See:** `docs/V6.10_PROGRESS.md` and `docs/FREE_TIER_FIXES.md` for detail
 
 ---
 
@@ -262,6 +263,7 @@ alphaedge-scanner/
 - **[TELEGRAM_ALERTS.md](docs/TELEGRAM_ALERTS.md)** — All 7 alert types with examples
 - **[V6.10_MIGRATION_PLAN.md](docs/V6.10_MIGRATION_PLAN.md)** — Technical blueprint
 - **[V6.10_PROGRESS.md](docs/V6.10_PROGRESS.md)** — Real-time status
+- **[FREE_TIER_FIXES.md](docs/FREE_TIER_FIXES.md)** — 8 free-tier safety fixes
 - **[SETUP.md](SETUP.md)** — Detailed setup instructions
 
 ---
