@@ -1301,19 +1301,47 @@ bool cvdBearBonus = useCVD and cvdBearDiv
 bool bullBonusActive = cvdBullBonus or smcBullBonus or (liqBonusScore and freshBullSweep) or highVol
 bool bearBonusActive = cvdBearBonus or smcBearBonus or (liqBonusScore and freshBearSweep) or highVol
 
-// ── 4-PILLAR SCORE ────────────────────────────────────────────────────────────
+// ── 5-PILLAR SCORE (v7.0 I1: AND-logic on P2/P3) ─────────────────────────────
 
 // PILLAR 1: Structural trend (4H HTF)
 bool p1Bull = htfBull
 bool p1Bear = not htfBull
 
-// PILLAR 2: Momentum confirmation — state-based, not crossover-based
-bool p2Bull = macdBull or (rsiVal > 50 and rsiVal > rsiVal[2])
-bool p2Bear = not macdBull or (rsiVal < 50 and rsiVal < rsiVal[2])
+// PILLAR 2: Momentum confirmation — v7.0 AND-logic
+//   Both true → 2pts (highest conviction)
+//   Either true → 1pt (partial credit)
+//   Neither → 0pts
+bool p2BullMacd = macdBull
+bool p2BullRsi  = rsiVal > 50 and rsiVal > rsiVal[2]
+bool p2BearMacd = not macdBull
+bool p2BearRsi  = rsiVal < 50 and rsiVal < rsiVal[2]
 
-// PILLAR 3: Volume confirmation
-bool p3Bull = highVol and (not useCVD or cvdBullDiv or cvdValue > cvdValue[3])
-bool p3Bear = highVol and (not useCVD or cvdBearDiv or cvdValue < cvdValue[3])
+int p2BullPts = (p2BullMacd and p2BullRsi) ? 2 : ((p2BullMacd or p2BullRsi) ? 1 : 0)
+int p2BearPts = (p2BearMacd and p2BearRsi) ? 2 : ((p2BearMacd or p2BearRsi) ? 1 : 0)
+
+// Boolean flags for purity count (any momentum agreement counts as pillar present)
+bool p2Bull = p2BullPts > 0
+bool p2Bear = p2BearPts > 0
+
+// PILLAR 3: Volume confirmation — v7.0 AND-logic
+//   high vol AND CVD aligned → 3pts (institutional commit)
+//   Either alone → 1pt (partial)
+//   Neither → 0pts
+bool p3BullVol = highVol
+bool p3BullCvd = not useCVD ? false : (cvdBullDiv or cvdValue > cvdValue[3])
+bool p3BearVol = highVol
+bool p3BearCvd = not useCVD ? false : (cvdBearDiv or cvdValue < cvdValue[3])
+
+// When CVD disabled, fall back to vol-only (1pt if true)
+int p3BullPts = useCVD ?
+                ((p3BullVol and p3BullCvd) ? 3 : ((p3BullVol or p3BullCvd) ? 1 : 0)) :
+                (p3BullVol ? 2 : 0)  // CVD off: vol=2pts (not full 3)
+int p3BearPts = useCVD ?
+                ((p3BearVol and p3BearCvd) ? 3 : ((p3BearVol or p3BearCvd) ? 1 : 0)) :
+                (p3BearVol ? 2 : 0)
+
+bool p3Bull = p3BullPts > 0
+bool p3Bear = p3BearPts > 0
 
 // PILLAR 4: Regime environment
 bool p4 = regimeTrending or regimeVolatile
@@ -1326,15 +1354,15 @@ bool p5Bear = useCandleGate and close < open and barBodyPct > 0.5
 // Composite score (0-12 scale: P1=3, P2=2, P3=3, P4=2, P5=2)
 bullScore = 0
 bullScore += p1Bull ? 3 : 0
-bullScore += p2Bull ? 2 : 0
-bullScore += p3Bull ? 3 : 0
+bullScore += p2BullPts
+bullScore += p3BullPts
 bullScore += p4     ? 2 : 0
 bullScore += p5Bull ? 2 : 0
 
 bearScore = 0
 bearScore += p1Bear ? 3 : 0
-bearScore += p2Bear ? 2 : 0
-bearScore += p3Bear ? 3 : 0
+bearScore += p2BearPts
+bearScore += p3BearPts
 bearScore += p4     ? 2 : 0
 bearScore += p5Bear ? 2 : 0
 
