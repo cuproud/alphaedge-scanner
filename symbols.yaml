@@ -693,3 +693,66 @@ settings:
     cooldown_hours:  8
     fetch_workers:   5
     max_loss_pct:    8.0
+
+  scanner:
+    # ── v6.10 Pine Script Parity ────────────────────────────────────
+    version: "6.10"
+
+    # Signal Quality
+    sqs_min_for_alert: 75           # Base SQS threshold (raised +5 on 1H+ auto)
+    grade_filter: "A+ and A"        # "A+ Only" | "A+ and A" | "B and better" | "All (incl C)"
+    min_conf_score: 7               # Min confluence for 12-point system (58% of max)
+
+    # Time Filter — NO OVERNIGHT ALERTS 10 PM - 7 AM ET
+    time_filter:
+      enabled: true
+      quiet_start: "22:00"          # 10 PM ET — block all alerts
+      quiet_end: "07:00"            # 7 AM ET — resume alerts
+      batch_delivery: true          # Queue overnight signals, deliver at 7 AM
+      bypass_critical: true         # VIX spike alerts bypass quiet hours
+      block_first_30min: true       # Block 9:30-10:00 AM (market open noise)
+      block_last_15min: true        # Block 3:45-4:00 PM (market close chop)
+      skip_weekends: true           # No alerts Sat/Sun (crypto still scans)
+
+    # Circuit Breaker — Stop After 3 Consecutive Losses
+    circuit_breaker:
+      enabled: true
+      loss_threshold: 3             # Pause after this many losses
+      cooldown_bars: 10             # Base cooldown (30 min on 30m TF)
+      escalation: 10                # +10 bars per loss beyond threshold
+      # Logic: 3 losses = 10 bars, 4th = 20 bars, 5th = 30 bars
+
+    # Dynamic Regime-Based TP/SL (v6.10 §DYNR)
+    dynamic_rr:
+      enabled: true
+      volatile:
+        tp1: 1.5                    # Wider TPs ride momentum
+        tp2: 2.5
+        tp3: 4.0
+        sl_mult: 2.5                # Wider SL avoids noise stops
+      quiet:
+        tp1: 0.8                    # Tighter TPs grab profit fast
+        tp2: 1.5
+        tp3: 2.0
+        sl_mult: 1.5                # Tighter SL
+      standard:                     # TRENDING / RANGING / TRANSITIONAL
+        tp1: 1.0
+        tp2: 2.0
+        tp3: 3.5
+        sl_mult: 2.0
+
+    # 12-Point Scoring System (v6.10 5-Pillar)
+    pillars:
+      p1_htf_trend: 3               # P1: HTF Trend (4H EMA50 vs EMA200)
+      p2_momentum: 2                # P2: Momentum (MACD + RSI state)
+      p3_volume: 3                  # P3: Volume (high vol + CVD)
+      p4_regime: 2                  # P4: Regime (TRENDING or VOLATILE only)
+      p5_candle_body: 2             # P5: Candle Body (body > 50% of bar)
+      # Total: 12 points max (vs old 9-point system)
+
+    # Alert Formatting
+    ui:
+      emoji_rich: true              # Use emoji headers in alerts
+      compact_cards: true           # Compact format (vs verbose)
+      group_sector_bleeds: true     # Group sector moves (reduce spam)
+      show_regime_rationale: true   # Show why TP/SL adjusted by regime
