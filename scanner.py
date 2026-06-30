@@ -3447,6 +3447,7 @@ def main():
         new_sigs.sort(key=lambda s: s['sqs'], reverse=True)
         if len(new_sigs) >= DIGEST_THRESHOLD:
             send_telegram(format_digest(new_sigs), silent=False)
+            time.sleep(0.3)
             print("📦 Sent digest")
             # Full details for signals at/above threshold
             hq = [s for s in new_sigs if s['sqs'] >= eff_threshold]
@@ -3454,17 +3455,21 @@ def main():
                 print(f"  Sending {len(hq)} full details...")
                 for sig in hq:
                     send_telegram(format_new_signal(sig, sig.get('ai_text')), silent=False)
+                    time.sleep(0.3)
             corr = format_correlation_alert(new_sigs, trades)
             if corr:
                 send_telegram(corr, silent=True)
+                time.sleep(0.3)
         else:
             for sig in new_sigs:
                 silent = 'FAIR' in sig['tier'] or 'LOW' in sig['tier']
                 send_telegram(format_new_signal(sig, sig.get('ai_text')), silent=silent)
+                time.sleep(0.3)
             print(f"📨 Sent {len(new_sigs)} alert(s)")
             corr = format_correlation_alert(new_sigs, trades)
             if corr:
                 send_telegram(corr, silent=True)
+                time.sleep(0.3)
 
     save_json(ALERT_CACHE, cache)
     save_json(TRADES_FILE, trades)
