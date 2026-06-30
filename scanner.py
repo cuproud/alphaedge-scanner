@@ -3228,10 +3228,20 @@ def _tg_send(message, silent=False):
         return False
 
 def send_telegram(message, silent=False):
-    """Send Telegram message — auto-splits on section boundaries when > 3900 chars."""
+    """
+    Send Telegram message — auto-splits on section boundaries when > 3900 chars.
+
+    Quiet hours (v6.10): 22:00-06:59 ET blocks send and queues for 7 AM batch.
+    Critical events (CIRCUIT BREAKER, VIX spike) bypass quiet hours.
+    """
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logging.warning("Telegram credentials missing")
         return False
+
+    # Quiet hours gate
+    if is_quiet_hours() and not should_bypass_quiet(message):
+        queue_overnight_alert(message, silent)
+        return True
 
     parts = _split_for_telegram(message)
     if len(parts) == 1:
@@ -3244,6 +3254,72 @@ def send_telegram(message, silent=False):
             ok = False
         time.sleep(0.3)
     return ok
+
+
+# ── Quiet hours gate (v6.10) ────────────────────────────────────────
+QUIET_QUEUE_FILE = 'overnight_alerts.json'
+
+
+def is_quiet_hours() -> bool:
+    """Check current ET hour against 22:00-06:59 quiet window."""
+    scanner_cfg = (YAML_SETTINGS.get('scanner') or {}) if 'YAML_SETTINGS' in globals() else {}
+    tf_cfg = (scanner_cfg.get('time_filter') or {})
+    if not tf_cfg.get('enabled', True):
+        return False
+    h = datetime.now(EST).hour
+    return h >= 22 or h < 7
+
+
+def should_bypass_quiet(message: str) -> bool:
+    """Critical events bypass quiet hours."""
+    msg_upper = message.upper()
+    if 'CIRCUIT BREAKER' in msg_upper:
+        return True
+    if 'VIX' in msg_upper and ('SPIKE' in msg_upper or '> 35' in msg_upper or 'CRITICAL' in msg_upper):
+        return True
+    return False
+
+
+def queue_overnight_alert(message: str, silent: bool):
+    """Append alert to overnight queue file. Delivered at 7 AM ET batch."""
+    try:
+        with open(QUIET_QUEUE_FILE, 'r') as f:
+            queue = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        queue = []
+    queue.append({'message': message, 'silent': silent, 'queued_at': datetime.now(EST).isoformat()})
+    with open(QUIET_QUEUE_FILE, 'w') as f:
+        json.dump(queue, f)
+    logging.info(f"Alert queued for 7 AM batch (queue size: {len(queue)})")
+
+
+def deliver_overnight_queue() -> int:
+    """Flush overnight queue. Returns count delivered."""
+    try:
+        with open(QUIET_QUEUE_FILE, 'r') as f:
+            queue = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return 0
+    if not queue:
+        return 0
+
+    n = len(queue)
+    header = f"🌅 *Morning Alert Batch* — {n} queued overnight\n`━━━━━━━━━━━━━━━━━━━━`"
+    _tg_send(header, silent=False)
+    time.sleep(0.5)
+
+    sent = 0
+    for item in queue:
+        for part in _split_for_telegram(item['message']):
+            if _tg_send(part, item.get('silent', False)):
+                sent += 1
+            time.sleep(0.3)
+
+    # Clear queue after flush
+    with open(QUIET_QUEUE_FILE, 'w') as f:
+        json.dump([], f)
+    logging.info(f"Delivered {sent} overnight alerts")
+    return sent
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # §19  CORRELATION DETECTOR
