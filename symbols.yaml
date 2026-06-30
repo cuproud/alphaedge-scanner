@@ -695,8 +695,8 @@ settings:
     max_loss_pct:    8.0
 
   scanner:
-    # ── v6.10 Pine Script Parity ────────────────────────────────────
-    version: "6.10"
+    # ── Pine v7.0 Parity ────────────────────────────────────────────
+    version: "7.0"
 
     # Signal Quality
     sqs_min_for_alert: 75           # Base SQS threshold (raised +5 on 1H+ auto)

@@ -1,11 +1,14 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
-  ALPHAEDGE SCANNER v7.1 — PINE PARITY + ADVANCED INTELLIGENCE
+  ALPHAEDGE SCANNER v7.2 — PINE v7.0 PARITY + FREE-TIER HARDENING
 ═══════════════════════════════════════════════════════════════════════════════
 
-  A self-contained signal scanner that mirrors TradingView Pine Script v6.3.2
-  exactly (Wilder's RMA, volume-driven Range Filter, ratcheting Supertrend,
-  etc.) with an advanced intelligence layer on top.
+  A self-contained signal scanner that mirrors TradingView Pine Script v7.0
+  (12pt 5-pillar with AND-logic P2/P3, staged SL, stage-aware trail, 30m chop
+  gate, time-of-day SQS multiplier, RS vs SPY confluence bonus) with an
+  advanced intelligence layer on top.
+
+  Aligned with: alphaedge_v7.0.pine
 
   Companion files
   ───────────────
@@ -3425,7 +3428,7 @@ def main():
 
     _startup_banner(session, active_list, eff_threshold)
 
-    logging.info(f"Scan v7.1 | session={session} | active={len(active_list)} | "
+    logging.info(f"Scan v7.2 | session={session} | active={len(active_list)} | "
                  f"threshold={eff_threshold} | universe={U.summary()}")
 
     cache  = load_cache()   # auto-cleaned
