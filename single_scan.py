@@ -179,9 +179,27 @@ def load_universe() -> tuple[list[str], dict[str, str]]:
 # SECTION 7 — SYMBOL HELPERS
 # ════════════════════════════════════════════════════════════════════
 
+import re
+
+# Whitelist: A-Z, 0-9, dot, dash, equals, caret (covers BRK.B, GC=F, ^VIX)
+_SAFE_SYMBOL_RE = re.compile(r"[^A-Z0-9.\-=^]")
+SYMBOL_MAX_LEN = 12
+
+
+def sanitize_symbol(raw: str) -> str:
+    """
+    Strip non-ticker chars from user input. Prevents shell-style
+    injection through symbol arg. Returns empty if nothing valid.
+    """
+    if not raw:
+        return ""
+    s = raw.strip().upper()[:SYMBOL_MAX_LEN]
+    return _SAFE_SYMBOL_RE.sub("", s)
+
+
 def normalise_symbol(raw: str) -> str:
     """Resolve common aliases (BTC, ETH, GOLD) to their yfinance tickers."""
-    s = raw.strip().upper()
+    s = sanitize_symbol(raw)
     aliases = {
         "BITCOIN":  "BTC-USD",
         "BTC":      "BTC-USD",
