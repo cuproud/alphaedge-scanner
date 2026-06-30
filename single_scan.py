@@ -1802,6 +1802,65 @@ def save_alerts(alerts: dict) -> None:
     save_json(ALERTS_FILE, alerts)
 
 
+# ── Bound state file growth (v6.10) ────────────────────────────────
+ALERT_PURGE_TRIGGERED_HOURS = 24   # delete triggered alerts after 24h
+ALERT_PURGE_EXPIRED_HOURS   = 24   # delete expired alerts after 24h
+ALERT_MAX_ENTRIES           = 500  # hard cap on total entries
+
+
+def purge_alerts(alerts: dict) -> tuple[dict, int]:
+    """
+    Remove old triggered and post-expiry entries. Caps total entries.
+    Returns (pruned_alerts, removed_count). Pure — does not save.
+    """
+    now = now_est()
+    removed = 0
+
+    for key in list(alerts.keys()):
+        a = alerts[key]
+
+        # Triggered + older than 24h
+        if a.get("triggered"):
+            trig_at = a.get("triggered_at") or a.get("set_at")
+            try:
+                ts = datetime.fromisoformat(trig_at)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=EST)
+                if (now - ts).total_seconds() > ALERT_PURGE_TRIGGERED_HOURS * 3600:
+                    del alerts[key]
+                    removed += 1
+                    continue
+            except Exception:
+                del alerts[key]
+                removed += 1
+                continue
+
+        # Expired more than 24h ago
+        try:
+            exp = datetime.fromisoformat(a["expires_at"])
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=EST)
+            if (now - exp).total_seconds() > ALERT_PURGE_EXPIRED_HOURS * 3600:
+                del alerts[key]
+                removed += 1
+                continue
+        except (KeyError, ValueError):
+            pass
+
+    # Hard cap — keep newest by set_at
+    if len(alerts) > ALERT_MAX_ENTRIES:
+        sorted_keys = sorted(
+            alerts.keys(),
+            key=lambda k: alerts[k].get("set_at", ""),
+            reverse=True,
+        )
+        for k in sorted_keys[ALERT_MAX_ENTRIES:]:
+            del alerts[k]
+            removed += 1
+
+    return alerts, removed
+
+
 def set_alert(symbol: str, target_price: float, direction: str = "auto") -> None:
     alerts = load_alerts()
     try:
@@ -1933,7 +1992,8 @@ def check_alerts() -> None:
                 f"ALERT TRIGGERED\n{em} *{symbol}* hit `${target:.2f}`\n"
                 f"Current: `${current:.2f}`\nAlert removed."
             )
-            a["triggered"] = True
+            a["triggered"]    = True
+            a["triggered_at"] = now.isoformat()
             changed = True
         elif (not a.get("warning_sent") and (
             (direction == "above" and current >= warn_price) or
@@ -1948,6 +2008,9 @@ def check_alerts() -> None:
             changed = True
 
     if changed:
+        alerts, removed = purge_alerts(alerts)
+        if removed:
+            logging.info(f"purge_alerts: removed {removed} stale entries")
         save_alerts(alerts)
 
 
