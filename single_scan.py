@@ -1241,19 +1241,14 @@ Respond EXACTLY:
                 if data.get("candidates"):
                     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
             elif r.status_code == 429:
-                return None   # signal retry
+                logging.warning("Gemini 429 — skipping (free tier protection)")
             else:
                 logging.warning(f"Gemini error {r.status_code}")
         except Exception as exc:
             logging.error(f"AI analysis: {exc}")
         return None
 
-    result = _call()
-    if result is None:
-        logging.warning("Gemini rate limited, retrying in 15s")
-        time.sleep(15)
-        result = _call()
-    return result
+    return _call()
 
 
 # ════════════════════════════════════════════════════════════════════
