@@ -593,11 +593,28 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ── yfinance global rate limiter (free-tier protection) ────────
+_YF_RATE_LOCK = Lock()
+_YF_LAST_CALL = [0.0]
+_YF_MIN_INTERVAL = 0.15  # 6.6 calls/sec ceiling across all threads
+
+
+def _yf_rate_limit():
+    """Block until min interval elapsed since last yf call (any thread)."""
+    with _YF_RATE_LOCK:
+        elapsed = time.time() - _YF_LAST_CALL[0]
+        if elapsed < _YF_MIN_INTERVAL:
+            time.sleep(_YF_MIN_INTERVAL - elapsed)
+        _YF_LAST_CALL[0] = time.time()
+
+
 def _yf_download(symbol: str, period: str, interval: str) -> pd.DataFrame | None:
     """
     Cached yfinance wrapper.  Returns None on failure or empty result.
     Cache key = "SYMBOL|period|interval" — separate dicts for daily vs intraday
     to avoid key collision when same period/interval string is reused.
+
+    Global rate limit: _YF_MIN_INTERVAL between calls across all threads.
     """
     key = f"{symbol}|{period}|{interval}"
     is_daily = (interval == "1d")
@@ -609,6 +626,7 @@ def _yf_download(symbol: str, period: str, interval: str) -> pd.DataFrame | None
 
     for attempt in range(2):
         try:
+            _yf_rate_limit()
             df = yf.download(symbol, period=period, interval=interval,
                              progress=False, auto_adjust=True)
             if df is None or df.empty:
