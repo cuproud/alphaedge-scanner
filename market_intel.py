@@ -229,6 +229,72 @@ def display_now() -> datetime: return now_est().astimezone(DISPLAY_TZ)
 
 
 # ════════════════════════════════════════════════════════════
+# § TIME FILTER — QUIET HOURS (v6.10)
+#   Block alerts 10 PM - 7 AM ET. Scanner continues, alerts queue.
+# ════════════════════════════════════════════════════════════
+
+_QUEUED_ALERTS: list[tuple[str, bool]] = []  # (message, silent) pairs
+
+def is_quiet_hours() -> bool:
+    """Check if current time is in quiet hours (10 PM - 7 AM ET)."""
+    time_filter = (YAML_SETTINGS.get("scanner") or {}).get("time_filter") or {}
+    if not time_filter.get("enabled", True):
+        return False
+
+    now = now_est()
+    hour = now.hour
+
+    # 22:00 (10 PM) through 06:59 (before 7 AM)
+    return hour >= 22 or hour < 7
+
+
+def queue_alert(message: str, silent: bool = False) -> None:
+    """Queue alert for 7 AM batch delivery."""
+    _QUEUED_ALERTS.append((message, silent))
+    logging.info(f"Alert queued for 7 AM batch (total queued: {len(_QUEUED_ALERTS)})")
+
+
+def deliver_queued_alerts() -> int:
+    """Deliver all queued alerts. Returns count sent."""
+    if not _QUEUED_ALERTS:
+        return 0
+
+    count = len(_QUEUED_ALERTS)
+    logging.info(f"Delivering {count} queued alerts from overnight")
+
+    # Send batch header
+    header = f"🌅 **Morning Alert Batch** — {count} queued overnight\n{H_RULE}"
+    _send_single(header, silent=False)
+    time.sleep(0.5)
+
+    sent = 0
+    for msg, silent in _QUEUED_ALERTS:
+        if send_telegram(msg, silent=silent):
+            sent += 1
+        time.sleep(0.5)
+
+    _QUEUED_ALERTS.clear()
+    return sent
+
+
+def should_bypass_quiet(message: str) -> bool:
+    """Check if alert should bypass quiet hours (VIX spike, critical events)."""
+    time_filter = (YAML_SETTINGS.get("scanner") or {}).get("time_filter") or {}
+    if not time_filter.get("bypass_critical", True):
+        return False
+
+    # VIX spike bypass
+    if "VIX" in message and ("spike" in message.lower() or "> 35" in message):
+        return True
+
+    # Circuit breaker bypass
+    if "CIRCUIT BREAKER" in message.upper():
+        return True
+
+    return False
+
+
+# ════════════════════════════════════════════════════════════
 # § JSON I/O — atomic, fcntl-locked state writes
 # ════════════════════════════════════════════════════════════
 
@@ -2117,7 +2183,16 @@ def _send_single(message: str, silent: bool = False) -> bool:
 
 
 def send_telegram(message: str, silent: bool = False) -> bool:
-    """Split and send a (potentially long) Telegram message. Returns True if all chunks sent."""
+    """
+    Split and send a (potentially long) Telegram message.
+    Respects quiet hours (10 PM - 7 AM ET) unless bypass_critical.
+    Returns True if all chunks sent.
+    """
+    # Check quiet hours gate
+    if is_quiet_hours() and not should_bypass_quiet(message):
+        queue_alert(message, silent)
+        return True  # queued = success
+
     ok = True
     for chunk in _split_for_telegram(message):
         if not _send_single(chunk, silent):
