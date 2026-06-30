@@ -581,3 +581,19 @@ All alerts respect quiet hours unless bypass criteria met.
 **Last Updated:** 2026-06-30  
 **Pine Script:** v6.10  
 **Python Modules:** scanner.py, market_intel.py, dip_scanner.py, morning_brief.py
+
+---
+
+## 🔒 Free-Tier Protections (v6.10)
+
+Alert system designed to stay within free-tier ceilings:
+
+| Service | Limit | Protection |
+|---------|-------|-----------|
+| Telegram | 30 msg/sec, 20 msg/min per chat | 0.3s throttle between sends |
+| Gemini AI | 1500 req/day | Hard cap at 1400, daily counter resets |
+| yfinance | Anti-burst (yahoo-side) | 0.15s global rate limit, thread-safe |
+| Cloudflare Worker | 100,000 req/day | External — managed in worker.js |
+| GitHub Actions | 6h/job (public repos) | No `sleep(15)` retries, fast 429 skip |
+
+See `docs/FREE_TIER_FIXES.md` for full implementation details.
