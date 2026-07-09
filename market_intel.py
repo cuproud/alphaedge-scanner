@@ -277,21 +277,13 @@ def deliver_queued_alerts() -> int:
     return sent
 
 
-def should_bypass_quiet(message: str) -> bool:
-    """Check if alert should bypass quiet hours (VIX spike, critical events)."""
-    time_filter = (YAML_SETTINGS.get("scanner") or {}).get("time_filter") or {}
-    if not time_filter.get("bypass_critical", True):
-        return False
+# Quiet-hours bypass: only genuinely "major" market events break through
+# 10 PM–7 AM (user directive). Everything else queues to the 7 AM batch.
+NIGHT_BYPASS_MOVE_PCT = 10.0   # single-stock |day move| ≥ this bypasses quiet hrs
 
-    # VIX spike bypass
-    if "VIX" in message and ("spike" in message.lower() or "> 35" in message):
-        return True
-
-    # Circuit breaker bypass
-    if "CIRCUIT BREAKER" in message.upper():
-        return True
-
-    return False
+def is_major_move(day_change_pct: float) -> bool:
+    """True if a single-stock move is big enough to wake the user at night."""
+    return abs(day_change_pct) >= NIGHT_BYPASS_MOVE_PCT
 
 
 # ════════════════════════════════════════════════════════════
@@ -561,6 +553,8 @@ BIG_GAIN_ALERT        = CFG.big_gain_alert
 NEAR_52W_LOW_PCT      = CFG.near_52w_low_pct
 ATH_PULLBACK_ALERT    = CFG.ath_pullback_alert
 COOLDOWN_HOURS        = CFG.cooldown_hours
+MOVER_DIGEST_CAP      = 12    # max gainers/drops shown per BIG MOVERS message
+SECTOR_BLEED_COLLAPSE = 2     # sector bleed: worst-N names shown per sector, rest collapsed
 SECTOR_BLEED_COOLDOWN = CFG.sector_bleed_cooldown_h
 LEADERSHIP_COOLDOWN   = CFG.leadership_cooldown_h
 EARNINGS_WARNING_DAYS = CFG.earnings_warning_days
@@ -1389,7 +1383,7 @@ def format_big_move_alert(
     # ── Stock vs market context banner note ───────────────────
     stock_vs_market = ""
     if drop < -5 and spy_pct > 0:
-        stock_vs_market = "  🚨 _Stock\\-specific — market is green_"
+        stock_vs_market = "  🚨 _Stock-specific — market is green_"
     elif drop < -5 and spy_pct < -1.5:
         stock_vs_market = "  ⚠️ _Moving with broad market bleed_"
     elif drop > 8 and spy_pct < 0:
@@ -1403,7 +1397,7 @@ def format_big_move_alert(
     msg  = f"{header_em} *{severity}*\n"
     msg += "`══════════════════════════`\n"
     msg += f"{name_line}\n"
-    msg += f"`${pf.format(c['current'])}`  {drop_em} *{sign}{drop:.2f}%*{stock_vs_market}\n"
+    msg += f"`${pf.format(c['current'])}`  {drop_em} *{sign}{drop:.1f}%*{stock_vs_market}\n"
     msg += f"_{ts}_\n"
     msg += "`══════════════════════════`\n\n"
 
@@ -1461,7 +1455,7 @@ def format_big_move_alert(
     # § MSG-4  PRICE
     # ════════════════════════════════════════════
     msg += "💵 *PRICE*\n`──────────────────────────`\n"
-    msg += f"  Live     `${pf.format(c['current'])}`  {drop_em} {sign}{drop:.2f}% today\n"
+    msg += f"  Live     `${pf.format(c['current'])}`  {drop_em} {sign}{drop:.1f}% today\n"
     msg += f"  Range    L `${pf.format(c['today_low'])}` — H `${pf.format(c['today_high'])}`\n"
 
     if   vol >= 2.0: vol_line = f"`{vol:.1f}x` 🔥 Unusually high"
@@ -1472,11 +1466,11 @@ def format_big_move_alert(
 
     # Volume × move context signals
     if drop <= BIG_DROP_WARN and vol < 0.8:
-        msg += "  ⚠️ _Big drop on low volume — may recover, watch for follow\\-through_\n"
+        msg += "  ⚠️ _Big drop on low volume — may recover, watch for follow-through_\n"
     elif drop <= BIG_DROP_WARN and vol >= 2.0:
-        msg += "  🚨 _High volume sell\\-off — distribution, not just a dip_\n"
+        msg += "  🚨 _High volume sell-off — distribution, not just a dip_\n"
     elif drop >= BIG_GAIN_ALERT and vol < 1.3:
-        msg += "  ⚠️ _Big gain on low volume — thin/news\\-driven, less reliable_\n"
+        msg += "  ⚠️ _Big gain on low volume — thin/news-driven, less reliable_\n"
     msg += "\n"
 
     # ════════════════════════════════════════════
@@ -1496,7 +1490,7 @@ def format_big_move_alert(
     elif "EXTENDED" in verdict or "PARABOLIC" in verdict:
         reentry = round(c["ema50"] * 0.98, 2)
         msg += "  › DO NOT chase at current price\n"
-        msg += f"  › Re\\-entry zone: near EMA50 `${pf.format(reentry)}`\n"
+        msg += f"  › Re-entry zone: near EMA50 `${pf.format(reentry)}`\n"
         msg += f"  › RSI trigger: wait for RSI below 60 (currently `{rsi:.0f}`)\n"
     elif "CRASH" in verdict or "AVOID" in verdict:
         msg += "  › Do NOT catch today — wait minimum 3 days\n"
@@ -1504,7 +1498,7 @@ def format_big_move_alert(
         msg += f"  › Entry only after base forms above EMA50 `${pf.format(c['ema50'])}`\n"
     elif "CAUTION" in verdict or "WATCH" in verdict:
         msg += f"  › Watch key level: EMA50 `${pf.format(c['ema50'])}`\n"
-        msg += f"  › Scale\\-in zone: EMA200 `${pf.format(c['ema200'])}` if holds\n"
+        msg += f"  › Scale-in zone: EMA200 `${pf.format(c['ema200'])}` if holds\n"
         msg += "  › Confirm with RSI > 50 + volume before entry\n"
     else:
         msg += "  › No clear edge — wait for directional setup\n"
@@ -1533,7 +1527,7 @@ def format_big_move_alert(
     msg += f"         `{bar}` {rp:.0f}% of range\n"
 
     if c["pct_from_52w_low"] > 500:
-        msg += f"  ⚠️ _52W low `${pf.format(c['low_52w'])}` may reflect split/spin\\-off_\n"
+        msg += f"  ⚠️ _52W low `${pf.format(c['low_52w'])}` may reflect split/spin-off_\n"
     msg += "\n"
 
     # ════════════════════════════════════════════
@@ -1600,10 +1594,10 @@ def format_big_move_alert(
                 parts.append(f"VIX {ve} `{vix_val:.1f}` _{vtag}_")
             msg += f"  {'  ·  '.join(parts)}\n"
 
-            if   drop < -5 and spy_pct > 0:   msg += "  🚨 _Stock\\-specific weakness — market is UP_\n"
-            elif drop < -5 and spy_pct < -1.5: msg += "  ⚠️ _Moving with broad market sell\\-off_\n"
-            elif drop > 8  and spy_pct < 0:    msg += "  💪 _Stock\\-specific strength — market is down_\n"
-            elif vix_val > 22:                 msg += "  ⚠️ _Elevated VIX — broad risk\\-off environment_\n"
+            if   drop < -5 and spy_pct > 0:   msg += "  🚨 _Stock-specific weakness — market is UP_\n"
+            elif drop < -5 and spy_pct < -1.5: msg += "  ⚠️ _Moving with broad market sell-off_\n"
+            elif drop > 8  and spy_pct < 0:    msg += "  💪 _Stock-specific strength — market is down_\n"
+            elif vix_val > 22:                 msg += "  ⚠️ _Elevated VIX — broad risk-off environment_\n"
             msg += "\n"
 
     # ════════════════════════════════════════════
@@ -1666,11 +1660,11 @@ def format_sector_bleed_alert(sector_moves: dict) -> str | None:
     msg = f"🩸 *SECTOR BLEED DETECTED*\n`━━━━━━━━━━━━━━━━━━━━━`\n_{ts}_\n\n"
 
     for sector, data in sorted(sector_moves.items(), key=lambda x: x[1]["avg"]):
-        msg += f"*{md(sector)}*\n"
-        msg += f"Sector avg: `{data['avg']:+.2f}%`\n"
+        msg += f"*{md(sector)}*  ·  avg `{data['avg']:+.1f}%`\n"
         msg += "`─────────────────`\n"
 
-        for sym, pct in sorted(data["all"], key=lambda x: x[1]):
+        ranked = sorted(data["all"], key=lambda x: x[1])   # worst first
+        for sym, pct in ranked[:SECTOR_BLEED_COLLAPSE]:
             em     = SYMBOL_EMOJI.get(sym, "📊")
             pct_em = (
                 "🔴" if pct < -5 else
@@ -1678,7 +1672,11 @@ def format_sector_bleed_alert(sector_moves: dict) -> str | None:
                 "🟡" if pct < 0  else
                 "🟢"
             )
-            msg += f"{pct_em} {em} *{md(sym)}* `{pct:+.2f}%`\n"
+            msg += f"{pct_em} {em} *{md(sym)}* `{pct:+.1f}%`\n"
+
+        rest = len(ranked) - SECTOR_BLEED_COLLAPSE
+        if rest > 0:
+            msg += f"  _+{rest} more in sector_\n"
 
         msg += "\n"
 
@@ -1727,6 +1725,13 @@ def format_mover_digest(all_contexts: dict[str, dict], market_ctx: dict | None =
     gainers.sort(key=lambda x: -x[1]["day_change_pct"])
     losers.sort(key=lambda x: x[1]["day_change_pct"])
 
+    # Cap each list to the biggest movers so the message stays phone-glanceable.
+    # Overflow count is shown as "+N more"; full list via on-demand reply.
+    _more_gainers = max(0, len(gainers) - MOVER_DIGEST_CAP)
+    _more_losers  = max(0, len(losers)  - MOVER_DIGEST_CAP)
+    gainers = gainers[:MOVER_DIGEST_CAP]
+    losers  = losers[:MOVER_DIGEST_CAP]
+
     spy_pct = market_ctx.get("SPY", {}).get("pct", 0) if market_ctx else 0
     qqq_pct = market_ctx.get("QQQ", {}).get("pct", 0) if market_ctx else 0
     vix_val = market_ctx.get("^VIX", {}).get("price", 15) if market_ctx else 15
@@ -1771,7 +1776,7 @@ def format_mover_digest(all_contexts: dict[str, dict], market_ctx: dict | None =
 
     # ── Helper: price formatter (4dp under $10, 2dp otherwise) ─
     def _pf(price: float) -> str:
-        return f"${price:.4f}" if price < 10 else f"${price:.2f}"
+        return f"${price:.4f}" if price < 1 else f"${price:.2f}"
 
     # ── Helper: pullback zone line ────────────────────────────
     # Only shown when the setup warrants it (see logic per section below).
@@ -1866,6 +1871,9 @@ def format_mover_digest(all_contexts: dict[str, dict], market_ctx: dict | None =
                     f"  ⚠️ _Extended_\n"
                 )
 
+        if _more_gainers:
+            msg += f"  _…+{_more_gainers} more gainers (reply ALL for full list)_\n"
+
     # ── Drops section ─────────────────────────────────────────
     if losers:
         msg += f"\n📉 *DROPS* (≤{CFG.big_drop_warn:.0f}%)\n`─────────────────`\n"
@@ -1890,10 +1898,14 @@ def format_mover_digest(all_contexts: dict[str, dict], market_ctx: dict | None =
             if zone:
                 msg += zone
 
+        if _more_losers:
+            msg += f"  _…+{_more_losers} more drops (reply ALL for full list)_\n"
+
     msg += "\n`━━━━━━━━━━━━━━━━━━━━━`\n"
+    msg += "_Legend: 1st tag=trend 🚀strong 📈up ⚖️flat 📉down 💀weak · 2nd=vol 🔥⬆️heavy ⬇️light_\n"
     msg += "_Reply with ticker for full analysis_"
     return msg
-    
+
 # ════════════════════════════════════════════════════════════
 # § LEADERSHIP / LAGGARD DETECTOR
 #   Within a bleed/rip sector, finds stocks that diverge
@@ -2003,7 +2015,7 @@ def format_leadership_alert(leaders: list[dict], laggards: list[dict]) -> str | 
 
     # ── Helper: price formatter ───────────────────────────────
     def _pf(price: float) -> str:
-        return f"${price:.4f}" if price < 10 else f"${price:.2f}"
+        return f"${price:.4f}" if price < 1 else f"${price:.2f}"
 
     # ── Helper: short trend pill ──────────────────────────────
     def _trend_pill(trend: str) -> str:
@@ -2025,10 +2037,10 @@ def format_leadership_alert(leaders: list[dict], laggards: list[dict]) -> str | 
             tpill = _trend_pill(trend)
             msg += f"{em} {name_label(ldr['symbol'])}\n"
             msg += (
-                f"Stock: `{ldr['ctx']['day_change_pct']:+.2f}%` {_pf(price)}  "
-                f"Sector avg: `{ldr['sector_avg']:+.2f}%`  {tpill}\n"
+                f"Stock: `{ldr['ctx']['day_change_pct']:+.1f}%` {_pf(price)}  "
+                f"Sector avg: `{ldr['sector_avg']:+.1f}%`  {tpill}\n"
             )
-            msg += f"💪 Outperforming by *{ldr['divergence']:+.2f}%*\n\n"
+            msg += f"💪 Outperforming by *{ldr['divergence']:+.1f}%*\n\n"
         msg += "💡 _Leaders during weakness can become future winners._\n\n"
 
     # ── Laggards (cap at 10) ──────────────────────────────────
@@ -2043,10 +2055,10 @@ def format_leadership_alert(leaders: list[dict], laggards: list[dict]) -> str | 
 
             msg += f"{em} {name_label(ldr['symbol'])}\n"
             msg += (
-                f"Stock: `{ldr['ctx']['day_change_pct']:+.2f}%` {_pf(price)}  "
-                f"Sector avg: `{ldr['sector_avg']:+.2f}%`  {tpill}\n"
+                f"Stock: `{ldr['ctx']['day_change_pct']:+.1f}%` {_pf(price)}  "
+                f"Sector avg: `{ldr['sector_avg']:+.1f}%`  {tpill}\n"
             )
-            msg += f"📉 Underperforming by *{ldr['divergence']:+.2f}%*\n"
+            msg += f"📉 Underperforming by *{ldr['divergence']:+.1f}%*\n"
             if ema50 is not None:
                 msg += f"  `└─` Watch reclaim: EMA50 {_pf(ema50)}\n"
             msg += "\n"
@@ -2111,6 +2123,17 @@ def mark_alert(key: str) -> None:
     """
     iso = now_est().isoformat()
     _state_update(lambda s: s.__setitem__(key, iso))
+
+
+def fired_today(base: str) -> bool:
+    """
+    True if a once-per-day alert for `base` already fired this ET calendar day.
+    Use with _daily_cool_key() for strict once-daily alerts (mover digest,
+    leadership, sector bleed). Replaces the buggy `can_alert(key, hours=0)`
+    pattern, where hours=0 made the guard always pass and re-sent every run.
+    """
+    state = load_json(STATE_FILE, {})
+    return _daily_cool_key(base) in state
 
 
 # ════════════════════════════════════════════════════════════
@@ -2200,14 +2223,17 @@ def _send_single(message: str, silent: bool = False) -> bool:
         return False
 
 
-def send_telegram(message: str, silent: bool = False) -> bool:
+def send_telegram(message: str, silent: bool = False, bypass_critical: bool = False) -> bool:
     """
     Split and send a (potentially long) Telegram message.
-    Respects quiet hours (10 PM - 7 AM ET) unless bypass_critical.
+    Respects quiet hours (10 PM - 7 AM ET). Only callers that pass
+    bypass_critical=True (genuine market events) skip the overnight queue.
+    Routine alerts embed the ambient VIX banner, which used to trip a
+    content-sniff bypass and flood the quiet window.
     Returns True if all chunks sent.
     """
     # Check quiet hours gate
-    if is_quiet_hours() and not should_bypass_quiet(message):
+    if is_quiet_hours() and not bypass_critical:
         queue_alert(message, silent)
         return True  # queued = success
 
@@ -2286,7 +2312,9 @@ def run_intel_scan() -> None:
     #         earnings_date=ed,
     #         days_until=days,
     #     )
-    #     if msg and send_telegram(msg, silent=False):
+    #     # ≥10% single-stock move breaks through quiet hours (user directive)
+    #     if msg and send_telegram(msg, silent=False,
+    #                              bypass_critical=is_major_move(drop)):
     #         mark_alert(cool_key)
     #         alerts_fired += 1
     #         print(f"  🚨 {sym} alert sent")
@@ -2297,11 +2325,14 @@ def run_intel_scan() -> None:
         return
 
     # ── Sector bleed ─────────────────────────────────────────
+    #   Once per ET day. Market-wide event → breaks through quiet hours
+    #   (user: "major things"). Once-daily guard stops the stale re-fire on
+    #   frozen closing data (was re-sending every 4h incl. 11:55 PM).
     sector_moves = check_sector_bleeds(all_contexts)
-    if sector_moves and can_alert("last_sector_bleed", CFG.sector_bleed_cooldown_h):
+    if sector_moves and not fired_today("last_sector_bleed"):
         msg = format_sector_bleed_alert(sector_moves)
-        if msg and send_telegram(msg, silent=False):
-            mark_alert("last_sector_bleed")
+        if msg and send_telegram(msg, silent=False, bypass_critical=True):
+            mark_alert(_daily_cool_key("last_sector_bleed"))
             alerts_fired += 1
             print("🩸 Sector bleed alert sent")
 
@@ -2319,20 +2350,19 @@ def run_intel_scan() -> None:
             }
 
     leaders, laggards = check_leadership(all_contexts, sector_full)
-    leadership_key = _daily_cool_key("last_leadership_alert")  # date-scoped = fires once per day max
-    if (leaders or laggards) and can_alert(leadership_key, hours=0):
+    # Once per ET day (was can_alert(key, hours=0) — always True → fired every run)
+    if (leaders or laggards) and not fired_today("last_leadership_alert"):
         msg = format_leadership_alert(leaders, laggards)
         if msg and send_telegram(msg, silent=True):
-            mark_alert(leadership_key)
+            mark_alert(_daily_cool_key("last_leadership_alert"))
             alerts_fired += 1
             print("💪 Leadership alert sent")
 
-    # ── End-of-day mover digest (once per day, after 3:45 PM ET) ─────────
-    digest_key = _daily_cool_key("last_mover_digest")
-    if can_alert(digest_key, hours=0):
+    # ── End-of-day mover digest (once per ET day) ─────────
+    if not fired_today("last_mover_digest"):
         digest = format_mover_digest(all_contexts, market_ctx)
         if digest and send_telegram(digest, silent=False):
-            mark_alert(digest_key)
+            mark_alert(_daily_cool_key("last_mover_digest"))
             alerts_fired += 1
             print("📊 Mover digest sent")
 

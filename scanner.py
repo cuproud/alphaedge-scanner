@@ -23,6 +23,22 @@
   GEMINI_API_KEY        (optional — enables AI enrichment via Gemini 2.0 Flash)
 
 ────────────────────────────────────────────────────────────────────────────────
+  PINE v7.0 PARITY PORT (2026-07-09) — faithful mirror, not adaptation
+────────────────────────────────────────────────────────────────────────────────
+  Signal engine rebuilt to match alphaedge_v7.0.pine line-for-line:
+    • Confluence: 5-pillar / 12-pt (P1 trend 3 · P2 mom AND 2 · P3 vol 2 ·
+      P4 regime 2 · P5 candle 2) + pillar-purity gate (>=3 of 5)
+    • SQS: pine f_calcSQS weights (conf 25 · mtf 20 w/ ranging penalty ·
+      regime 28/18/14/8/3 · vol 15/12/8/3 · volat 10/7/3)
+    • I6 Choppiness-Index gate (CHOP<61.8, 30m+) · I7 time-of-day SQS mult ·
+      I8 RS-vs-SPY 5d +1 confluence bonus (cap 12)
+    • Grade gate by TF (1h>=9) · minConf 7 · quality-gate bundle
+    • SL: struct-merge (min long/max short) → [0.8, 5.0]×ATR clamp · TP 1/2/3.5R
+    • I3 staged SL (+0.5R → 3.0×ATR) · I4 stage-aware trail 1.8→1.5→1.0→0.6
+  NOTE: VIX gate + %-of-price SL caps are scanner-only safety, not in pine.
+  Sync rule going forward: change pine first, then mirror the delta here.
+
+────────────────────────────────────────────────────────────────────────────────
   WHAT'S NEW IN v7.1 vs v7.0
 ────────────────────────────────────────────────────────────────────────────────
 
@@ -98,7 +114,7 @@
   ✅ Cache auto-cleans entries older than 48h (no unbounded memory growth)
   ✅ Markdown-safe escaping for symbols/prices (no broken Telegram alerts)
   ✅ Crossover uses both sides correctly (prev ≤ band AND current > band)
-  ✅ SQS denominator corrected to /9 (was /10 — scores were over-inflated)
+  ✅ Confluence on pine 12-pt scale (5-pillar); SQS conf weight = score/12*25
   ✅ Single data fetch per symbol per TF (was fetching 3× redundantly)
   ✅ get_htf_bias uses iloc[-2] consistently (was mixing -1 and -2)
   ✅ Log file rotation per-day via dated filename (no unbounded mega-file)
@@ -157,8 +173,8 @@
   ORB           No opening range breakout context. Planned for v7.2 as a
                 10th confluence point and morning brief addition.
 
-  RS vs index   Main scanner has no relative strength vs QQQ/SPY component.
-                Dip scanner has it; planned to unify in v7.2.
+  RS vs index   v7.0 I8 adds RS-vs-SPY 5d bonus to confluence (see rs_vs_spy_5d).
+                QQQ/sector RS still dip-scanner only; unify in v7.2.
 
   Backtesting   No offline replay pipeline. Dynamic threshold reads live
                 trade history but cannot test parameter changes historically.
@@ -219,13 +235,18 @@ SQ_BB_MULT = 2.0
 SQ_KC_MULT = 1.5
 
 # ── Stop loss / take profit ──
-SL_MULT = 2.0                # ATR multiple for initial SL distance
-SWING_LOOKBACK = 10          # bars back for structure SL
-STRUCT_BUFFER = 0.2          # ATR buffer around swing
-MIN_SL_DIST = 0.5            # minimum ATR distance for SL
-TP1_MULT, TP2_MULT, TP3_MULT = 1.0, 2.0, 3.0
+SL_MULT = 2.0                # ATR multiple for initial SL distance (pine slMult)
+SWING_LOOKBACK = 10          # bars back for structure SL (pine swingLookback)
+STRUCT_BUFFER = 0.3          # ATR buffer around swing (pine structBuffer)
+MIN_SL_DIST = 0.8            # minimum ATR distance for SL (pine minSLDistance)
+MAX_SL_DIST = 5.0            # max ATR distance for SL (pine maxSLDistance)
+SAFE_MIN_ATR = 0.5           # absolute SL floor ×ATR (pine safeMin)
+SL_TIGHTEN_ATR = 3.0         # I3: tighten SL to this ×ATR after +0.5R (pine)
+SL_TIGHTEN_R = 0.5           # I3: profit-R trigger for staged tighten
+TRAIL_ATR_MULT = 1.8         # I4: base trail ×ATR (ladder →1.5→1.0→0.6, pine)
+TP1_MULT, TP2_MULT, TP3_MULT = 1.0, 2.0, 3.5   # pine tp1/tp2/tp3Mult
 
-# ── Safety caps (as % of entry price) ──
+# ── Safety caps (as % of entry price) — NOT in pine; scanner-only outer guard ──
 MAX_SL_PCT_STOCKS = 0.04
 MAX_SL_PCT_CRYPTO = 0.08
 MIN_SL_PCT_STOCKS = 0.005
@@ -233,7 +254,7 @@ MIN_SL_PCT_CRYPTO = 0.01
 PRICE_SANITY_DEVIATION = 0.20  # reject if live vs daily > 20% off
 
 # ── Signal gates ──
-MIN_CONF_SCORE = 4
+MIN_CONF_SCORE = 7           # pine minConfScore (12-pt scale)
 GRADE_FILTER = "A+ and A"    # "A+ Only" | "A+ and A" | "B and better" | "All"
 USE_COUNTER_TREND_BLOCK = True
 USE_MTF_GATE = True
@@ -241,6 +262,13 @@ MTF_GATE_BULL = 9
 MTF_GATE_BEAR = 3
 USE_CHOP_FILTER = True
 CHOP_ATR_MULT = 1.0
+# v7.0 I6: Choppiness Index gate — block entries in range/chop. Active on 30m+
+# (both scanner TFs qualify). Ported from pine v7.0 chopIndex logic.
+USE_CHOP_INDEX    = True
+CHOP_INDEX_LEN    = 14
+CHOP_INDEX_THRESH = 61.8      # block when CHOP >= this
+# v7.0 I8: RS-vs-SPY 5d bonus adds +1 to the 12-pt confluence when outperforming
+# (see rs_vs_spy_5d + apply site in analyze_symbol). Faithful to pine lines 1430-1447.
 USE_RSI_DIV = True
 RSI_DIV_LOOK = 5
 RSI_DIV_FLOOR = 25
@@ -254,9 +282,15 @@ SQS_DYNAMIC_MIN = 70
 SQS_DYNAMIC_MAX = 85
 AI_TIER_THRESHOLD = 75       # SQS ≥ this triggers AI analysis
 
-# ── Regime classification ──
+# ── Regime classification ── (pine defaults, lines 392-395)
 REGIME_ADX_TREND = 22
 REGIME_ADX_RANGE = 20
+REGIME_VOL_HIGH  = 1.5       # volRatio >= this → VOLATILE
+REGIME_VOL_LOW   = 0.7       # volRatio <= this (+ adx<range) → QUIET
+USE_CANDLE_GATE  = True      # pine P5 candle-body confluence (line 170)
+# Quality-gate thresholds (pine lines 154-159, 1612)
+EMA200_SLOPE_MIN_1H = 0.004  # ema200 slope ×ATR/bar, 1H+ (pine line 156)
+MAX_EMA200_EXT_ATR  = 8.0    # max |close-ema200|/ATR (pine line 159)
 
 # ── Alert management ──
 DIGEST_THRESHOLD = 4         # collapse to digest if ≥N signals fire at once
@@ -682,7 +716,9 @@ def absolute_time(iso_str):
         dt = datetime.fromisoformat(iso_str)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=EST)
-        return dt.strftime('%H:%M %Z')
+        # Normalize to EST so %Z renders "EDT"/"EST", not a fixed "UTC-04:00"
+        # offset (fromisoformat restores a fixed-offset tzinfo).
+        return dt.astimezone(EST).strftime('%I:%M %p ET')
     except Exception:
         return "?"
 
@@ -880,15 +916,17 @@ def tier_label(sqs):
     return "🔹 LOW"
 
 def grade_label(score):
-    if score >= 8: return "A+"
-    if score >= 6: return "A"
-    if score >= 4: return "B"
+    # 12-pt confluence scale (pine getGrade: A+ >=12, A >=9, B >=6, else C)
+    if score >= 12: return "A+"
+    if score >= 9:  return "A"
+    if score >= 6:  return "B"
     return "C"
 
 def grade_passes(score):
-    if GRADE_FILTER == "A+ Only":      return score >= 8
-    if GRADE_FILTER == "A+ and A":     return score >= 6
-    if GRADE_FILTER == "B and better": return score >= 4
+    # 12-pt scale (pine grades: A+ >=12, A >=9, B >=6, C else — lines 1399-1408)
+    if GRADE_FILTER == "A+ Only":      return score >= 12
+    if GRADE_FILTER == "A+ and A":     return score >= 9
+    if GRADE_FILTER == "B and better": return score >= 6
     return True
 
 def sqs_meter(sqs):
@@ -2043,6 +2081,71 @@ def get_mtf_sum(symbol):
 # §14  SIGNAL ANALYSIS ENGINE — Pine parity + all bug fixes
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def compute_chop_index(df, length=CHOP_INDEX_LEN):
+    """
+    v7.0 I6: Choppiness Index (0-100). >61.8 = range/chop, <38.2 = trending.
+    Port of pine chopIndex = 100*log10(sum(TR,n)/(HH-LL))/log10(n).
+    Returns None if undefined.
+    """
+    try:
+        high, low, close = df['High'], df['Low'], df['Close']
+        prev_close = close.shift(1)
+        tr = pd.concat([(high - low),
+                        (high - prev_close).abs(),
+                        (low - prev_close).abs()], axis=1).max(axis=1)
+        atr_sum = float(tr.rolling(length).sum().iloc[-1])
+        rng = float(high.rolling(length).max().iloc[-1] - low.rolling(length).min().iloc[-1])
+        if rng <= 0 or atr_sum <= 0:
+            return None
+        return 100.0 * np.log10(atr_sum / rng) / np.log10(length)
+    except Exception:
+        return None
+
+
+def time_of_day_sqs_mult():
+    """
+    v7.0 I7: US-session bias multiplier on SQS.
+    10:00-11:00 & 14:00-15:00 ET -> 1.05x ; 11:30-13:30 lunch -> 0.90x ; else 1.0x.
+    """
+    n = now_est()
+    mins = n.hour * 60 + n.minute
+    if (600 <= mins < 660) or (840 <= mins < 900):
+        return 1.05
+    if 690 <= mins < 810:
+        return 0.90
+    return 1.0
+
+
+def _five_day_return(sym, _cache={}):
+    """~5-session % return from daily closes. Cached per process run."""
+    hit = _cache.get(sym)
+    if hit is not None and (now_est() - hit[1]).total_seconds() < 600:
+        return hit[0]
+    try:
+        d = yf.download(sym, period='7d', interval='1d', progress=False, auto_adjust=True)
+        if d is None or d.empty or len(d) < 2:
+            return None
+        closes = d['Close'].dropna()
+        first, last = float(closes.iloc[0]), float(closes.iloc[-1])
+        ret = (last - first) / first * 100.0 if first > 0 else None
+    except Exception:
+        ret = None
+    _cache[sym] = (ret, now_est())
+    return ret
+
+
+def rs_vs_spy_5d(symbol):
+    """
+    v7.0 I8: symbol 5d return minus SPY 5d return (percentage points).
+    >0 = outperforming SPY, <0 = underperforming. None if data unavailable.
+    """
+    spy_ret = _five_day_return('SPY')
+    sym_ret = _five_day_return(symbol)
+    if spy_ret is None or sym_ret is None:
+        return None
+    return sym_ret - spy_ret
+
+
 def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
     """
     Core signal engine.
@@ -2159,28 +2262,60 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
         macd_bull = last['macd'] > last['signal']
         ema_bull  = ema50_v > ema200_v
 
-        # ─── Confluence (9 points total) ───
-        bull = 0
-        bull += 1 if uprng else 0
-        bull += 1 if st_now == 1 else 0
-        bull += 1 if macd_bull else 0
-        bull += 1 if rsi_bull else 0
-        bull += 1 if ema_bull else 0
-        bull += 1 if bar_price > vwap_v else 0
-        bull += 1 if adx_val > ADX_STRONG and plus_di > minus_di else 0
-        bull += 1 if htf_bull is True else 0
-        bull += 1 if bool(sqz_bull_break.iloc[-2]) else 0
+        # ═══ Market regime (pine lines 1166-1200) ═══
+        #   VOLATILE  volRatio>=1.5 | TRENDING adx>=22 | QUIET volRatio<=0.7 & adx<20
+        #   RANGING   adx<20        | else TRANSITIONAL
+        atr_avg_v = df['atr'].rolling(50).mean().iloc[-2]
+        vol_ratio = float(atr_val / atr_avg_v) if atr_avg_v and atr_avg_v > 0 else 1.0
+        if   vol_ratio >= REGIME_VOL_HIGH:                          market_regime = 'VOLATILE'
+        elif adx_val   >= REGIME_ADX_TREND:                         market_regime = 'TRENDING'
+        elif vol_ratio <= REGIME_VOL_LOW and adx_val < REGIME_ADX_RANGE: market_regime = 'QUIET'
+        elif adx_val   <  REGIME_ADX_RANGE:                         market_regime = 'RANGING'
+        else:                                                        market_regime = 'TRANSITIONAL'
+        regime_trending = market_regime == 'TRENDING'
+        regime_volatile = market_regime == 'VOLATILE'
 
-        bear = 0
-        bear += 1 if not uprng else 0
-        bear += 1 if st_now == -1 else 0
-        bear += 1 if not macd_bull else 0
-        bear += 1 if rsi_bear else 0
-        bear += 1 if not ema_bull else 0
-        bear += 1 if bar_price < vwap_v else 0
-        bear += 1 if adx_val > ADX_STRONG and minus_di > plus_di else 0
-        bear += 1 if htf_bull is False else 0
-        bear += 1 if bool(sqz_bear_break.iloc[-2]) else 0
+        # ═══ CONFLUENCE — pine 5-pillar, max 12 (pine lines 1309-1376) ═══
+        rsi_2ago  = float(df['rsi'].iloc[-4])
+        open_v    = float(last['Open'])
+        high_v    = float(last['High'])
+        low_v     = float(last['Low'])
+        vol_now   = float(last['Volume'])
+        vol_avg_c = float(last['vol_avg']) if not pd.isna(last['vol_avg']) else 0.0
+        high_vol  = vol_now > vol_avg_c * 1.1
+
+        # P1 structural trend (3 pts)
+        p1_bull, p1_bear = (htf_bull is True), (htf_bull is False)
+        # P2 momentum MACD+RSI AND-logic (0/1/2)
+        p2_bull_macd = macd_bull
+        p2_bull_rsi  = rsi_val > 50 and rsi_val > rsi_2ago
+        p2_bear_macd = not macd_bull
+        p2_bear_rsi  = rsi_val < 50 and rsi_val < rsi_2ago
+        p2_bull = 2 if (p2_bull_macd and p2_bull_rsi) else 1 if (p2_bull_macd or p2_bull_rsi) else 0
+        p2_bear = 2 if (p2_bear_macd and p2_bear_rsi) else 1 if (p2_bear_macd or p2_bear_rsi) else 0
+        # P3 volume (CVD off in pine default → vol-only = 2 pts)
+        p3_bull = 2 if high_vol else 0
+        p3_bear = 2 if high_vol else 0
+        # P4 regime environment (2 pts, shared)
+        p4 = 2 if (regime_trending or regime_volatile) else 0
+        # P5 candle body confirmation (2 pts)
+        bar_range   = high_v - low_v
+        body_pct    = abs(bar_price - open_v) / bar_range if bar_range > 0 else 0.0
+        p5_bull = 2 if (USE_CANDLE_GATE and bar_price > open_v and body_pct > 0.5) else 0
+        p5_bear = 2 if (USE_CANDLE_GATE and bar_price < open_v and body_pct > 0.5) else 0
+
+        bull = (3 if p1_bull else 0) + p2_bull + p3_bull + p4 + p5_bull
+        bear = (3 if p1_bear else 0) + p2_bear + p3_bear + p4 + p5_bear
+
+        # Pillar purity: need >= 3 of 5 pillars active (pine lines 1372-1376)
+        bull_purity_ok = sum([p1_bull, p2_bull > 0, p3_bull > 0, p4 > 0, p5_bull > 0]) >= 3
+        bear_purity_ok = sum([p1_bear, p2_bear > 0, p3_bear > 0, p4 > 0, p5_bear > 0]) >= 3
+
+        # v7.0 I8: RS-vs-SPY 5d confluence bonus (+1, cap 12) — pine lines 1430-1447
+        rs5d = rs_vs_spy_5d(symbol)
+        if rs5d is not None:
+            if rs5d > 0: bull = min(12, bull + 1)
+            if rs5d < 0: bear = min(12, bear + 1)
 
         # ─── Triggers ───
         prev_close   = float(prev['Close'])
@@ -2220,13 +2355,47 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
             except Exception:
                 pass
 
+        # v7.0 I6: Choppiness Index gate (active on 30m+; both scanner TFs qualify)
+        chop_idx_ok  = True
+        chop_idx_val = None
+        if USE_CHOP_INDEX:
+            chop_idx_val = compute_chop_index(df)
+            if chop_idx_val is not None and chop_idx_val >= CHOP_INDEX_THRESH:
+                chop_idx_ok = False
+
+        # ═══ Quality gate bundle (pine qualityGate, lines 1602-1621) ═══
+        #   Scanner TFs are 30m/1h. Members that are tf<=15m/30m no-ops in pine
+        #   are set True here; the tf>=1h hard gates apply on the 1h scan.
+        is_1h = tf == '1h'
+        # regime must allow signals (pine regimeAllowsSignal, line 1200)
+        regime_adx_floor   = 20.0 if tf == '30m' else 22.0
+        regime_allows      = market_regime in ('TRENDING', 'VOLATILE') and adx_val >= regime_adx_floor
+        # ema200 slope hard gate — 1h+ only (pine lines 667-673); 30m => True
+        ema200_v5          = float(df['ema200'].iloc[-7])   # ema200[5] on confirmed bar
+        ema200_slope       = (ema200_v - ema200_v5) / (atr_val * 5) if atr_val > 0 else 0.0
+        slope_ok_bull      = (ema200_slope >  EMA200_SLOPE_MIN_1H) if is_1h else True
+        slope_ok_bear      = (ema200_slope < -EMA200_SLOPE_MIN_1H) if is_1h else True
+        # supertrend confirm + vwap hard gate — 1h+ only (pine 1602/1618); 30m => True
+        st_confirm_bull    = (st_now ==  1) if is_1h else True
+        st_confirm_bear    = (st_now == -1) if is_1h else True
+        vwap_ok_bull       = (bar_price > vwap_v) if is_1h else True
+        vwap_ok_bear       = (bar_price < vwap_v) if is_1h else True
+        # ema200 extension gate (all TFs, pine line 1612)
+        ema200_dist_atr    = (bar_price - ema200_v) / atr_val if atr_val > 0 else 0.0
+        ema200_ext_ok      = abs(ema200_dist_atr) <= MAX_EMA200_EXT_ATR
+        quality_bull = regime_allows and slope_ok_bull and st_confirm_bull and vwap_ok_bull and ema200_ext_ok and chop_idx_ok
+        quality_bear = regime_allows and slope_ok_bear and st_confirm_bear and vwap_ok_bear and ema200_ext_ok and chop_idx_ok
+
         # ═══ Signal decision ═══
+        # Grade gate by TF (pine: 1H+ needs >=9, else grade filter — lines 1623-1624)
+        grade_ok_bull = bull >= 9 if tf == '1h' else grade_passes(bull)
+        grade_ok_bear = bear >= 9 if tf == '1h' else grade_passes(bear)
         raw_buy = (uprng and trigger_bull and adx_pass_bull and
-                   bull >= MIN_CONF_SCORE and grade_passes(bull) and
-                   not ct_buy and not mtf_block_buy and chop_ok)
+                   bull >= MIN_CONF_SCORE and grade_ok_bull and bull_purity_ok and
+                   not ct_buy and not mtf_block_buy and chop_ok and quality_bull)
         raw_sell = (not uprng and trigger_bear and adx_pass_bear and
-                    bear >= MIN_CONF_SCORE and grade_passes(bear) and
-                    not ct_sell and not mtf_block_sell and chop_ok)
+                    bear >= MIN_CONF_SCORE and grade_ok_bear and bear_purity_ok and
+                    not ct_sell and not mtf_block_sell and chop_ok and quality_bear)
 
         # Resolve conflicts
         if raw_buy and raw_sell:
@@ -2241,6 +2410,9 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
             if mtf_block_buy:  return None, f"MTF blocks BUY (sum={mtf_sum})"
             if mtf_block_sell: return None, f"MTF blocks SELL (sum={mtf_sum})"
             if not chop_ok:    return None, "chop filter"
+            if not chop_idx_ok: return None, f"CHOP index {chop_idx_val:.0f} >= {CHOP_INDEX_THRESH}"
+            if bull >= MIN_CONF_SCORE and not bull_purity_ok: return None, "bull pillar purity < 3"
+            if bear >= MIN_CONF_SCORE and not bear_purity_ok: return None, "bear pillar purity < 3"
             return None, None
 
         signal = 'BUY' if raw_buy else 'SELL'
@@ -2252,26 +2424,30 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
             return None, vix_reason
 
         # ─── SQS calc ───
+        # ═══ SQS — pine f_calcSQS (lines 1230-1271). Uses RS-adjusted bull/bear. ═══
         def calc_sqs(is_bull):
             sc       = bull if is_bull else bear
-            conf_pct = sc / 9 * 40   # /9 since we have 9 confluence points
-            mtf_pct  = (mtf_sum / 12 * 25) if is_bull else ((12 - mtf_sum) / 12 * 25)
-            if   adx_val >= REGIME_ADX_TREND: reg_pct = 15.0
-            elif adx_val <  REGIME_ADX_RANGE: reg_pct = 5.0
-            else:                              reg_pct = 8.0
-            vol_avg_v = float(last['vol_avg']) if not pd.isna(last['vol_avg']) else 1
+            conf_pct = sc / 12.0 * 25.0
+            penalty  = 0.5 if adx_val < REGIME_ADX_RANGE else 1.0
+            mtf_pct  = (mtf_sum / 12.0 * 20.0 * penalty) if is_bull \
+                       else ((12 - mtf_sum) / 12.0 * 20.0 * penalty)
+            if   market_regime == 'TRENDING':     reg_pct = 28.0
+            elif market_regime == 'VOLATILE':     reg_pct = 28.0 if adx_val >= REGIME_ADX_TREND else 18.0
+            elif market_regime == 'TRANSITIONAL': reg_pct = 14.0
+            elif market_regime == 'RANGING':      reg_pct = 8.0
+            else:                                  reg_pct = 3.0     # QUIET
+            vol_avg_v = float(last['vol_avg']) if not pd.isna(last['vol_avg']) else 0.0
             cur_vol   = float(last['Volume'])
-            if   cur_vol > vol_avg_v * 1.5: vol_pct = 10.0
-            elif cur_vol > vol_avg_v:       vol_pct = 6.0
-            else:                            vol_pct = 3.0
-            atr_avg   = df['atr'].rolling(50).mean().iloc[-2]
-            vol_ratio = atr_val / atr_avg if atr_avg and atr_avg > 0 else 1.0
+            vrl       = cur_vol / vol_avg_v if vol_avg_v > 0 else 1.0
+            vol_pct   = 15.0 if vrl >= 1.5 else 12.0 if vrl >= 1.1 else 8.0 if vrl >= 0.85 else 3.0
             if   0.8 <= vol_ratio <= 1.5: volat_pct = 10.0
             elif 0.6 <= vol_ratio <= 2.0: volat_pct = 7.0
             else:                          volat_pct = 3.0
-            return min(100, conf_pct + mtf_pct + reg_pct + vol_pct + volat_pct)
+            return min(100.0, conf_pct + mtf_pct + reg_pct + vol_pct + volat_pct)
 
         sqs = calc_sqs(raw_buy)
+        # v7.0 I7: time-of-day SQS multiplier (pine multiplies final SQS, line 1449)
+        sqs = min(100.0, sqs * time_of_day_sqs_mult())
         effective_threshold = get_effective_threshold()
 
         if USE_SQS and sqs < effective_threshold:
@@ -2290,17 +2466,27 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
         max_sl_pct  = MAX_SL_PCT_CRYPTO if is_crypto(symbol) else MAX_SL_PCT_STOCKS
         min_sl_pct  = MIN_SL_PCT_CRYPTO if is_crypto(symbol) else MIN_SL_PCT_STOCKS
 
+        # SL calc mirrors pine f_calcSL (lines 1846-1867):
+        #   merge ATR-stop with structure-stop (long=min → wider), clamp to
+        #   [minSLDistance, maxSLDistance]×ATR, then safeMin floor. The %-of-price
+        #   caps below are a scanner-only outer guard (NOT in pine).
+        min_dist = atr_val * MIN_SL_DIST
+        max_dist = atr_val * MAX_SL_DIST
+        safe_min = atr_val * SAFE_MIN_ATR
         if signal == 'BUY':
             atr_sl    = entry_price - atr_val * SL_MULT
             struct_sl = recent_low  - atr_val * STRUCT_BUFFER
-            sl = max(atr_sl, struct_sl)
-            min_dist = atr_val * MIN_SL_DIST
-            if (entry_price - sl) < min_dist:
-                sl = entry_price - min_dist
+            sl = min(atr_sl, struct_sl)                    # pine: min for long
+            dist = entry_price - sl
+            if   dist < min_dist: sl = entry_price - min_dist
+            elif dist > max_dist: sl = entry_price - max_dist
+            # scanner-only % outer guard
             if (entry_price - sl) > entry_price * max_sl_pct:
                 sl = entry_price * (1 - max_sl_pct)
             if (entry_price - sl) < entry_price * min_sl_pct:
                 sl = entry_price * (1 - min_sl_pct)
+            if (entry_price - sl) < safe_min:              # pine safeMin floor
+                sl = entry_price - safe_min
             risk = entry_price - sl
             tp1 = entry_price + risk * TP1_MULT
             tp2 = entry_price + risk * TP2_MULT
@@ -2308,14 +2494,17 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
         else:
             atr_sl    = entry_price + atr_val * SL_MULT
             struct_sl = recent_high + atr_val * STRUCT_BUFFER
-            sl = min(atr_sl, struct_sl)
-            min_dist = atr_val * MIN_SL_DIST
-            if (sl - entry_price) < min_dist:
-                sl = entry_price + min_dist
+            sl = max(atr_sl, struct_sl)                    # pine: max for short
+            dist = sl - entry_price
+            if   dist < min_dist: sl = entry_price + min_dist
+            elif dist > max_dist: sl = entry_price + max_dist
+            # scanner-only % outer guard
             if (sl - entry_price) > entry_price * max_sl_pct:
                 sl = entry_price * (1 + max_sl_pct)
             if (sl - entry_price) < entry_price * min_sl_pct:
                 sl = entry_price * (1 + min_sl_pct)
+            if (sl - entry_price) < safe_min:              # pine safeMin floor
+                sl = entry_price + safe_min
             risk = sl - entry_price
             tp1 = entry_price - risk * TP1_MULT
             tp2 = entry_price - risk * TP2_MULT
@@ -2330,6 +2519,9 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
             'ema50':      ema50_v,
             'ema200':     ema200_v,
         }
+
+        # ─── YAML metadata (used by POC asset_class + alert header) ───
+        meta = SYMBOL_META.get(symbol, {})
 
         # ─── v7.0 FEATURE: POC ───
         # ✅ FIX: renamed local `lookback` → `poc_lookback` so we don't
@@ -2358,9 +2550,6 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
         else:
             strong_trend = (not ema_bull and bar_price < ema50_v and
                             22 < adx_val < 55 and minus_di > plus_di)
-
-        # ─── v7.0 NEW: YAML metadata for richer alert headers ───
-        meta = SYMBOL_META.get(symbol, {})
 
         return {
             'symbol':        symbol,
@@ -2443,6 +2632,10 @@ def create_trade(sig):
         'htf_bull':         sig.get('htf_bull'),
         'tp1_hit': False, 'tp2_hit': False, 'tp3_hit': False,
         'tp1_hit_at': None, 'tp2_hit_at': None, 'tp3_hit_at': None,
+        # v7.0 I3/I4 live SL management (pine lines 1955-2067)
+        'sl_tightened':  False,   # I3: staged SL tighten fired (+0.5R → 3.0×ATR)
+        'early_be_armed': False,  # trail arms after +0.75R
+        'trail_price':   sig['sl'],  # ratchets toward price, never loosens
         'closed':        False,
         'closed_reason': None,
         'closed_at':     None,
@@ -2454,7 +2647,7 @@ def check_trade_progress(trade):
     live = get_live_ohlc(trade['symbol'])
     if not live:
         return [], False
-    current, _, _ = live
+    current, bar_high, bar_low = live
     events  = []
     is_long = trade['signal'] == 'BUY'
 
@@ -2473,13 +2666,69 @@ def check_trade_progress(trade):
     except Exception:
         pass
 
+    # ═══ v7.0 I3 staged SL + I4 stage-aware trail (pine lines 1955-2067) ═══
+    #   Uses atr_at_entry (trade-check does not refetch live ATR); risk & TP
+    #   levels are entry-fixed, so this is a faithful port of the staging logic.
+    entry = trade['entry']
+    risk  = trade['risk'] or (abs(entry - trade['sl']) or 1e-9)
+    atr_e = trade.get('atr_at_entry') or (risk / SL_MULT)
+    profit_r = ((bar_high - entry) if is_long else (entry - bar_low)) / risk
+
+    # I3: one-shot SL tighten to 3.0×ATR after +0.5R
+    if profit_r >= SL_TIGHTEN_R and not trade['sl_tightened']:
+        tighten_dist = atr_e * min(MAX_SL_DIST, SL_TIGHTEN_ATR)
+        cur_dist = (entry - trade['sl']) if is_long else (trade['sl'] - entry)
+        if cur_dist > tighten_dist:
+            trade['sl'] = entry - tighten_dist if is_long else entry + tighten_dist
+        trade['sl_tightened'] = True
+
+    # arm early-BE at +0.75R
+    if profit_r >= 0.75:
+        trade['early_be_armed'] = True
+
+    # I4: stage-aware trail floors + ATR ladder
+    tp1, tp2 = trade['tp1'], trade['tp2']
+    if is_long:
+        floor = trade['sl']
+        if trade['early_be_armed']: floor = max(floor, entry + risk * 0.3)
+        if trade['tp1_hit']:        floor = max(floor, entry + risk * 0.5)
+        if trade['tp2_hit']:        floor = max(floor, tp1)
+        if trade['tp3_hit']:        floor = max(floor, tp2)
+    else:
+        floor = trade['sl']
+        if trade['early_be_armed']: floor = min(floor, entry - risk * 0.3)
+        if trade['tp1_hit']:        floor = min(floor, entry - risk * 0.5)
+        if trade['tp2_hit']:        floor = min(floor, tp1)
+        if trade['tp3_hit']:        floor = min(floor, tp2)
+
+    # engage: 1h after TP1, else after early-BE (pine trailEngaged, line 2020)
+    trail_engaged = trade['tp1_hit'] if trade['tf'] == '1h' else trade['early_be_armed']
+    if not trade['early_be_armed'] and not trade['tp1_hit']:
+        trail_engaged = False
+    new_trail = floor
+    if trail_engaged:
+        mult = (0.6 if trade['tp3_hit'] else 1.0 if trade['tp2_hit']
+                else 1.5 if trade['tp1_hit'] else TRAIL_ATR_MULT)
+        atr_level = (bar_high - atr_e * mult) if is_long else (bar_low + atr_e * mult)
+        new_trail = max(atr_level, floor) if is_long else min(atr_level, floor)
+    # ratchet: SL only moves toward price, never away
+    trade['trail_price'] = max(trade['trail_price'], new_trail) if is_long \
+                           else min(trade['trail_price'], new_trail)
+    trade['sl'] = max(trade['sl'], trade['trail_price']) if is_long \
+                  else min(trade['sl'], trade['trail_price'])
+
     # SL
     sl_hit = (is_long and current <= trade['sl']) or (not is_long and current >= trade['sl'])
     if sl_hit:
         trade['closed']        = True
-        trade['closed_reason'] = 'SL Hit'
+        trade['closed_reason'] = 'Trail/SL Hit' if trade['tp1_hit'] else 'SL Hit'
         trade['closed_at']     = now_est().isoformat()
-        trade['final_r']       = 0 if trade['tp1_hit'] else -1
+        # final_r: banked profit if trailed out after a TP, else full loss
+        if trade['tp1_hit']:
+            trade['final_r'] = round((trade['sl'] - entry) / risk, 2) if is_long \
+                               else round((entry - trade['sl']) / risk, 2)
+        else:
+            trade['final_r'] = -1
         events.append({'type': 'SL', 'price': trade['sl']})
         return events, True
 
@@ -2499,7 +2748,7 @@ def check_trade_progress(trade):
             trade['closed']        = True
             trade['closed_reason'] = 'TP3 Hit'
             trade['closed_at']     = now_est().isoformat()
-            trade['final_r']       = 3
+            trade['final_r']       = TP3_MULT
             events.append({'type': 'TP3', 'price': trade['tp3']})
             return events, True
     else:
@@ -2517,7 +2766,7 @@ def check_trade_progress(trade):
             trade['closed']        = True
             trade['closed_reason'] = 'TP3 Hit'
             trade['closed_at']     = now_est().isoformat()
-            trade['final_r']       = 3
+            trade['final_r']       = TP3_MULT
             events.append({'type': 'TP3', 'price': trade['tp3']})
             return events, True
 
@@ -2565,7 +2814,7 @@ def get_ai_analysis(sig):
 
 SYMBOL: {company_line} ({sig['signal']} @ ${sig['price']}){sector_line}
 TF: {sig['timeframe']} | Trigger: {sig['trigger']}
-Score: {sig['score']}/9 ({sig['grade']}) | SQS: {sig['sqs']}/100
+Score: {sig['score']}/12 ({sig['grade']}) | SQS: {sig['sqs']}/100
 RSI: {sig['rsi']} | ADX: {sig['adx']} | Regime: {sig['regime']}
 MTF sum: {sig.get('mtf_sum', '?')}/12 | HTF: {sig.get('htf_bull')}
 Reward ratio: 1:3 | Strong trend: {sig['strong_trend']}{ah_note}
@@ -2736,8 +2985,17 @@ def format_new_signal(sig, ai_text=None):
     d            = sig['decimals']
     direction_em = "🟢" if sig['signal'] == 'BUY' else "🔴"
 
-    # ─── Header + context banner ──────────────────────────────────────
+    # ─── Header + TL;DR + context banner ──────────────────────────────
     msg  = _header_block(sig)
+
+    # One-line scannable summary — decide in 2 seconds, details below.
+    tldr = (f"{direction_em} *{sig['signal']} "
+            f"{safe_sym(sig['symbol'])}* · SQS {sig['sqs']} ({sig['grade']})\n"
+            f"🎯 `${fmt_price(sig['price'], d)}` → "
+            f"TP `${fmt_price(sig['tp1'], d)}`/`${fmt_price(sig['tp2'], d)}`/"
+            f"`${fmt_price(sig['tp3'], d)}` · SL `${fmt_price(sig['sl'], d)}`\n")
+    msg += tldr
+
     ban  = _context_banner(sig)
     if ban:
         msg += ban
@@ -2746,7 +3004,7 @@ def format_new_signal(sig, ai_text=None):
     body  = f"{direction_em} *Entry @* `${fmt_price(sig['price'], d)}` · {sig['trigger']}\n"
     body += f"SQS *{sig['sqs']}/100* · {sig['tier']}\n"
     body += f"`{sqs_meter(sig['sqs'])}`\n"
-    body += f"Confluence: *{sig['score']}/9* (Grade {sig['grade']})\n"
+    body += f"Confluence: *{sig['score']}/12* (Grade {sig['grade']})\n"
 
     trend_note = format_sqs_trend_note(sig['symbol'])
     if trend_note:
@@ -3230,19 +3488,22 @@ def _tg_send(message, silent=False):
         logging.error(f"Telegram send: {e}")
         return False
 
-def send_telegram(message, silent=False):
+def send_telegram(message, silent=False, bypass_critical=False):
     """
     Send Telegram message — auto-splits on section boundaries when > 3900 chars.
 
     Quiet hours (v6.10): 22:00-06:59 ET blocks send and queues for 7 AM batch.
-    Critical events (CIRCUIT BREAKER, VIX spike) bypass quiet hours.
+    Only callers that pass bypass_critical=True (genuine market events, e.g.
+    circuit breaker / VIX-extreme market alert) skip the queue. Routine signal
+    alerts must NOT bypass — the ambient VIX banner they embed used to trip a
+    content-sniff and flood the overnight window.
     """
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logging.warning("Telegram credentials missing")
         return False
 
     # Quiet hours gate
-    if is_quiet_hours() and not should_bypass_quiet(message):
+    if is_quiet_hours() and not bypass_critical:
         queue_overnight_alert(message, silent)
         return True
 
@@ -3271,16 +3532,6 @@ def is_quiet_hours() -> bool:
         return False
     h = datetime.now(EST).hour
     return h >= 22 or h < 7
-
-
-def should_bypass_quiet(message: str) -> bool:
-    """Critical events bypass quiet hours."""
-    msg_upper = message.upper()
-    if 'CIRCUIT BREAKER' in msg_upper:
-        return True
-    if 'VIX' in msg_upper and ('SPIKE' in msg_upper or '> 35' in msg_upper or 'CRITICAL' in msg_upper):
-        return True
-    return False
 
 
 def queue_overnight_alert(message: str, silent: bool):

@@ -19,3 +19,8 @@ venv/
 scanner_state.json
 gemini_counter.json
 overnight_alerts.json
+dynamic_threshold.json
+active_trades.json
+
+# RTK token-saver cache
+.tokensave/

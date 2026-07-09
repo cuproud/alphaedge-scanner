@@ -151,7 +151,7 @@ universe:
 # ───────────────────────────────────────────────────────────────────────────────
 
   - { symbol: "NVDA",  name: "NVIDIA Corp.",            exchange: "NASDAQ", asset_class: "stock", emoji: "💎", sector: "AI / Semis", session: "extended", roles: ["intel","brief","dip","scanner"] }
-  - { symbol: "AMD",   name: "Advanced Micro Devices",  exchange: "NASDAQ", asset_class: "stock", emoji: "🔴", sector: "AI / Semis", session: "extended", roles: ["intel","brief","dip","scanner"] }
+  - { symbol: "AMD",   name: "Advanced Micro Devices",  exchange: "NASDAQ", asset_class: "stock", emoji: "🎮", sector: "AI / Semis", session: "extended", roles: ["intel","brief","dip","scanner"] }
 
 # ───────────────────────────────────────────────────────────────────────────────
 # AI / SEMIS — Memory & Fab

@@ -112,7 +112,7 @@ from market_intel import (
     load_json,
     now_est,
     send_telegram,
-    can_alert,
+    fired_today,
     mark_alert,
     tg_escape as md,
     display_now,
@@ -476,8 +476,10 @@ def section_header(
     title:  str,
     border: str = "─────────────────",
 ) -> str:
-    """Minor section divider."""
-    return f"\n{emoji} *{title}*\n`{border}`\n"
+    """Minor section divider. Emoji optional — pass "" when the title already
+    carries its own leading emoji (avoids double-emoji headers)."""
+    prefix = f"{emoji} " if emoji else ""
+    return f"\n{prefix}*{title}*\n`{border}`\n"
 
 
 def sector_emoji(avg: float) -> str:
@@ -496,7 +498,7 @@ def render_market_row(label: str, d: dict | None) -> str:
     pct   = d.get("pct",   0)
     price = d.get("price", 0)
     em    = "🟢" if pct >= 0 else "🔴"
-    return f"{label}: {em} `${price:.2f}`  `{pct:+.2f}%`\n"
+    return f"{label}: {em} `${price:.2f}`  `{pct:+.1f}%`\n"
 
 
 def render_market_snapshot(market_ctx: dict, title: str) -> str:
@@ -508,7 +510,7 @@ def render_market_snapshot(market_ctx: dict, title: str) -> str:
     qqq = market_ctx.get("QQQ",  {})
     vix = market_ctx.get("^VIX", {})
 
-    out = section_header("🌍", title)
+    out = section_header("", title)
     out += render_market_row("SPY", spy)
     out += render_market_row("QQQ", qqq)
     out += render_market_row("VIX", vix)
@@ -532,9 +534,9 @@ def render_sectors(sectors: list[tuple[str, float]], title: str) -> str:
     """Render sector performance table (sorted by avg move)."""
     if not sectors:
         return ""
-    out = section_header("🌡️", title)
+    out = section_header("", title)
     for sector, avg in sectors:
-        out += f"{sector_emoji(avg)} {md(sector)}: `{avg:+.2f}%`\n"
+        out += f"{sector_emoji(avg)} {md(sector)}: `{avg:+.1f}%`\n"
     return out
 
 
@@ -546,17 +548,17 @@ def render_movers(
     """Render top gainers and losers under one section header."""
     if not (gainers or losers):
         return ""
-    out = section_header("📊", title)
+    out = section_header("", title)
     if gainers:
         out += "*🚀 GAINERS*\n"
         for g in gainers:
             em = SYMBOL_EMOJI.get(g["symbol"], "📊")
-            out += f"  {em} *{md(g['symbol'])}* `{g['pct']:+.2f}%`\n"
+            out += f"  {em} *{md(g['symbol'])}* `{g['pct']:+.1f}%`\n"
     if losers:
         out += "\n*📉 LOSERS*\n"
         for l in losers:
             em = SYMBOL_EMOJI.get(l["symbol"], "📊")
-            out += f"  {em} *{md(l['symbol'])}* `{l['pct']:+.2f}%`\n"
+            out += f"  {em} *{md(l['symbol'])}* `{l['pct']:+.1f}%`\n"
     return out
 
 
@@ -583,13 +585,13 @@ def render_header(emoji: str, title: str) -> str:
     if "MORNING" in title.upper():
         return brief_header(
             emoji, title,
-            "Pre\\-market setup, risk map, and watchlist",
+            "Pre-market setup, risk map, and watchlist",
             "━━━━━━━━━━━━━━━━━━━━━",
         )
     if "EVENING" in title.upper():
         return brief_header(
             emoji, title,
-            "Day recap, open risk, and after\\-hours watch",
+            "Day recap, open risk, and after-hours watch",
             "═════════════════════",
         )
     return brief_header(emoji, title)
@@ -702,7 +704,7 @@ def build_morning_brief() -> bool:
 
     msg += render_footer(
         data.failed_count, len(MONITOR_LIST),
-        "Scanners running every 10\\-15 min during market hours. "
+        "Scanners running every 10-15 min during market hours. "
         "Watch for 🩸 sector bleed, 💪 RS signals, 🎯 dip alerts.",
     )
 
@@ -830,7 +832,7 @@ def build_evening_brief() -> bool:
 
     msg += render_footer(
         data.failed_count, len(MONITOR_LIST),
-        "Scanner continues in after-hours (crypto + ext\\-hrs stocks). "
+        "Scanner continues in after-hours (crypto + ext-hrs stocks). "
         "Next morning brief: tomorrow at 9:00 AM ET.",
     )
 
@@ -1002,11 +1004,11 @@ def run_job(job: Job, *, force: bool = False) -> None:
 
     mark_alert() is called only on confirmed successful delivery.
     """
-    slot_key = _brief_slot_key(job.kind)
-    today    = market_now().strftime("%Y-%m-%d")
+    today = market_now().strftime("%Y-%m-%d")
 
-    if not force and not can_alert(slot_key, hours=0):
-        # hours=0: any prior write for today's key is enough to block
+    # Once per ET day. Guards against the DST cron-hedge firing the same brief
+    # twice (was can_alert(key, hours=0) — always True, so it never blocked).
+    if not force and fired_today(f"last_{job.kind}_brief"):
         print(f"ℹ️  {job.kind.title()} brief already sent today ({today})")
         logging.info(f"{job.kind} brief skipped — already sent today ({today})")
         return
@@ -1014,7 +1016,7 @@ def run_job(job: Job, *, force: bool = False) -> None:
     try:
         ok = job.builder()
         if ok:
-            mark_alert(slot_key)   # ← only on confirmed send
+            mark_alert(_brief_slot_key(job.kind))   # ← only on confirmed send
     except Exception as e:
         logging.exception(f"{job.kind} brief crashed: {e}")
 
