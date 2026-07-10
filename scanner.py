@@ -262,6 +262,11 @@ MTF_GATE_BULL = 9
 MTF_GATE_BEAR = 3
 USE_CHOP_FILTER = True
 CHOP_ATR_MULT = 1.0
+# Range-flip trigger TF gate — mirrors pine `allowFlipAllTF` (input :199) + isHigherTF
+# (>=240min). Pine disables the flip trigger below 4h because the volume-driven range
+# filter whips in intraday chop. Backtest (30m): NVDA PF 1.92->1.45 with flip on, aggregate
+# PF 1.33 (off) vs 1.25 (on). Default False = Pine parity; set True to fire flip on all TFs.
+ALLOW_FLIP_ALL_TF = False
 # v7.0 I6: Choppiness Index gate — block entries in range/chop. Active on 30m+
 # (both scanner TFs qualify). Ported from pine v7.0 chopIndex logic.
 USE_CHOP_INDEX    = True
@@ -291,6 +296,13 @@ USE_CANDLE_GATE  = True      # pine P5 candle-body confluence (line 170)
 # Quality-gate thresholds (pine lines 154-159, 1612)
 EMA200_SLOPE_MIN_1H = 0.004  # ema200 slope ×ATR/bar, 1H+ (pine line 156)
 MAX_EMA200_EXT_ATR  = 8.0    # max |close-ema200|/ATR (pine line 159)
+
+# ── Data feed ──
+# TradingView intraday defaults to SPLIT-only adjustment (dividends NOT applied).
+# yfinance auto_adjust=True applies BOTH → every EMA/range/POC level drifts vs the
+# TV chart (root cause of the MU "below EMA200 in Python, above on TV" divergence).
+# False = split-only = TV parity. Keep the 'Close' column (still present when False).
+YF_AUTO_ADJUST = False
 
 # ── Alert management ──
 DIGEST_THRESHOLD = 4         # collapse to digest if ≥N signals fire at once
@@ -1727,7 +1739,7 @@ def format_poc_line(current_price: float,
 #
 # import yfinance as yf
 # df = yf.download('NVDA', period='60d', interval='30m',
-#                  progress=False, auto_adjust=True)
+#                  progress=False, auto_adjust=YF_AUTO_ADJUST)
 # if hasattr(df.columns, 'get_level_values'):
 #     df.columns = df.columns.get_level_values(0)
 #
@@ -1769,7 +1781,7 @@ def get_vix_regime(cache_minutes=10):
         return _vix_cache['data']
     try:
         df = yf.download('^VIX', period='10d', interval='1d',
-                         progress=False, auto_adjust=True)
+                         progress=False, auto_adjust=YF_AUTO_ADJUST)
         if df.empty or len(df) < 5:
             return None
         df = _clean_df(df)
@@ -1978,7 +1990,7 @@ def get_real_time_price(sym):
     """Fetch latest 1m close."""
     try:
         df = yf.download(sym, period='1d', interval='1m',
-                         progress=False, auto_adjust=True)
+                         progress=False, auto_adjust=YF_AUTO_ADJUST)
         if df.empty: return None
         df = _clean_df(df)
         return float(df['Close'].iloc[-1])
@@ -1989,7 +2001,7 @@ def get_live_ohlc(sym):
     """Latest 5m OHLC — used for trade checks."""
     try:
         df = yf.download(sym, period='2d', interval='5m',
-                         progress=False, auto_adjust=True)
+                         progress=False, auto_adjust=YF_AUTO_ADJUST)
         if df.empty: return None
         df = _clean_df(df)
         return (float(df['Close'].iloc[-1]),
@@ -2001,7 +2013,7 @@ def get_live_ohlc(sym):
 def get_daily_close(sym):
     try:
         df = yf.download(sym, period='5d', interval='1d',
-                         progress=False, auto_adjust=True)
+                         progress=False, auto_adjust=YF_AUTO_ADJUST)
         if df.empty: return None
         df = _clean_df(df)
         return float(df['Close'].iloc[-1])
@@ -2019,7 +2031,7 @@ def get_htf_bias(symbol):
     """4h EMA50 > EMA200 = bullish. Returns True/False/None."""
     try:
         df = yf.download(symbol, period='3mo', interval='1h',
-                         progress=False, auto_adjust=True)
+                         progress=False, auto_adjust=YF_AUTO_ADJUST)
         if df.empty or len(df) < 50:
             return None
         df = _clean_df(df)
@@ -2050,7 +2062,7 @@ def get_mtf_score(symbol, tf_str):
     period, interval = tf_map[tf_str]
     try:
         df = yf.download(symbol, period=period, interval=interval,
-                         progress=False, auto_adjust=True)
+                         progress=False, auto_adjust=YF_AUTO_ADJUST)
         if df.empty: return 0
         df = _clean_df(df)
         if tf_str == '4h':
@@ -2122,7 +2134,7 @@ def _five_day_return(sym, _cache={}):
     if hit is not None and (now_est() - hit[1]).total_seconds() < 600:
         return hit[0]
     try:
-        d = yf.download(sym, period='7d', interval='1d', progress=False, auto_adjust=True)
+        d = yf.download(sym, period='7d', interval='1d', progress=False, auto_adjust=YF_AUTO_ADJUST)
         if d is None or d.empty or len(d) < 2:
             return None
         closes = d['Close'].dropna()
@@ -2166,7 +2178,7 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
 
     try:
         df = yf.download(symbol, period=tf_lookback, interval=tf,
-                         progress=False, auto_adjust=True)
+                         progress=False, auto_adjust=YF_AUTO_ADJUST)
         if df.empty or len(df) < min_bars:
             return None, "insufficient data"
         df = _clean_df(df)
@@ -2328,8 +2340,14 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
         flip_bull = (not bool(bar2['uprng'])) and uprng
         flip_bear = bool(bar2['uprng']) and (not uprng)
 
-        trigger_bull = cross_up or flip_bull
-        trigger_bear = cross_dn or flip_bear
+        # v7.2: flip TF gate — mirror pine isHigherTF (>=240min). Off <4h unless overridden.
+        # Was the sole Python↔Pine divergence: Python fired flip on 30m, pine did not.
+        _tf_min = {'1m':1,'3m':3,'5m':5,'15m':15,'30m':30,'1h':60,'2h':120,
+                   '4h':240,'6h':360,'8h':480,'12h':720,'1d':1440,'1w':10080}
+        flip_allowed = ALLOW_FLIP_ALL_TF or _tf_min.get(tf, 0) >= 240
+
+        trigger_bull = cross_up or (flip_bull and flip_allowed)
+        trigger_bear = cross_dn or (flip_bear and flip_allowed)
 
         # ─── Hard gates ───
         adx_pass_bull = (adx_val > ADX_GATE_LEVEL) or (bull >= ADX_BYPASS_MIN)
@@ -2538,8 +2556,8 @@ def analyze_symbol(symbol, tf_config, htf_bull, mtf_sum, last_signal_info=None):
         elif adx_val <  REGIME_ADX_RANGE: regime = 'RANGING'
         else:                              regime = 'TRANSITIONAL'
 
-        if   flip_bull: trigger_type = "AE Flip Bullish"
-        elif flip_bear: trigger_type = "AE Flip Bearish"
+        if   flip_bull and flip_allowed: trigger_type = "AE Flip Bullish"
+        elif flip_bear and flip_allowed: trigger_type = "AE Flip Bearish"
         elif cross_up:  trigger_type = "Breakout Above Band"
         elif cross_dn:  trigger_type = "Breakdown Below Band"
         else:           trigger_type = "Signal"

@@ -711,7 +711,7 @@ float chopHiLo      = ta.highest(high, chopIndexLen) - ta.lowest(low, chopIndexL
 float chopIndex     = chopHiLo > 0 ? 100.0 * math.log10(chopAtrSum / chopHiLo) / math.log10(chopIndexLen) : 50.0
 // Apply on 1H+ only — on 15m/30m pullback-resumption fires in consolidation
 // where CHOP reads high, blocking valid entries. Regime ADX floor handles it there.
-// v7.0 I6: Choppiness gate now active on 30m+ (was 1H+ only in v6.10).
+// v7.0 I6: Choppiness gate now active on 30m+ (was 1H+ only in v).
 // 15m left at 100.0 (effectively disabled) to preserve trade count on
 // pullback-resumption which legitimately fires in 15m consolidation.
 float chopThreshEff = timeframe.in_seconds() >= 1800 ? chopIndexThresh : 100.0
@@ -1336,12 +1336,8 @@ bool p3BearVol = highVol
 bool p3BearCvd = not useCVD ? false : (cvdBearDiv or cvdValue < cvdValue[3])
 
 // When CVD disabled, fall back to vol-only (1pt if true)
-int p3BullPts = useCVD ?
-                ((p3BullVol and p3BullCvd) ? 3 : ((p3BullVol or p3BullCvd) ? 1 : 0)) :
-                (p3BullVol ? 2 : 0)  // CVD off: vol=2pts (not full 3)
-int p3BearPts = useCVD ?
-                ((p3BearVol and p3BearCvd) ? 3 : ((p3BearVol or p3BearCvd) ? 1 : 0)) :
-                (p3BearVol ? 2 : 0)
+int p3BullPts = useCVD ?((p3BullVol and p3BullCvd) ? 3 : ((p3BullVol or p3BullCvd) ? 1 : 0)) : (p3BullVol ? 2 : 0)  // CVD off: vol=2pts (not full 3)
+int p3BearPts = useCVD ?((p3BearVol and p3BearCvd) ? 3 : ((p3BearVol or p3BearCvd) ? 1 : 0)) : (p3BearVol ? 2 : 0)
 
 bool p3Bull = p3BullPts > 0
 bool p3Bear = p3BearPts > 0
@@ -1432,7 +1428,7 @@ spyClose5_v7     = request.security("SPY", "D", close[6], barmerge.gaps_off, bar
 float spyRet5_v7 = not na(spyClose5_v7) and spyClose5_v7 > 0 ? (spyCloseToday_v7 - spyClose5_v7) / spyClose5_v7 * 100.0 : 0.0
 
 // Approximate 5-session lookback in current TF bars
-int v7_barsPerSession = math.max(1, int(390 / math.max(1.0, timeframe.in_minutes())))
+int v7_barsPerSession = math.max(1, int(390 / math.max(1.0, timeframe.in_seconds() / 60.0)))
 int v7_lookbackBars   = math.min(2000, 5 * v7_barsPerSession)
 float v7_closeBack    = close[v7_lookbackBars]
 float v7_symRet5      = not na(v7_closeBack) and v7_closeBack > 0 ? (close - v7_closeBack) / v7_closeBack * 100.0 : 0.0
@@ -1641,6 +1637,17 @@ bool buyCondition  = rawBuy  and legOkBuy  and barsSinceSig >= minBarsBetweenEff
 bool sellCondition = rawSell and legOkSell and barsSinceSig >= minBarsBetweenEff and chopOkSell and timeAllowed and not circuitBreakerOn and (timeframe.in_seconds() > 900 or sqsBear >= 70.0)
 bool confirmedBuy  = buyCondition  and barstate.isconfirmed
 bool confirmedSell = sellCondition and barstate.isconfirmed
+
+// v7.0 — WAITING block reason (diagnostic only, zero effect on signal logic).
+// Explains why a high-bias bar did NOT fire an entry.
+string entryBlockReason =
+     circuitBreakerOn                             ? "circuit breaker " + str.tostring(math.max(0, circuitBreakerCooldown - (bar_index - circuitBreakerBar))) + "b" :
+     not timeAllowed                              ? "time-of-day filter" :
+     barsSinceSig < minBarsBetweenEff             ? "cooldown " + str.tostring(minBarsBetweenEff - barsSinceSig) + "b" :
+     (ptDirectionFlip and not flipAllowed)        ? "range-flip off <4h" :
+     (not chopOkBuy and not chopOkSell)           ? "chop gate" :
+     (rawBuy or rawSell)                          ? "ready" :
+     "no trigger / gate"
 
 if confirmedBuy
     inBuyLeg      := true
@@ -1947,7 +1954,9 @@ if confirmedSell
     reEntryArmed   := false
     exitDirSnapshot := -1
 
-bool canCheck = bar_index > (entryBar + 2) and tradeDir != 0 and not slHit
+// v7.0 fix: entry fills at signal-bar close, so monitor stops from the NEXT bar.
+// (was entryBar+2 — 2 bars of stop-blindness inflated backtest WR/PF and delayed the circuit breaker)
+bool canCheck = bar_index > entryBar and tradeDir != 0 and not slHit
 
 // ══════════════════════════════════════════════════════════════════════════════
 // DYNAMIC ATR TRAILING STOP — v6.10
@@ -3546,7 +3555,8 @@ f_infoCompact(table t, string infSize) =>
         float  domSQS    = bullDom ? nz(sqsBullConfirmed, sqsBull) : nz(sqsBearConfirmed, sqsBear)
         string domGrade  = bullDom ? getGrade(bullScore) : getGrade(bearScore)
         string sqsSuffix = useSQS ? "  SQS " + str.tostring(math.round(domSQS)) : ""
-        table.cell(t, 0, 1, "⚏ WAITING  •  " + waitBias + " " + domGrade + "  (" + netSign + str.tostring(netWait) + ")" + sqsSuffix, text_color=waitBiasC, text_size=infSize, bgcolor=waitBg, text_halign=text.align_center)
+        string waitWhy   = entryBlockReason != "ready" ? "  ⛔ " + entryBlockReason : ""
+        table.cell(t, 0, 1, "⚏ WAITING  •  " + waitBias + " " + domGrade + "  (" + netSign + str.tostring(netWait) + ")" + sqsSuffix + waitWhy, text_color=waitBiasC, text_size=infSize, bgcolor=waitBg, text_halign=text.align_center)
         table.merge_cells(t, 0, 1, 1, 1)
 
         // Row 2: Bull score | Bear score
