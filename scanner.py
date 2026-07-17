@@ -2937,33 +2937,29 @@ def _header_block(sig):
     else:
         company = f"{sym_em} *{sym_safe}*"
 
-    # Line 3 — sector · exchange (skip if both blank)
+    # Line 3 — merged meta: sector · exchange · timeframe · session
+    #   (one line instead of three — no phantom blank lines on mobile)
+    sess_txt = session.split(' ', 1)[-1] if ' ' in session else session
     meta_bits = []
     if sector and sector != 'Other':
         meta_bits.append(md_escape(sector))
     if exch:
         meta_bits.append(md_escape(exch))
-    meta_line = "🏷️ " + " · ".join(meta_bits) if meta_bits else ""
+    meta_bits.append(tf_label)
+    meta_bits.append(sess_txt)
+    meta_line = " · ".join(meta_bits)
 
-    # Line 4 — timeframe · session
-    tf_session = f"⏰ {tf_label} · {session}"
-
-    # Line 5 — full timestamp
+    # Line 4 — full timestamp
     now = now_est()
     tz_abbr = now.tzname() or "ET"
-    ts_line = f"🕒 {now.strftime(f'%a %b %d · %I:%M %p {tz_abbr}')}"
+    ts_line = f"{now.strftime(f'%a %b %d · %I:%M %p {tz_abbr}')}"
 
-    # Compose
-    lines = [
-        title,
-        "`━━━━━━━━━━━━━━━━━━━━━`",
-        company,
-    ]
+    # Compose — no divider under the title, single divider before the body
+    lines = [title, company]
     if meta_line:
         lines.append(meta_line)
-    lines.append(tf_session)
     lines.append(ts_line)
-    lines.append("`━━━━━━━━━━━━━━━━━━━━━`")
+    lines.append("─" * 22)
     return "\n".join(lines) + "\n"
 
 
@@ -2982,8 +2978,10 @@ def _context_banner(sig):
 
 
 def _section(title, body):
-    """Render a uniformly styled section: `*TITLE*\n─────…\n<body>\n`."""
-    return f"\n*{title}*\n`─────────────────`\n{body}"
+    """Render a uniformly styled section: *TITLE* + plain divider + body.
+    Plain (non-monospace) divider — backtick dividers get extra vertical
+    padding on Telegram mobile and read as phantom blank lines."""
+    return f"\n*{title}*\n{'─' * 22}\n{body}"
 
 
 def format_new_signal(sig, ai_text=None):
@@ -3007,11 +3005,12 @@ def format_new_signal(sig, ai_text=None):
     msg  = _header_block(sig)
 
     # One-line scannable summary — decide in 2 seconds, details below.
-    tldr = (f"{direction_em} *{sig['signal']} "
-            f"{safe_sym(sig['symbol'])}* · SQS {sig['sqs']} ({sig['grade']})\n"
+    # Symbol lives in the header — don't repeat it here.
+    tldr = (f"{direction_em} *{sig['signal']}* · SQS {sig['sqs']} ({sig['grade']})\n"
             f"🎯 `${fmt_price(sig['price'], d)}` → "
-            f"TP `${fmt_price(sig['tp1'], d)}`/`${fmt_price(sig['tp2'], d)}`/"
-            f"`${fmt_price(sig['tp3'], d)}` · SL `${fmt_price(sig['sl'], d)}`\n")
+            f"TP `${fmt_price(sig['tp1'], d)}` / `${fmt_price(sig['tp2'], d)}` / "
+            f"`${fmt_price(sig['tp3'], d)}`\n"
+            f"🛑 SL `${fmt_price(sig['sl'], d)}`\n")
     msg += tldr
 
     ban  = _context_banner(sig)
@@ -3347,14 +3346,40 @@ def format_weekly_summary():
     if not week:
         return None
 
+    div     = "─" * 22
     wins    = [t for t in week if (t.get('final_r') or 0) > 0]
     losses  = [t for t in week if (t.get('final_r') or 0) < 0]
     be      = [t for t in week if (t.get('final_r') or 0) == 0]
     total_r = sum((t.get('final_r') or 0) for t in week)
     wr      = len(wins) / len(week) * 100 if week else 0
-    best    = max(week, key=lambda t: t.get('final_r', 0) or 0)
-    worst   = min(week, key=lambda t: t.get('final_r', 0) or 0)
 
+    msg  = (f"📊 *WEEKLY REPORT*\n"
+            f"{cutoff.strftime('%b %d')} → {now_est().strftime('%b %d')}\n{div}\n")
+    msg += (f"Closed: *{len(week)}* · ✅ {len(wins)}W · "
+            f"❌ {len(losses)}L · ➖ {len(be)}BE\n")
+    msg += f"Win rate *{wr:.0f}%* · Net *{fmt_r(total_r, plain=True)}*\n"
+
+    # ── Per-trade outcomes, best first ──
+    msg += f"\n*TRADES THIS WEEK*\n{div}\n"
+    max_rows = 15
+    for t in sorted(week, key=lambda t: -(t.get('final_r') or 0))[:max_rows]:
+        r      = t.get('final_r') or 0
+        reason = t.get('closed_reason') or ''
+        if reason == 'TP3 Hit':
+            em, txt = '🏆', 'All targets'
+        elif reason.startswith('Trail') and r > 0:
+            em, txt = '✅', 'Trailed out'
+        elif 'Timeout' in reason:
+            em, txt = '⏰', 'Timeout'
+        else:
+            em, txt = '🛑', 'Stop hit'
+        dir_em = '🟢' if t.get('signal') == 'BUY' else '🔴'
+        msg += (f"{em} *{safe_sym(t['symbol'])}* {dir_em} {t.get('tf', '')} — "
+                f"{txt} · {fmt_r(r)}\n")
+    if len(week) > max_rows:
+        msg += f"_+{len(week) - max_rows} more_\n"
+
+    # ── Grade performance — one compact line ──
     grades = {'A+': [0, 0], 'A': [0, 0], 'B': [0, 0], 'C': [0, 0]}
     for t in week:
         g = t.get('grade', 'C')
@@ -3362,29 +3387,20 @@ def format_weekly_summary():
             grades[g][0] += 1
             if (t.get('final_r') or 0) > 0:
                 grades[g][1] += 1
+    parts = [f"{g}: {w}/{tot}" for g, (tot, w) in grades.items() if tot > 0]
+    if parts:
+        msg += f"\n*GRADES* (wins/total)\n{' · '.join(parts)}\n"
 
-    best_lbl  = best.get('label')  or f"*{safe_sym(best['symbol'])}*"
-    worst_lbl = worst.get('label') or f"*{safe_sym(worst['symbol'])}*"
-
-    msg  = f"📊 *WEEKLY SUMMARY*\n{cutoff.strftime('%b %d')} → {now_est().strftime('%b %d')}\n"
-    msg += "`━━━━━━━━━━━━━━━━━━━━━`\n"
-    msg += f"Total signals: *{len(week)}*\n"
-    msg += f"✅ Wins: *{len(wins)}* ({wr:.0f}%)\n"
-    msg += f"❌ Losses: *{len(losses)}*\n"
-    msg += f"➖ Breakeven: *{len(be)}*\n\n"
-    msg += f"💹 *Total: {fmt_r(total_r, plain=True)}*\n"
-    msg += f"🏆 Best: {best_lbl} ({fmt_r(best.get('final_r', 0) or 0, plain=True)})\n"
-    msg += f"💥 Worst: {worst_lbl} ({fmt_r(worst.get('final_r', 0) or 0, plain=True)})\n\n"
-    msg += "*GRADE PERFORMANCE*\n`━━━━━━━━━━━━━━━━━━━━━`\n"
-    for g, (tot, w) in grades.items():
-        if tot > 0:
-            msg += f"{g}: {w}/{tot} wins ({w / tot * 100:.0f}%)\n"
+    # ── Positions still running ──
+    open_trades = load_json(TRADES_FILE, [])
+    if open_trades:
+        msg += f"\n📌 Still open: *{len(open_trades)}* position(s)\n"
 
     # Dynamic threshold context
     dyn = load_json(DYNAMIC_THRESHOLD_FILE, {})
     if dyn:
-        msg += f"\n*⚙️ Adaptive Threshold: {dyn.get('threshold', SQS_BASE_THRESHOLD)}*\n"
-        msg += f"_{dyn.get('reason', 'baseline')}_\n"
+        msg += (f"⚙️ Threshold *{dyn.get('threshold', SQS_BASE_THRESHOLD)}* — "
+                f"_{md_escape(dyn.get('reason', 'baseline'))}_\n")
 
     msg += f"\n⏰ {fmt_time()}"
     return msg
@@ -3505,6 +3521,28 @@ def _tg_send(message, silent=False):
     except Exception as e:
         logging.error(f"Telegram send: {e}")
         return False
+
+def send_weekly_gif():
+    """Teaser animation before the weekly report so it stands out in the feed.
+    GIF URL comes from WEEKLY_GIF_URL env (Telegram-reachable .gif/.mp4 URL).
+    Unset → silently skipped, weekly text report sends regardless."""
+    gif = os.environ.get('WEEKLY_GIF_URL')
+    if not gif or not TELEGRAM_TOKEN or not CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendAnimation"
+    try:
+        r = requests.post(url, json={
+            'chat_id':   CHAT_ID,
+            'animation': gif,
+            'caption':   '📊 Weekly Report',
+        }, timeout=15)
+        if r.status_code != 200:
+            logging.error(f"Weekly GIF {r.status_code}: {r.text[:200]}")
+        return r.status_code == 200
+    except Exception as e:
+        logging.error(f"Weekly GIF send: {e}")
+        return False
+
 
 def send_telegram(message, silent=False, bypass_critical=False):
     """
@@ -3650,7 +3688,8 @@ def format_correlation_alert(new_sigs, open_trades):
 def should_send_weekly_summary():
     state = load_json(STATE_FILE, {})
     now = now_est()
-    if now.weekday() != 6 or now.hour < 21:
+    # Friday 5 PM ET+ — scanner cron still runs then, so delivery is reliable
+    if now.weekday() != 4 or now.hour < 17:
         return False
     week_key = now.strftime('%Y-W%W')
     if state.get('last_weekly') == week_key:
@@ -3865,11 +3904,12 @@ def main():
     save_json(ALERT_CACHE, cache)
     save_json(TRADES_FILE, trades)
 
-    # Weekly summary (Sun 9 PM)
+    # Weekly report (Fri 5 PM ET)
     if should_send_weekly_summary():
         print("📊 Sending weekly summary...")
         ws = format_weekly_summary()
         if ws:
+            send_weekly_gif()
             send_telegram(ws, silent=False)
 
     # ─── Final report ────────────────────────────────────────────────

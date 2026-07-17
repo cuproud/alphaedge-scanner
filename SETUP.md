@@ -56,6 +56,11 @@ Telegram → Cloudflare Worker → GitHub Actions → single_scan.py → Telegra
 | `CHAT_ID` | Your Telegram chat/user ID |
 | `GEMINI_API_KEY` | Google Gemini API key for AI analysis |
 
+### GitHub Repo Variables (Settings → Secrets and variables → Actions → Variables)
+| Variable | Description |
+|----------|-------------|
+| `WEEKLY_GIF_URL` | Optional. `.gif`/`.mp4` URL sent as teaser before the Friday weekly report. Unset = no GIF, report still sends. |
+
 ---
 
 ## GitHub Token Requirements

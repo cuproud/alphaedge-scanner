@@ -125,7 +125,7 @@ Every alert is **context-rich**: not just "BUY here" but _why, where to enter, w
 6. **💪 Leadership** — Stocks holding firm in weak sectors
 7. **💎 Dip Opportunities** — Oversold uptrends (3-4× daily)
 8. **🌅 Morning Brief** — 9 AM daily setup
-9. **📈 Weekly Summary** — Sunday 9 PM performance recap
+9. **📈 Weekly Report** — Friday 5 PM ET: wins/losses, win rate, net R, per-trade outcomes (optional teaser GIF via `WEEKLY_GIF_URL`)
 
 ### Quiet Hours Behavior
 

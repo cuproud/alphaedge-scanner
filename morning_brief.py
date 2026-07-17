@@ -479,7 +479,7 @@ def section_header(
     """Minor section divider. Emoji optional — pass "" when the title already
     carries its own leading emoji (avoids double-emoji headers)."""
     prefix = f"{emoji} " if emoji else ""
-    return f"\n{prefix}*{title}*\n`{border}`\n"
+    return f"\n{prefix}*{title}*\n{border}\n"
 
 
 def sector_emoji(avg: float) -> str:
@@ -678,18 +678,20 @@ def build_morning_brief() -> bool:
         for sym, ctx, _v, zone, reasons in buy_candidates[:shown]:
             try:
                 em = SYMBOL_EMOJI.get(sym, "📊")
-                msg += f"  {em} {name_label(sym)}\n"
+                nm = SYMBOL_META.get(sym, {}).get("name", "")
+                head = f"{em} *{md(sym)}* — {md(nm)}" if nm else f"{em} *{md(sym)}*"
+                # 2 tight lines + blank gap so candidates don't blur together
+                # on mobile. Exchange + the redundant reason line are dropped.
+                msg += f"{head}\n"
                 msg += (
-                    f"     `${ctx['current']:.2f}` — _{md(zone)}_ • "
-                    f"RSI(14) `{ctx.get('rsi', 0):.0f}` • "
-                    f"{ctx['day_change_pct']:+.2f}%\n"
+                    f"`${ctx['current']:.2f}` · "
+                    f"RSI `{ctx.get('rsi', 0):.0f}` · "
+                    f"{ctx['day_change_pct']:+.1f}% · _{md(zone)}_\n\n"
                 )
-                if reasons:
-                    msg += f"     💡 {md(reasons[0])}\n"
             except Exception as e:
                 logging.error(f"render buy row {sym}: {e}")
         if len(buy_candidates) > shown:
-            msg += f"  _+{len(buy_candidates) - shown} more buy candidates_\n"
+            msg += f"_+{len(buy_candidates) - shown} more buy candidates_\n"
     else:
         msg += "  _No clean buy setups — wait for better conditions_\n"
 
