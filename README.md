@@ -111,6 +111,12 @@ Every alert is **context-rich**: not just "BUY here" but _why, where to enter, w
 - ✅ Circuit breaker not active
 - ✅ Not in quiet hours (10pm-7am)
 
+### Risk Locks (v7.2)
+
+- 🔒 **Same-symbol lock** — one open trade per symbol across all timeframes (no 30m + 1h double risk)
+- 🛑 **Post-stop cooldown** — after a stop-out, same symbol+direction blocked 24h (opposite direction allowed)
+- 🔗 **Correlation lock** — open trade in a correlation group blocks new entries in that group (e.g. ETH open blocks XRP)
+
 ---
 
 ## 📱 What You Receive on Telegram

@@ -311,6 +311,7 @@ COOLDOWN_ELITE = 2           # hours between duplicate alerts (SQS ≥ 85)
 COOLDOWN_STRONG = 4          # SQS ≥ 70
 COOLDOWN_GOOD = 6            # SQS ≥ 55
 COOLDOWN_FAIR = 10           # below
+POST_STOP_COOLDOWN_HOURS = 24  # block same symbol+direction re-entry after stop-out
 POSITION_SUMMARY_HOURS = 2   # min hours between open-positions summaries
 CACHE_MAX_AGE_HOURS = 48     # cleanup old cache entries
 
@@ -651,7 +652,8 @@ def now_est():
     return datetime.now(EST)
 
 def fmt_time():
-    return now_est().strftime('%H:%M %Z')
+    # 12-hour "5:27 PM ET" — matches fmt_alert_time style, avoids 24h confusion
+    return now_est().strftime('%I:%M %p ET').lstrip('0')
 
 def fmt_datetime():
     return now_est().strftime('%Y-%m-%d %H:%M %Z')
@@ -795,6 +797,50 @@ def is_duplicate(sym, sig_key, cache, sqs=60):
 
 def mark_sent(sym, sig_key, cache):
     cache[f"{sym}_{sig_key}"] = now_est().isoformat()
+
+def is_post_stop_blocked(sym, direction):
+    """Block same symbol+direction re-entry for POST_STOP_COOLDOWN_HOURS
+    after a stop-out. Stops the XRP-style re-entry loop: stop hit, same
+    setup fires again next scan, stop hit again."""
+    history = load_json(HISTORY_FILE, [])
+    cutoff  = now_est() - timedelta(hours=POST_STOP_COOLDOWN_HOURS)
+    for t in reversed(history):          # newest last → scan backwards
+        if t.get('symbol') != sym or t.get('signal') != direction:
+            continue
+        if 'SL Hit' not in (t.get('closed_reason') or ''):
+            continue
+        if (t.get('final_r') or 0) >= 0:
+            continue                     # trailed out with profit — not a stop loss
+        try:
+            ca = datetime.fromisoformat(t['closed_at'])
+            if ca.tzinfo is None:
+                ca = ca.replace(tzinfo=EST)
+            if ca >= cutoff:
+                return True
+        except Exception:
+            continue
+    return False
+
+def has_open_trade_for_symbol(sym, trades):
+    """One open trade per symbol across ALL timeframes — 30m + 1h entries
+    on the same symbol double the same risk (CRWD, XRP double losses)."""
+    return any(t.get('symbol') == sym and not t.get('closed')
+               for t in trades.values())
+
+def get_correlated_open(sym, trades):
+    """Open trade in the same correlation group (e.g. ETH-USD open blocks
+    XRP-USD entry — same-week crypto cluster stops move together).
+    Returns the blocking symbol or None."""
+    groups = [syms for syms in CORRELATION_GROUPS.values() if sym in syms]
+    if not groups:
+        return None
+    for t in trades.values():
+        if t.get('closed') or t.get('symbol') == sym:
+            continue
+        for syms in groups:
+            if t['symbol'] in syms:
+                return t['symbol']
+    return None
 
 def get_last_signal_info(cache, symbol, tf):
     """Returns last {price, atr, ts} within 24h for chop filter."""
@@ -3791,6 +3837,17 @@ def main():
                 if ps:
                     send_telegram(ps, silent=True)
 
+    # ─── Weekly report (Fri 5 PM ET) ─────────────────────────────────
+    # Before the scan loop: scan takes 8-12 min, sending first keeps the
+    # report near 5 PM. Trade check above already ran, so today's closes
+    # are included.
+    if should_send_weekly_summary():
+        print("📊 Sending weekly summary...")
+        ws = format_weekly_summary()
+        if ws:
+            send_weekly_gif()
+            send_telegram(ws, silent=False)
+
     # ─── STEP 2: Scan new signals ────────────────────────────────────
     print(f"🔍 Scanning {len(active_list)} symbols...")
     new_sigs    = []
@@ -3824,6 +3881,19 @@ def main():
                 print("🔒 active")
                 continue
 
+            # Same-symbol lock: any open trade on this symbol (other TF) blocks
+            if has_open_trade_for_symbol(sym, trades):
+                skip_active += 1
+                print("🔒 symbol active (other TF)")
+                continue
+
+            # Correlation lock: open trade in same group (ETH open blocks XRP)
+            corr_sym = get_correlated_open(sym, trades)
+            if corr_sym:
+                skip_active += 1
+                print(f"🔗 correlated w/ open {corr_sym}")
+                continue
+
             last_sig_info = get_last_signal_info(cache, sym, tf)
             try:
                 result, reason = analyze_symbol(
@@ -3851,6 +3921,12 @@ def main():
             if is_duplicate(sym, sig_key, cache, result['sqs']):
                 skip_dupe += 1
                 print("🔕 cooldown")
+                continue
+
+            # Post-stop cooldown: same symbol+direction stopped out recently
+            if is_post_stop_blocked(sym, result['signal']):
+                skip_dupe += 1
+                print("🛑 post-stop cooldown")
                 continue
 
             # Record SQS for trending
@@ -3903,14 +3979,6 @@ def main():
 
     save_json(ALERT_CACHE, cache)
     save_json(TRADES_FILE, trades)
-
-    # Weekly report (Fri 5 PM ET)
-    if should_send_weekly_summary():
-        print("📊 Sending weekly summary...")
-        ws = format_weekly_summary()
-        if ws:
-            send_weekly_gif()
-            send_telegram(ws, silent=False)
 
     # ─── Final report ────────────────────────────────────────────────
     print(f"\n{'─' * 70}")
