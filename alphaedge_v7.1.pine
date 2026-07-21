@@ -65,6 +65,9 @@ showDirArrow    = input.bool(true, "Show Live Bias Arrow", group=G_THEME)
 showProgressBar = input.bool(true, "Show Confluence Progress Bars", group=G_THEME)
 enrichedAlerts  = input.bool(true, "Enriched Alert Messages", group=G_THEME)
 biasArrowOffset = input.int(20, "Bias Arrow Right Offset (bars)", group=G_THEME, minval=5, maxval=300)
+showAmbientBG   = input.bool(true, "🌌 Dark Background Overlay", group=G_THEME, tooltip="Solid near-black wash over the whole chart.\n0 = fully opaque black (complete dark, hides grid), higher = lighter.")
+ambientDarkness = input.int(0, "Darkness (0 = full dark)", group=G_THEME, minval=0, maxval=97)
+showMomoBG      = input.bool(false, "Big Mover Background Tint", group=G_THEME, tooltip="Orange/purple background wash on big-move days. Alert itself still fires when off.")
 
 // ══════════════════════════════════════════════════════════════════════════════
 // 📱 MOBILE QUICK TOGGLES
@@ -2875,9 +2878,12 @@ if barstate.islast and array.size(sigLabels) > 0
                 label.set_textcolor(lbl_fade, color.white)
                 label.set_size(lbl_fade, size.normal)
 
+// ── Dark background overlay — solid near-black wash ───────────────────────────
+bgcolor(showAmbientBG ? color.new(#05070A, ambientDarkness) : na, title="Dark Background Overlay")
+
 bgcolor(highlightEntryBar and tradeDir != 0 and bar_index == entryBar ? color.new(#00E5FF, 90) : na, title="Entry Bar Highlight")
 // Momentum move highlight — orange background when big mover threshold crossed
-bgcolor(useMomoAlert and momoUpMove ? color.new(#FF6D00, 92) : useMomoAlert and momoDownMove and not momoDirectional ? color.new(#AA00FF, 92) : na, title="Big Mover Day Highlight")
+bgcolor(showMomoBG and useMomoAlert and momoUpMove ? color.new(#FF6D00, 92) : showMomoBG and useMomoAlert and momoDownMove and not momoDirectional ? color.new(#AA00FF, 92) : na, title="Big Mover Day Highlight")
 // Raised transparency so candles dominate over background fills
 bgcolor(stHighlightBull ? color.new(THEME_BULL, 96) : na, title="ST Bull Highlight")
 bgcolor(stHighlightBear ? color.new(THEME_BEAR, 96) : na, title="ST Bear Highlight")
